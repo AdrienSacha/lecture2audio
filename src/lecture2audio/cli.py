@@ -1,0 +1,387 @@
+"""Command line: lecture2audio build|text INPUT [options]."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from .assemble import encode_final, join_parts, synth_blocks
+from .course import CoursePipeline, course_report
+from .course_render import write_vault
+from .llm import PRESETS, FakeLLM, LLMError, dry_run_handler, make_llm, research_loop
+from .web import SEARCH_ENGINES, FetchError, make_search, pick_engine
+from .pipeline import PipelineError, TextPipeline, chapter_titles, load_prompts
+from .report import (write_glossary, write_index, write_questions, write_reference,
+                     write_report, write_script)
+from .roundtrip import check_chunks
+from .segment import split_units
+from .sources import (AUDIO_EXT, detect_language, load_glossary, load_slides, load_transcript,
+                      slugify)
+from .transcribe import STTError, transcribe_audio
+from .tts import TTSError, make_tts
+
+# What --redo X discards: the results of stage X and of every stage after it.
+GAPS = ["coverage.json", "coverage_audit.json", "termbase.json", "research"]
+LATER = {"transcribe": ["outline.json", *GAPS, "rewrite", "audit.json", "spoken", "audio",
+                        "course", "vault"],
+         "outline": ["outline.json", *GAPS, "rewrite", "audit.json", "spoken", "audio",
+                     "course", "vault"],
+         "gaps": [*GAPS, "rewrite", "audit.json", "spoken", "audio", "course", "vault"],
+         "research": ["research", "rewrite", "audit.json", "spoken", "audio", "course",
+                      "vault"],
+         "rewrite": ["rewrite", "audit.json", "spoken", "audio", "course", "vault"],
+         "spoken": ["spoken", "audio"], "audio": ["audio"],
+         "course": ["course", "vault"]}
+# (rewrite, verifier) per provider. A local server has no default: its models are
+# whatever the user has pulled.
+DEFAULT_MODELS = {"anthropic": ("claude-sonnet-5-5", "claude-opus-5-5"),
+                  "openai": ("gpt-6.1-sol", "gpt-6-astra"),
+                  "deepseek": ("deepseek-flash", "deepseek-v4-pro")}
+PROVIDERS = ["deepseek", "anthropic", "openai", "kimi", "openrouter", "compat", "local", "dry"]
+NATIVE_SEARCH = ("anthropic", "openai")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lecture2audio",
+        description="Turn a lecture transcript (or recording) into a clear spoken explanation.",
+        epilog="'lecture2audio gui [--port N] [--no-browser]' opens the same options in the browser.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for command, text in (("build", "transcript or recording -> audio"),
+                          ("text", "same, but stop before the voice: script and quality report only")):
+        p = sub.add_parser(command, help=text, description=text)
+        p.add_argument("input", help="transcript (.txt .md .srt .vtt) or recording (.mp3 .m4a .wav ...)")
+        p.add_argument("--name", help="name of the lecture (default: the input file name)")
+        p.add_argument("--out", default="out", help="output folder (default: ./out)")
+        p.add_argument("--slides", help="slides as PDF (needs pypdf) or text, optional")
+        p.add_argument("--glossary", help="text file, one course term per line, optional")
+        p.add_argument("--language", choices=["en", "fr", "auto"], default="en")
+        p.add_argument("--course", action="store_true",
+                       help="also write the course material: a Markdown vault (vault/, for "
+                            "Obsidian) with exact definitions, full explanations, worked "
+                            "examples, check questions, figures and linked terms, made from the "
+                            "verified script")
+        p.add_argument("--redo", choices=sorted(LATER),
+                       help="discard saved results from this stage onwards and run it again")
+        llm = p.add_argument_group("language models")
+        llm.add_argument("--llm", choices=PROVIDERS, default="deepseek",
+                         help="provider for the outline, the rewrite and the spoken form; "
+                              "'openai' needs OPENAI_API_KEY; 'deepseek' (DEEPSEEK_API_KEY), "
+                              "'kimi' (MOONSHOT_API_KEY) and 'openrouter' (OPENROUTER_API_KEY) "
+                              "are hosted OpenAI-compatible APIs; 'compat' = any other one "
+                              "(--base-url, L2A_COMPAT_API_KEY); 'local' = OpenAI-compatible "
+                              "server (Ollama, LM Studio, llama.cpp, vLLM), no key needed; "
+                              "'dry' = no model, pass-through, for smoke tests")
+        llm.add_argument("--rewrite-model",
+                         help="default: env L2A_REWRITE_MODEL, else claude-sonnet-5-5 "
+                              "(anthropic), gpt-6.1-sol (openai) or deepseek-flash (deepseek); "
+                              "required for the other providers")
+        llm.add_argument("--base-url",
+                         help="API base URL (default for local: http://localhost:11434/v1, "
+                              "Ollama). With Ollama, raise num_ctx in a Modelfile: the OpenAI "
+                              "route cannot set the context size")
+        llm.add_argument("--verify-llm", choices=PROVIDERS,
+                         help="provider for the verifier (default: same as --llm). A verifier from "
+                              "another model family is less inclined to approve the rewrite")
+        llm.add_argument("--verify-model",
+                         help="default: env L2A_VERIFY_MODEL, else claude-opus-5-5 (anthropic), "
+                              "gpt-6-astra (openai) or deepseek-v4-pro (deepseek); otherwise "
+                              "the rewrite model")
+        llm.add_argument("--verify-base-url", help="API base URL for --verify-llm openai or local")
+        llm.add_argument("--max-part-words", type=int, default=2500,
+                         help="longest part of the outline, in words (default 2500)")
+        llm.add_argument("--max-retries", type=int, default=2,
+                         help="rewrites allowed after a failed verification (default 2)")
+        llm.add_argument("--workers", type=int, default=3,
+                         help="parts processed at the same time (default 3)")
+        llm.add_argument("--no-audit", action="store_true",
+                         help="skip the tests that plant a fault (an omission for the verifier, a hole "
+                              "for the gap search) to check that they notice it")
+        research = p.add_argument_group("web research (fills the gaps the lecture leaves)")
+        research.add_argument("--research", choices=["auto", "native", "loop", "off"],
+                              default="auto",
+                              help="'native' = the provider's own web search (anthropic, "
+                                   "openai); 'loop' = the program runs the searches and reads "
+                                   "the pages for any model that can call tools (deepseek, kimi, "
+                                   "openrouter, compat, local), using --search; 'auto' = native "
+                                   "when the provider has it, else loop; 'off' = only list the "
+                                   "gaps in report.md")
+        research.add_argument("--search", choices=["auto", *SEARCH_ENGINES], default="auto",
+                              help="search engine for --research loop: deepseek "
+                                   "(DEEPSEEK_API_KEY), tavily (TAVILY_API_KEY), brave "
+                                   "(BRAVE_API_KEY) or searxng (free, self-hosted, "
+                                   "--searxng-url). 'auto' takes the first one available")
+        research.add_argument("--searxng-url", help="address of a SearXNG instance with JSON output")
+        research.add_argument("--research-depth", type=int, default=30,
+                              help="searches and page reads allowed per gap (default 30). Every "
+                                   "gap is researched; raise this for deeper research")
+        llm.add_argument("--prompts-dir",
+                         help="folder with your own prompts (outline.md, rewrite.md, verify.md, "
+                              "spoken.md, coverage.md, termbase.md, research.md, terms.md)")
+        stt = p.add_argument_group("speech to text (recording input, round trip)")
+        stt.add_argument("--stt", choices=["auto", "mlx", "faster"], default="auto")
+        stt.add_argument("--stt-model", help="model name for the chosen backend")
+        stt.add_argument("--transcribe-only", action="store_true",
+                         help="stop after writing transcript.txt, so you can correct it first")
+        if command == "build":
+            voice = p.add_argument_group("voice")
+            voice.add_argument("--tts", choices=["ming", "openai", "say", "command", "fake"],
+                               default="ming",
+                               help="ming = Ming-3.0-tts, open voice, local (default); openai = "
+                                    "OpenAI speech API; say = macOS voice; command = your own "
+                                    "script; fake = tones, for tests")
+            voice.add_argument("--voice", help="ming: US_James (default), US_Emma, UK_George, "
+                                               "UK_Charlotte, US_Stella, or a WAV file of a voice; "
+                                               "openai or say: a voice name")
+            voice.add_argument("--tts-command",
+                               help="for --tts command: shell command using {text_file} {out} {language}")
+            voice.add_argument("--format", choices=["m4a", "mp3", "wav"], default="m4a")
+            voice.add_argument("--chunk-chars", type=int, default=600,
+                               help="longest piece of text sent to the voice at once")
+            voice.add_argument("--no-quiz", action="store_true",
+                               help="leave the questions out of the audio (they stay in questions.md)")
+            voice.add_argument("--quiz-pause", type=float, default=8.0,
+                               help="seconds of silence after each question (default 8)")
+            voice.add_argument("--no-loudnorm", action="store_true", help="skip loudness normalisation")
+            voice.add_argument("--roundtrip", action="store_true",
+                               help="transcribe the audio again and flag chunks that differ from the script")
+            voice.add_argument("--roundtrip-threshold", type=float, default=0.88)
+    return parser
+
+
+def _model(explicit: str | None, env: str, provider: str, slot: int, fallback: str | None):
+    if provider == "dry":
+        return None
+    defaults = DEFAULT_MODELS.get(provider)
+    model = explicit or os.environ.get(env) or (defaults[slot] if defaults else fallback)
+    if not model:
+        flag = f"--{'rewrite' if slot == 0 else 'verify'}-model"
+        hint = (" (the name the local server serves, for example from `ollama list`)"
+                if provider == "local" else "")
+        raise SystemExit(f"Give {flag}{hint}: there is no default model for '{provider}'.")
+    return model
+
+
+def _llms(args):
+    verify_provider = args.verify_llm or args.llm
+    rewrite_model = _model(args.rewrite_model, "L2A_REWRITE_MODEL", args.llm, 0, None)
+    verify_model = _model(args.verify_model, "L2A_VERIFY_MODEL", verify_provider, 1,
+                          rewrite_model if verify_provider == args.llm else None)
+    if args.llm == "dry":
+        rewrite_llm = FakeLLM(dry_run_handler)
+    else:
+        rewrite_llm = make_llm(args.llm, rewrite_model, args.base_url)
+    if verify_provider == "dry":
+        verify_llm = FakeLLM(dry_run_handler)
+    else:
+        verify_llm = make_llm(verify_provider, verify_model,
+                              args.verify_base_url or (args.base_url if verify_provider == args.llm
+                                                       else None))
+    return rewrite_llm, verify_llm
+
+
+def _researcher(args, llm):
+    """(researcher function, None) or (None, why the gaps are not searched)."""
+    mode = args.research
+    if mode == "off":
+        return None, "web research was turned off (--research off)"
+    if mode == "auto":
+        mode = "native" if args.llm in NATIVE_SEARCH or args.llm == "dry" else "loop"
+    if mode == "native":
+        if args.llm not in NATIVE_SEARCH and args.llm != "dry":
+            raise SystemExit(f"--research native needs --llm anthropic or openai; use "
+                             f"--research loop with --llm {args.llm}.")
+        return (lambda system, user: llm.research(system, user, depth=args.research_depth)), None
+    if args.llm not in ("openai", *PRESETS, "local"):
+        raise SystemExit(f"--research loop needs a model that calls tools through an "
+                         f"OpenAI-compatible API; with --llm {args.llm} use --research native.")
+    engine = pick_engine(args.search, args.llm, args.searxng_url)
+    if engine is None:
+        return None, ("no search engine is set up for the research loop: set TAVILY_API_KEY, "
+                      "BRAVE_API_KEY or DEEPSEEK_API_KEY, or give --searxng-url")
+    try:
+        search = make_search(engine, base_url=args.searxng_url)
+    except FetchError as exc:
+        raise SystemExit(str(exc)) from None
+    return (lambda system, user: research_loop(llm, system, user, search,
+                                               args.research_depth)), None
+
+
+def _transcript(args, work: Path, glossary: str, log) -> str:
+    source = Path(args.input)
+    target = work / "transcript.txt"
+    if source.suffix.lower() in AUDIO_EXT:
+        if args.redo == "transcribe" and target.exists():
+            target.unlink()
+        if not target.exists():
+            minutes = _minutes(source)
+            log(f"[transcribe] {source.name}" + (f", {minutes:.0f} min of audio. Each recognised "
+                                                "sentence is printed as it comes; a long "
+                                                "recording takes several minutes" if minutes else ""))
+            terms = ", ".join(line.split(":")[0].strip() for line in glossary.splitlines())[:800]
+            language = None if args.language == "auto" else args.language
+            target.write_text(transcribe_audio(source, args.stt, language, terms or None,
+                                               args.stt_model, progress=True), encoding="utf-8")
+            log(f"[transcribe] saved {target}. Correct misheard technical terms there; "
+                "running the same command again reuses your corrected file.")
+        return target.read_text(encoding="utf-8")
+    text = load_transcript(source)
+    target.write_text(text, encoding="utf-8")
+    return text
+
+
+def _minutes(path: Path) -> float | None:
+    """Length of a recording in minutes (ffprobe), or None."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "csv=p=0", str(path)], capture_output=True, text=True,
+                             timeout=30)
+        return float(out.stdout.strip()) / 60
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _discard(work: Path, names: list[str]) -> None:
+    for name in names:
+        path = work / name
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        elif path.exists():
+            path.unlink()
+
+
+def run(args) -> int:
+    def log(message: str) -> None:
+        print(message, flush=True)
+
+    source = Path(args.input)
+    if not source.exists():
+        raise SystemExit(f"Input not found: {source}")
+    name = args.name or slugify(source.stem)
+    work = Path(args.out) / name
+    work.mkdir(parents=True, exist_ok=True)
+    glossary = load_glossary(args.glossary)
+    slides = load_slides(args.slides)
+    if args.redo:
+        _discard(work, LATER[args.redo])
+
+    text = _transcript(args, work, glossary, log)
+    if args.transcribe_only:
+        return 0
+    language = detect_language(text) if args.language == "auto" else args.language
+    units = split_units(text)
+    if not units:
+        raise SystemExit("The transcript is empty.")
+    fingerprint = hashlib.sha1(json.dumps([args.max_part_words, units, slides, glossary])
+                               .encode()).hexdigest()
+    marker = work / "fingerprint.txt"
+    if marker.exists() and marker.read_text() != fingerprint:
+        log("[cache] the transcript, slides, glossary or --max-part-words changed: earlier "
+            "results discarded")
+        _discard(work, LATER["outline"])
+    marker.write_text(fingerprint)
+    log(f"{len(text.split())} words, {len(units)} units, language: {language}")
+
+    rewrite_llm, verify_llm = _llms(args)
+    researcher, research_note = _researcher(args, rewrite_llm)
+    pipeline = TextPipeline(work, language, rewrite_llm, verify_llm,
+                            load_prompts(language, args.prompts_dir), glossary, slides,
+                            args.max_retries, log, args.max_part_words, args.workers,
+                            researcher)
+    outline = pipeline.run_outline(units)
+    log(f"[outline] {len(outline.parts)} part(s), "
+        f"{sum(len(p.children) for p in outline.parts)} point(s)")
+    coverage = pipeline.run_coverage(outline)
+    terms = pipeline.run_termbase(outline)
+    if research_note and coverage["gaps"]:
+        log(f"[research] skipped: {research_note}")
+    supplements = pipeline.run_research(outline)
+    log(f"[gaps] {len(coverage['gaps'])} gap(s), {len(terms)} term(s), "
+        f"{len(supplements)} checked fact(s) from outside the lecture")
+    gaps = {"coverage": coverage, "terms": terms, "research": pipeline.research,
+            "supplements": supplements, "note": research_note,
+            "audit": None if args.no_audit else pipeline.audit_coverage(outline)}
+    records = pipeline.run_parts(outline)
+    audit = None if args.no_audit else pipeline.audit_verifier(outline, records)
+    notes = pipeline.global_notes(outline, records)
+    spoken = pipeline.run_spoken(outline, records)
+    course = course_stats = None
+    if args.course:
+        course = CoursePipeline(pipeline).run(outline, records)
+        course_stats = write_vault(work / "vault", name, outline, course, records, terms,
+                                   language)
+        log(f"[course] {course_stats['cards']} card(s), {course_stats['notes']} note(s): "
+            f"{work / 'vault'}")
+    usage = {rewrite_llm.name: rewrite_llm.usage}
+    if verify_llm is not rewrite_llm:
+        usage[verify_llm.name + " (verifier)"] = verify_llm.usage
+
+    def reports(chapters=None, roundtrip=None):
+        write_script(work / "script.md", name, outline, records, language)
+        write_index(work / "index.md", name, outline, chapters)
+        write_questions(work / "questions.md", name, outline, records)
+        write_reference(work / "reference.md", name, outline, records)
+        write_glossary(work / "glossary.md", name, outline, terms)
+        write_report(work / "report.md", name, outline, records, spoken, notes, audit, usage,
+                     roundtrip, gaps)
+        if course:  # before the list of noise, which stays last
+            report = (work / "report.md").read_text(encoding="utf-8")
+            cut = report.find("\n## Removed as noise")
+            section = course_report(course, course_stats, language)
+            report = report + section if cut < 0 else report[:cut] + section + report[cut:]
+            (work / "report.md").write_text(report, encoding="utf-8")
+
+    reports()
+    flagged = [r["part"] for r in records if r["flagged"]]
+    if flagged:
+        log(f"[check] parts with open problems after the retries: {', '.join(flagged)} "
+            "(see report.md)")
+    if audit and audit.get("caught") is False:
+        log("[check] the verifier missed a planted omission (see report.md)")
+    if args.command == "text":
+        log(f"Done. Read {work / 'script.md'} and {work / 'report.md'}.")
+        return 0
+
+    backend = make_tts(args.tts, language, args.voice, args.tts_command)
+    voiced = synth_blocks(backend, [s["blocks"] for s in spoken], work / "audio", args.chunk_chars,
+                          not args.no_quiz, args.quiz_pause, log)
+    joined, chapters = join_parts(voiced, work / "audio")
+    titles = chapter_titles(outline, language, not args.no_quiz)
+    output = work / f"{name}.{args.format}"
+    encode_final(joined, output, [titles[c] for c, _ in chapters], [s for _, s in chapters],
+                 loudness=not args.no_loudnorm)
+    roundtrip = None
+    if args.roundtrip:
+        log("[roundtrip] transcribing the audio again")
+        groups = [[(e["path"], e["text"]) for e in entries if e["kind"] == "chunk"]
+                  for entries in voiced]
+        results = check_chunks(
+            lambda p: transcribe_audio(p, args.stt, language, None, args.stt_model), groups)
+        roundtrip = [r for r in results if r["score"] < args.roundtrip_threshold]
+        log(f"[roundtrip] {len(roundtrip)} of {len(results)} chunks below {args.roundtrip_threshold}")
+    reports(chapters, roundtrip)
+    log(f"Done. Audio: {output}")
+    return 0
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["gui"]:
+        from .gui import main as gui_main
+        return gui_main(argv[1:])
+    args = build_parser().parse_args(argv)
+    try:
+        sys.exit(run(args))
+    except KeyboardInterrupt:
+        print("Interrupted. Run the same command again to continue where it stopped.",
+              file=sys.stderr)
+        sys.exit(130)
+    except (LLMError, PipelineError, TTSError, STTError, RuntimeError,
+            subprocess.CalledProcessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

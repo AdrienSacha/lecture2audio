@@ -1,0 +1,130 @@
+---
+title: {{ fm(title) }}
+part: {{ part.id }}
+tags: [course, part]
+{% if prev %}
+prev: {{ fm("[[" ~ prev ~ "]]") }}
+{% endif %}
+{% if next %}
+next: {{ fm("[[" ~ next ~ "]]") }}
+{% endif %}
+---
+# {{ part.id }}. {{ title }}
+
+{% if intro %}
+{{ intro }}
+
+{% endif %}
+{% if prerequisites %}
+**{{ labels.needs }}:** {{ prerequisites|join(", ") }}
+
+{% endif %}
+{% for group in groups %}
+{% if group.heading %}
+{{ "#" * group.depth }} {{ group.heading }}
+
+{% endif %}
+{% for card in group.cards %}
+{{ "#" * (group.depth + 1) }} {{ card.title }}
+
+{% if card.external %}
+> [!note] {{ labels.external }}
+> {{ labels.external_text }} {{ card.sources|join(", ") }}
+
+{% endif %}
+{% if card.definition %}
+> [!definition] {{ labels[card.kind] }}
+{{ card.definition|quote }}
+
+{% endif %}
+{% if card.instance %}
+**{{ labels.instance }}.** {{ card.instance }}
+
+{% endif %}
+{% for paragraph in card.explanation %}
+{{ paragraph }}
+
+{% endfor %}
+{% for formula in card.formulas %}
+$$
+{{ formula }}
+$$
+
+{% endfor %}
+{% if card.notation %}
+| {{ labels.symbol }} | {{ labels.meaning }} |
+|---|---|
+{% for n in card.notation %}
+| ${{ n.symbol }}$ | {{ n.meaning }} |
+{% endfor %}
+
+{% endif %}
+{% if card.example %}
+> [!example] {{ labels.example }}: {{ card.example.title }}
+{% for step in card.example.steps %}
+> {{ loop.index }}. {{ step }}
+{% endfor %}
+
+{% endif %}
+{% if card.diagram %}
+{% if card.diagram.title %}
+**{{ card.diagram.title }}**
+
+{% endif %}
+{% for frame in card.diagram.frames %}
+*{{ labels.step }} {{ loop.index }} / {{ loop.length }}.* {{ frame.caption }}
+
+```mermaid
+{{ frame.mermaid }}
+```
+
+{% endfor %}
+{% endif %}
+{% for snippet in card.code %}
+{% if snippet.caption %}
+*{{ snippet.caption }}*
+
+{% endif %}
+```{{ snippet.language }}
+{{ snippet.code }}
+```
+
+{% endfor %}
+{% if card.table %}
+{% if card.table.caption %}
+*{{ card.table.caption }}*
+
+{% endif %}
+| {{ card.table.columns|join(" | ") }} |
+|{% for _ in card.table.columns %}---|{% endfor %}
+
+{% for row in card.table.rows %}
+| {{ row|join(" | ") }} |
+{% endfor %}
+
+{% endif %}
+{% if card.illustrative %}
+*{{ labels.illustration }}*
+
+{% endif %}
+{% for check in card.checks %}
+> [!question]- {{ check.question }}
+{{ check.answer|quote }}
+
+{% endfor %}
+{% endfor %}
+{% endfor %}
+{% if review %}
+## {{ labels.review }}
+
+{% for item in review %}
+> [!question]- {{ item.question }} ({{ item.link }})
+{{ item.answer|quote }}
+
+{% endfor %}
+{% endif %}
+{% if prev or next %}
+---
+{% if prev %}{{ labels.previous }}: [[{{ prev }}]]{% endif %}{% if prev and next %} · {% endif %}{% if next %}{{ labels.next }}: [[{{ next }}]]{% endif %}
+
+{% endif %}

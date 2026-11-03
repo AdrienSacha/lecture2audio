@@ -1,0 +1,18 @@
+---
+title: {{ fm(title) }}
+tags: [course, lecture]
+---
+# {{ title }}
+
+## {{ labels.parts }}
+
+{% for part in parts %}
+{{ loop.index }}. [[{{ part.note }}]]{% if part.intro %} – {{ part.intro }}{% endif %}
+
+{% endfor %}
+## {{ labels.reference }}
+
+- [[{{ sources_note }}]]
+{% if final_review %}
+- [[{{ review_note }}]]
+{% endif %}

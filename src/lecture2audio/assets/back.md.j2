@@ -1,0 +1,46 @@
+---
+title: {{ fm(heading) }}
+tags: [course, reference]
+---
+# {{ heading }}
+
+{% if kind == "glossary" %}
+{% for t in terms %}
+- {{ t.link }}: {{ t.definition }}
+{% endfor %}
+{% elif kind == "notation" %}
+{% if notation %}
+| {{ labels.symbol }} | {{ labels.meaning }} | {{ labels.defined_in }} |
+|---|---|---|
+{% for n in notation %}
+| ${{ n.symbol }}$ | {{ n.meaning }} | {{ n.link }} |
+{% endfor %}
+{% else %}
+{{ labels.none }}
+{% endif %}
+{% elif kind == "sources" %}
+{% if sources %}
+{% for s in sources %}
+### {{ s.id }}
+
+{{ s.text }}
+{% if s.url %}
+
+{{ s.url }}
+{% endif %}
+{% if s.quote %}
+
+> {{ s.quote }}
+{% endif %}
+
+{% endfor %}
+{% else %}
+{{ labels.none }}
+{% endif %}
+{% elif kind == "review" %}
+{% for item in review %}
+> [!question]- {{ item.question }} ({{ item.link }})
+{{ item.answer|quote }}
+
+{% endfor %}
+{% endif %}

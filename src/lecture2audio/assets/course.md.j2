@@ -1,0 +1,19 @@
+---
+title: {{ fm(title) }}
+tags: [course, index]
+---
+# {{ title }}
+
+{{ stats|join(" · ") }}
+
+## {{ labels.lectures_title }}
+
+{% for lecture in lectures %}
+{{ loop.index }}. [[{{ lecture.index }}]] – {{ lecture.title }}
+{% endfor %}
+
+## {{ labels.reference }}
+
+{% for note in reference %}
+- [[{{ note }}]]
+{% endfor %}

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lecture2audio"
+version = "0.1.0"
+description = "Turn a lecture transcript into a clear, listenable audio explanation"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=2.4.0",  # Claude (--llm anthropic)
+    "openai>=3.42.1",  # OpenAI and every OpenAI-compatible API (DeepSeek, Kimi, OpenRouter, local)
+    "pydantic>=2.9",
+    "jinja2>=3.1",
+    "latex2mathml>=3.77",
+]
+
+[project.optional-dependencies]
+pdf = ["pypdf"]
+voice = ["mlx-audio>=0.6.2"]  # Ming-3.0-tts on Apple chips
+whisper-mac = ["mlx-whisper"]
+whisper = ["faster-whisper"]
+
+[project.scripts]
+lecture2audio = "lecture2audio.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lecture2audio = ["prompts/*.md", "assets/*"]

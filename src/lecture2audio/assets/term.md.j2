@@ -1,0 +1,33 @@
+---
+title: {{ fm(term.term) }}
+tags: [course, term]
+{% if aliases %}
+aliases: {{ aliases }}
+{% endif %}
+---
+# {{ term.term }}
+
+> [!definition] {{ labels.definition }}
+{{ term.definition|quote }}
+
+**{{ labels.defined_in }}:** {{ defined_in }}
+{% if requires %}
+
+**{{ labels.requires }}:** {{ requires|join(", ") }}
+{% endif %}
+{% if required_by %}
+
+**{{ labels.required_by }}:** {{ required_by|join(", ") }}
+{% endif %}
+{% if confusable %}
+
+**{{ labels.confusable }}:** {{ confusable|join(", ") }}
+{% endif %}
+{% if used_in %}
+
+## {{ labels.used_in }}
+
+{% for link in used_in %}
+- {{ link }}
+{% endfor %}
+{% endif %}

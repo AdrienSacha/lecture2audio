@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+out/
+work/
+*.m4a
+*.mp3
+CLAUDE.local.md
