@@ -155,10 +155,20 @@ class Check(Model):
     answer: Text = Field(min_length=1)
 
 
+class Exercise(Model):
+    """A practice problem in the style of a recitation: answered from the part alone, with a
+    complete worked solution."""
+    question: Text = Field(min_length=1)
+    steps: list[Text] = Field(min_length=1, max_length=12)
+    answer: Text = Field(min_length=1)
+    covers: list[int] = Field(min_length=1)
+
+
 class Card(Model):
     node: Text
     kind: Literal["definition", "concept", "procedure", "remark"]
     title: Text = Field(min_length=1)
+    plain: Text = ""  # "In short": the idea in plain words, for a reader new to the field
     terms: list[Text] = []
     definition: Text = ""
     instance: Text = ""
@@ -166,6 +176,7 @@ class Card(Model):
     formulas: list[Text] = []  # LaTeX, one per line
     notation: list[Notation] = []
     example: Example | None = None
+    proof: list[Text] = Field(default=[], max_length=16)  # steps of a proof the lecture gives
     diagram: Diagram | None = None
     code: list[Snippet] = []
     table: Table | None = None
@@ -190,7 +201,8 @@ class Card(Model):
 
     @model_validator(mode="after")
     def _texts(self):
-        texts = [self.title, self.definition, self.instance, *self.explanation]
+        texts = [self.title, self.plain, self.definition, self.instance, *self.explanation,
+                 *self.proof]
         if self.example:
             texts += [self.example.title, *self.example.steps]
         for check in self.checks:
@@ -211,6 +223,19 @@ class Card(Model):
 
 class Cards(Model):
     cards: list[Card] = Field(min_length=1)
+    exercises: list[Exercise] = Field(default=[], max_length=6)
+
+    @model_validator(mode="after")
+    def _exercise_texts(self):
+        for exercise in self.exercises:
+            texts = [exercise.question, exercise.answer, *exercise.steps]
+            if any(html_in_text(t) for t in texts):
+                raise ValueError("exercises are plain Markdown: no HTML tags")
+            errors = [e for t in texts for e in math_in_text(t)]
+            if errors:
+                raise ValueError("inline math between $ $ is LaTeX: " + "; ".join(errors))
+            exercise.covers = sorted(set(exercise.covers))
+        return self
 
 
 CARDS_SCHEMA = Cards.model_json_schema(by_alias=True)

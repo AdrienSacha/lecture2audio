@@ -171,6 +171,12 @@ Format of each rule: statement, rationale, source, confidence. Numeric threshold
 33. **One column of content, with the visual placed right after the sentence that introduces it.** Sources: spatial contiguity; Chandler and Sweller (1991). Confidence: strong for contiguity, weak for the exact layout.
 34. **Every formula is typeset with the same notation as its definition and has each symbol explained once, on the first use in the section.** Source: Sweller (2010). Confidence: weak.
 
+### Added in November 2026 (see section 2.17 of `research-notes.md`)
+
+36. **Give every idea a plain version first, and judge it by comprehension, not by readability scores.** Each card opens with "In short": one to three short sentences in everyday words that state the same facts, name the technical term and explain it with words a newcomer knows, with no analogy. Readability formulas do not predict comprehension; faithfulness, added background and coherence do (Guo et al., 2025). ISO 24495-1:2023 states the governing principle: the reader can find, understand and use the information. Confidence: moderate.
+37. **Let a simulated first reader find where it gets lost, and revise once.** Unknown terms, missing context and confusing sentences found by simulated readers, fixed by one editor, improve readability and factuality together, best at one or two rounds (Jung et al., 2026). Confidence: moderate (simulated readers).
+38. **Close each part with practice problems and full worked solutions**, after the worked examples (rule 8), with the solution collapsed until the reader has tried (rule 20). Iteratively critiqued generated items matched standardized-test items in difficulty and discrimination (Isley et al., 2025). Confidence: moderate for item quality, strong for retrieval practice in general.
+
 ### What to hide by default
 
 35. **Hidden until asked:** answers to check questions, optional derivations or proofs that were not part of the lecture, the long list of alternative names, and any marked external digression. **Visible by default:** definitions, the worked example, the visual and its caption, the section overview. Sources: coherence (Rey, 2012); retrieval (Rowland, 2014). Confidence: moderate.

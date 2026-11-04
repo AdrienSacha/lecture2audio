@@ -18,6 +18,10 @@ Read the cards in order. After each card, ask what you now know. Report a loose 
 - "forward_reference": the card uses a term or a result that a later card defines or proves.
 - "undefined_symbol": a symbol used before the card that introduces its meaning.
 - "ambiguous": a statement that can be read in two ways.
+- "confusing_sentence": a sentence you cannot follow on a first reading (too long, nested, or with words a newcomer does not know), even though nothing is missing.
+- "missing_context": a statement whose purpose or setting you cannot see: why it matters, or what situation it applies to.
+
+Read the "In short" text of each card as a newcomer: it must be clear without anything else.
 
 Report only what you can point at: name the card and say exactly which word, step or symbol is missing. Do not invent problems. A term defined in the same card before it is used is fine.
 

@@ -241,6 +241,11 @@ def anki_rows(name: str, rows: list[dict], course: dict | None, records: list[di
             for check in card["checks"]:
                 out.append((anki_math(check["question"]), anki_math(check["answer"]), tags))
                 tested.update(ideas)
+        for exercise in part.get("exercises", []):
+            back = " ".join(f"{k}. {step}" for k, step in enumerate(exercise["steps"], 1))
+            out.append((anki_math(exercise["question"]),
+                        anki_math(f"{back} → {exercise['answer']}"),
+                        f"{base} {base}::part-{int(part['part']):02d} {base}::exercise"))
     kinds = KIND_WORDS.get(language, KIND_WORDS["en"])
     recall = RECALL.get(language, RECALL["en"])
     for row in rows:

@@ -137,15 +137,20 @@ class Live(unittest.TestCase):
 
 class Gate(unittest.TestCase):
     def test_the_idea_list_of_a_part_is_checked_by_code(self):
-        from lecture2audio.enrich import validate_idea_list
+        from lecture2audio.enrich import unaccounted_units, validate_idea_list
         part = outline().parts[0]
         good = {"ideas": [{"kind": "claim", "idea": "a", "nodes": ["1.1"], "units": [1]},
-                          {"kind": "condition", "idea": "b", "nodes": ["1.2"], "units": [3, 4]}]}
+                          {"kind": "condition", "idea": "b", "nodes": ["1.2"], "units": [3, 4]}],
+                "no_content": [{"units": [5], "kind": "no_teaching", "reason": "a joke"}]}
         self.assertEqual(validate_idea_list(good, part), [])
-        self.assertTrue(validate_idea_list({"ideas": good["ideas"][:1]}, part))  # 1.2 skipped
-        bad = {"ideas": [dict(good["ideas"][0], units=[6]), dict(good["ideas"][1], kind="x")]}
-        self.assertEqual(len(validate_idea_list(bad, part)), 2)  # unit of part 2, unknown kind
+        self.assertEqual(unaccounted_units(good, part), [])
+        self.assertEqual(unaccounted_units({"ideas": good["ideas"][:1]}, part), [3, 4, 5])
+        self.assertTrue(validate_idea_list({"ideas": [dict(good["ideas"][0], units=[6])]}, part))
+        self.assertTrue(any("kind" in e for e in validate_idea_list(
+            {"ideas": [dict(good["ideas"][1], kind="x")]}, part)))
         self.assertTrue(validate_idea_list({"items": []}, part))
+        self.assertTrue(validate_idea_list(
+            {"ideas": [], "no_content": [{"units": [9], "kind": "unclear"}]}, part))
 
 
 class Anki(unittest.TestCase):

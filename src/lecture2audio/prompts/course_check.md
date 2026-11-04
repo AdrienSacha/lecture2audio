@@ -10,7 +10,7 @@ You check the course material, and nothing else. Course material is a set of wri
 
 # How to judge
 
-For each card compare its "definition", "explanation", "formulas", "example", "diagram", "table" and "checks" with the covered sentences only. A card may spell out the reasoning that links statements of the covered sentences, and may restate them in other words; that is not an added fact. Give one status:
+For each card compare its "plain", "definition", "explanation", "formulas", "example", "proof", "diagram", "table" and "checks" with the covered sentences only. "plain" says the same facts in everyday words: a fact it adds is "added_fact", a condition or number it loses or a simplification that becomes false is "changed". A "proof" step that does not follow, or a proof the covered sentences do not give, is "changed". A card may spell out the reasoning that links statements of the covered sentences, and may restate them in other words; that is not an added fact. Give one status:
 
 - "faithful": every statement of the card is in the covered sentences, with the same meaning, and the card leaves out no definition, condition, qualification ("only if", "except", "at most"), number or step that the covered sentences contain.
 - "changed": a statement of the card says something different from the sentences (another number, a weaker or stronger claim, a lost qualification, a swapped term, a wrong formula).
@@ -24,6 +24,8 @@ Figures and tables are checked like text. Read every frame of a "diagram" (its c
 
 When IDEAS is given, check off every idea of the idea ledger against the cards: say for each idea whether it is taught somewhere in the cards ("taught") or not ("missing"), and give in "cards" the numbers of the cards that teach it. An idea is taught when a card states it with its conditions and numbers; a passing mention is "missing". The cards list in "ideas" the ideas they claim to teach; check each claim, and do not accept a claim the card does not fulfil.
 
+When EXERCISES is given, solve every exercise yourself from the SCRIPT and give it one status: "correct" (answerable from what the script teaches, every step and the answer right), "wrong" (a step or the answer is wrong, or the question cannot be answered from the script) or "added_fact" (the question or a step relies on a fact the script does not teach). Recompute every number.
+
 Be strict, but report only what you can point at: say in "detail" which statement is wrong and which sentence shows it. Do not invent problems.
 
 # Output
@@ -32,7 +34,8 @@ Return one JSON object and nothing else.
 
 {
   "cards": [{"card": 1, "status": "faithful", "detail": ""}],
-  "ideas": [{"idea": "T1", "status": "taught", "cards": [1], "detail": ""}]
+  "ideas": [{"idea": "T1", "status": "taught", "cards": [1], "detail": ""}],
+  "exercises": [{"exercise": 1, "status": "correct", "detail": ""}]
 }
 
-Give one entry for every card, in order. "detail" is empty when the status is "faithful". "cards" is an empty list for a missing idea. "ideas" is an empty list when IDEAS is not given.
+Give one entry for every card, in order. "detail" is empty when the status is "faithful". "cards" is an empty list for a missing idea. "ideas" is an empty list when IDEAS is not given. "exercises" is an empty list when EXERCISES is not given.

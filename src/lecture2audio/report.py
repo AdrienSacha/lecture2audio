@@ -148,7 +148,8 @@ def _issue_line(issue: dict) -> str:
 def write_report(path: Path, name: str, outline: Outline, records: list[dict],
                  spoken: list[dict], notes: list[str], audit: dict | None,
                  usage: dict | None = None, roundtrip: list[dict] | None = None,
-                 gaps: dict | None = None, ideas: dict | None = None) -> None:
+                 gaps: dict | None = None, ideas: dict | None = None,
+                 factcheck: dict | None = None, asr: list[dict] | None = None) -> None:
     lines = [f"# {name}: quality report", ""]
     flagged = [r for r in records if r["flagged"]]
     lines.append(f"**{len(flagged)} part(s) still have open problems after the retries.** Listen "
@@ -182,6 +183,14 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
         lines += _gap_lines(outline, gaps)
     if ideas is not None:
         lines += ledger_lines(ideas)
+    lines += factcheck_lines(factcheck)
+    if asr:
+        lines += ["## Speech recognition", "",
+                  f"{len(asr)} recognised segment(s) were dropped because they are phrases speech "
+                  "recognition writes over silence or music, or the third repeat of one segment. "
+                  "Check them against the recording if one of them could be teaching content:", ""]
+        lines += [f"- \"{item['text'].strip()}\" ({item['reason']})" for item in asr]
+        lines.append("")
 
     moved = [(r["part"], m) for r in records for m in r.get("moves", [])]
     if moved:
@@ -210,10 +219,12 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
 
     if roundtrip:
         lines += ["## Round trip (voice, then speech recognition, compared with the script)", "",
-                  "| Part | Chunk | Similarity | Heard |", "|---|---|---|---|"]
+                  "These chunks were still heard differently from the script after the new takes. "
+                  "Listen to them.", "",
+                  "| Part | Chunk | Similarity | New takes | Heard |", "|---|---|---|---|---|"]
         for item in roundtrip:
             lines.append(f"| {item['segment'] + 1} | {item['chunk'] + 1} | {item['score']:.2f} | "
-                         f"{item['heard'][:80]} |")
+                         f"{item.get('tries', 0)} | {item['heard'][:80]} |")
         lines.append("")
 
     noise = outline.noise_units()
@@ -226,6 +237,26 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
         lines.append("No unit was marked as noise.")
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def factcheck_lines(factcheck: dict | None) -> list[str]:
+    """The independent fact-check by MiniCheck, when it ran."""
+    if not factcheck:
+        return []
+    lines = ["## Independent fact-check (MiniCheck)", "",
+             f"A small local fact-checker of another model family ({factcheck['model']}) checked "
+             f"{factcheck['checked']} lecture sentence(s) of the script against the transcript "
+             "units of the ideas each one cites."]
+    if not factcheck["unsupported"]:
+        lines += ["It found support for every sentence.", ""]
+        return lines
+    lines += [f"It found no support for {len(factcheck['unsupported'])} sentence(s). Speech "
+              "recognition errors in the units can cause this, so these are leads for a check, "
+              "not verdicts:", ""]
+    lines += [f"- Part {u['part']}, sentence {u['sentence']} (score {u['score']:.2f}): {u['text']}"
+              for u in factcheck["unsupported"]]
+    lines.append("")
+    return lines
 
 
 LEDGER_STATUS = {"pending": "not checked", "scripted": "found in the script, not yet in a card",
@@ -274,6 +305,23 @@ def ledger_lines(ideas: dict) -> list[str]:
                   + ("the fact was listed." if audit["caught"] else
                      "**the fact was not listed**, so the ledger may be missing ideas of the "
                      "lecture; consider a stronger writer model (--rewrite-model).")]
+    if ideas.get("no_content"):
+        lines += ["", "The idea listing marked these units as teaching nothing or as unclear; "
+                  "they are not checked idea by idea, so check them against the transcript:", ""]
+        for item in ideas["no_content"]:
+            what = "unclear recognition" if item["kind"] == "unclear" else "no teaching content"
+            lines.append(f"- Part {item['part']}, units {ranges(item['units'])} ({what})"
+                         + (f": {item['reason']}" if item.get("reason") else "."))
+    if ideas.get("unaccounted"):
+        lines += ["", "**Some units are accounted for by no idea and were not marked as teaching "
+                  "nothing**, after the retries. Their content is checked only node by node:", ""]
+        lines += [f"- Part {part}: units {ranges(units)}"
+                  for part, units in ideas["unaccounted"].items()]
+    if ideas.get("unledgered"):
+        lines += ["", f"{len(ideas['unledgered'])} lecture sentence(s) of the script cite no idea of "
+                  "the ledger. They may state something the idea listing missed:", ""]
+        lines += [f"- Part {part}, sentence {issue['sentence']}: {issue['detail'].split(': ', 1)[-1]}"
+                  for part, issue in ideas["unledgered"][:30]]
     if ideas.get("empty_parts"):
         lines += ["", f"Parts {', '.join(ideas['empty_parts'])} teach content but have no idea "
                   "in the ledger. The list of ideas may have been cut short (for example by the "

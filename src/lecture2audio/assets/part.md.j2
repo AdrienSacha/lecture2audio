@@ -32,6 +32,11 @@ next: {{ fm("[[" ~ next ~ "]]") }}
 {% for card in group.cards %}
 {{ "#" * (group.depth + 1) }} {{ card.title }}
 
+{% if card.plain %}
+> [!abstract] {{ labels.plain }}
+{{ card.plain|quote }}
+
+{% endif %}
 {% if card.external %}
 > [!note] {{ labels.external }}
 > {{ labels.external_text }} {{ card.sources|join(", ") }}
@@ -69,6 +74,14 @@ $$
 {% for step in card.example.steps %}
 > {{ loop.index }}. {{ step }}
 {% endfor %}
+
+{% endif %}
+{% if card.proof %}
+> [!proof] {{ labels.proof }}
+{% for step in card.proof %}
+> {{ loop.index }}. {{ step }}
+{% endfor %}
+> ∎
 
 {% endif %}
 {% if card.diagram %}
@@ -122,6 +135,21 @@ $$
 {% endfor %}
 {% endfor %}
 {% endfor %}
+{% if exercises %}
+## {{ labels.exercises }}
+
+{% for exercise in exercises %}
+**{{ labels.exercise }} {{ loop.index }}.** {{ exercise.question }}
+
+> [!check]- {{ labels.solution }}
+{% for step in exercise.steps %}
+> {{ loop.index }}. {{ step }}
+{% endfor %}
+>
+> **{{ labels.answer }}:** {{ exercise.answer }}
+
+{% endfor %}
+{% endif %}
 {% if review %}
 ## {{ labels.review }}
 

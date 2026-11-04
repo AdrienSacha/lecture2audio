@@ -24,6 +24,7 @@ Each card has these fields:
 - "node": the node id the card belongs to. Cards follow the order of REQUIRED STRUCTURE.
 - "kind": "definition" (it defines a term), "concept" (a claim, a property, a rule, a derivation), "procedure" (the steps of an algorithm, a method or a calculation) or "remark" (a condition, a warning, an exam remark, a flag about a doubtful passage).
 - "title": the name of the idea.
+- "plain": the idea "in short", for a reader with no background who reads it first: one to three short sentences (under 20 words each) in everyday words, that say what the thing is and why it matters, directly and precisely. Name the technical term itself (the reader learns it), but explain it with words a newcomer knows; keep every condition and number that changes the meaning ("only if", "at most 5"). It states the same facts as the definition and the explanation, and no others. No analogy, no metaphor, no "imagine", no simplification that becomes false. Example: "A pointer is a variable that holds the address of another variable. Through it, the program can read or change that other variable."
 - "terms": the terms this card defines, exactly as spelled in the TERMBASE. A term with "define_here" true is defined in exactly one card of this part, the first time it is needed. Empty for a card that defines nothing.
 - "definition": for a card with terms, the exact definition: "X is ..." with the termbase meaning, as many sentences as the definition needs, giving the unit when the term is a quantity. Empty otherwise.
 - "instance": a concrete instance of the real object defined or stated, with actual values (the actual array [3, 1, 2], the actual packet). Empty when none makes the idea clearer.
@@ -31,12 +32,17 @@ Each card has these fields:
 - "formulas": formulas and relations to display on their own line, written in LaTeX without the surrounding dollar signs, for example "T = \\frac{L}{R}". Empty list if none. In every other text field, write short expressions between single dollar signs, for example "the rate $R$ in bits per second".
 - "notation": the symbols this card introduces, each {"symbol": "R", "meaning": "transmission rate, in bits per second"} (the symbol in LaTeX). A symbol keeps one meaning in the whole course. Empty list if none.
 - "example": a worked example, or null. Use it for every procedure and for every calculation: {"title": "...", "steps": ["...", "..."]}. Each step shows one operation and its result. Every number must be computed correctly. Use the lecture's own numbers when it has them.
+- "proof": when the script gives a proof or a derivation of the card's claim, its steps in order, one step per entry, each saying why it follows (the last step concludes the claim). Empty list when the script gives none: never write a proof the lecture does not give.
 - "diagram": a figure, or null (see below).
 - "code": code the lecture shows, each {"language": "python", "code": "...", "caption": "..."}. Empty list if none. Give the code without the fence.
 - "table": a table of values or of cases, or null: {"columns": ["..."], "rows": [["...", "..."]], "caption": "..."}.
 - "checks": zero to four questions the reader answers from memory, each {"question": "...", "answer": "..."}. Required (at least one) for every card that defines a term or is a procedure. Ask for a definition in the reader's own words, a reason, a step, or a calculation. The answer is complete, in one to three sentences.
 - "covers": the numbers of the SCRIPT sentences this card teaches. Every script sentence is covered by at least one card. A transition sentence ("The second point is ...") is covered by the first card of its node.
 - "ideas": the ids of the IDEAS TO TEACH that this card teaches (for example ["T3", "T4"]). Every idea of IDEAS TO TEACH is listed by at least one card, the card that states it in full. Empty list when IDEAS TO TEACH is not given.
+
+# Exercises
+
+After the cards, write "exercises": zero to four practice problems in the style of a university recitation, for the reader to solve after studying the part. Write them only when the part teaches a procedure, a calculation, a derivation or a rule that can be applied; a part that teaches only definitions or facts has none. Never pad the list. Each exercise is {"question": "...", "steps": ["...", "..."], "answer": "...", "covers": [3, 4]}: a question that applies what the covered sentences teach to a new instance (new values are allowed and must be correct), the complete worked solution step by step, each step one operation with its result and its reason, and the final answer. It may use only what the script teaches. Do not repeat a check question.
 
 # Rules of writing
 
@@ -78,6 +84,7 @@ Return one JSON object and nothing else. Write everything in LANGUAGE.
 
 {
   "cards": [
-    {"node": "1.1", "kind": "definition", "title": "...", "terms": ["..."], "definition": "...", "instance": "...", "explanation": ["...", "..."], "formulas": [], "notation": [], "example": null, "diagram": null, "code": [], "table": null, "checks": [{"question": "...", "answer": "..."}], "covers": [1, 2], "ideas": ["T1"]}
-  ]
+    {"node": "1.1", "kind": "definition", "title": "...", "plain": "...", "terms": ["..."], "definition": "...", "instance": "...", "explanation": ["...", "..."], "formulas": [], "notation": [], "example": null, "proof": [], "diagram": null, "code": [], "table": null, "checks": [{"question": "...", "answer": "..."}], "covers": [1, 2], "ideas": ["T1.1"]}
+  ],
+  "exercises": [{"question": "...", "steps": ["...", "..."], "answer": "...", "covers": [3, 4]}]
 }

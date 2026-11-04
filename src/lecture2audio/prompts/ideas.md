@@ -25,11 +25,12 @@ Split until each idea says one thing: "TCP is reliable and ordered" is two claim
 
 # Rules
 
-1. Complete. Every unit that teaches something is the source of at least one idea. Every node that has units has at least one idea. A long, dense part has many ideas; there is no maximum.
+1. Complete. Every unit is accounted for: it is cited in the "units" of at least one idea, or listed under "no_content". A long, dense part has many ideas; there is no maximum and no minimum. A part, or a node, that teaches little has few ideas: never invent or split an idea to fill a list.
 2. Faithful. Write each idea in one sentence of your own, with the teacher's terms and numbers. Add nothing the teacher did not say, and do not correct the teacher.
 3. In order. List the ideas in the order the teacher says them.
 4. Sourced. For each idea give the node or nodes where it is taught and the numbers of the units that say it.
 5. Leave out filler, room talk, jokes, and repetitions of an idea already listed. A repetition that adds a condition or a number is a new idea.
+6. Say what teaches nothing, instead of guessing. List under "no_content" the units that teach nothing ("kind": "no_teaching": filler, room talk, a pure transition, a repetition with nothing new) and the units you cannot interpret because the recognition garbled them ("kind": "unclear"). Never guess the meaning of an unclear unit.
 
 # Output
 
@@ -39,7 +40,8 @@ Return one JSON object and nothing else. Write "idea" in {{language}}.
   "ideas": [
     {"kind": "definition", "idea": "A window is the number of packets the sender may send before it must wait for an acknowledgement.", "nodes": ["1.1"], "units": [3, 4]},
     {"kind": "condition", "idea": "The sender retransmits a packet when no acknowledgement arrives within the timeout of 5 seconds.", "nodes": ["1.2"], "units": [9]}
-  ]
+  ],
+  "no_content": [{"units": [5, 6], "kind": "no_teaching", "reason": "The teacher asks whether everyone can hear."}]
 }
 
-"nodes" are ids from the TRANSCRIPT OF THIS PART headings. "units" are unit numbers from the same transcript. The program numbers the ideas.
+"nodes" are ids from the TRANSCRIPT OF THIS PART headings. "units" are unit numbers from the same transcript. "no_content" is an empty list when every unit teaches something. The program numbers the ideas.

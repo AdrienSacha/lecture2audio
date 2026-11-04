@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import shutil
 import subprocess
 import wave
@@ -69,6 +71,58 @@ def _cache_name(backend: TTS, text: str) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16] + ".wav"
 
 
+def render_chunk(backend: TTS, text: str, final: Path) -> None:
+    """Voice one piece of text into `final` (mono WAV at RATE)."""
+    raw = final.with_name(final.stem + ".raw" + backend.ext)
+    backend.synth(text, raw)
+    run_ffmpeg("-i", str(raw), "-ar", str(RATE), "-ac", "1", "-c:a", "pcm_s16le", str(final))
+    raw.unlink()
+
+
+def repair_chunks(backend: TTS, voiced: list[list[dict]], transcribe: Callable[[Path], str],
+                  threshold: float, retries: int, cache: Path,
+                  log: Callable[[str], None] = print) -> list[dict]:
+    """The round trip, with repair. Every chunk is transcribed back and compared with its
+    text; a chunk below `threshold` is voiced again, up to `retries` times, and the attempt
+    heard best is kept in place of the first. Autoregressive voices skip or invent words on
+    some samples, and resampling the failures is the standard inference-time fix (Seed-TTS,
+    2024; Wang et al., 2026). Scores are cached by file, so a rerun checks only new audio."""
+    from .roundtrip import similarity
+    seen = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else {}
+    results = []
+    for p_index, entries in enumerate(voiced):
+        chunks = [e for e in entries if e["kind"] == "chunk"]
+        for c_index, entry in enumerate(chunks):
+            path, stat = entry["path"], entry["path"].stat()
+            key = f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}"
+            if key in seen:
+                results.append(dict(seen[key], segment=p_index, chunk=c_index))
+                continue
+            heard = transcribe(path)
+            score = first = similarity(entry["text"], heard)
+            tries = 0
+            while score < threshold and tries < retries:
+                tries += 1
+                trial = path.with_name(f"{path.stem}.try{tries}.wav")
+                render_chunk(backend, entry["text"], trial)
+                again = transcribe(trial)
+                better = similarity(entry["text"], again)
+                if better > score:
+                    os.replace(trial, path)
+                    score, heard = better, again
+                else:
+                    trial.unlink()
+            if tries:
+                log(f"[voice] part {p_index + 1}, chunk {c_index + 1}: heard {first:.2f}, "
+                    f"{score:.2f} after {tries} new take(s)")
+            item = {"score": score, "first": first, "tries": tries, "heard": heard}
+            stat = path.stat()
+            seen[f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}"] = item
+            results.append(dict(item, segment=p_index, chunk=c_index))
+            cache.write_text(json.dumps(seen, ensure_ascii=False, indent=1), encoding="utf-8")
+    return results
+
+
 def synth_blocks(backend: TTS, parts: list[list[dict]], audio_dir: Path, chunk_chars: int,
                  quiz: bool = True, quiz_pause: float = 8.0,
                  log: Callable[[str], None] = print) -> list[list[dict]]:
@@ -96,11 +150,7 @@ def synth_blocks(backend: TTS, parts: list[list[dict]], audio_dir: Path, chunk_c
                 log(f"[voice] chunk {done}/{total}, part {p_index + 1}/{len(parts)}"
                     + (" (already recorded)" if final.exists() else ""))
                 if not final.exists():
-                    raw = audio_dir / (final.stem + ".raw" + backend.ext)
-                    backend.synth(chunk, raw)
-                    run_ffmpeg("-i", str(raw), "-ar", str(RATE), "-ac", "1", "-c:a", "pcm_s16le",
-                               str(final))
-                    raw.unlink()
+                    render_chunk(backend, chunk, final)
                 entries.append({"chapter": block["chapter"], "kind": "chunk", "path": final,
                                 "text": chunk, "block": b_index})
                 count += 1

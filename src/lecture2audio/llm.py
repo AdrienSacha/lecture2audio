@@ -674,6 +674,8 @@ def _dry_outline(user: str) -> str:
 
 def _dry_rewrite(user: str) -> str:
     shape = json.loads(_between(user, "REQUIRED STRUCTURE (JSON)"))
+    ideas = (json.loads(_between(user, "IDEAS OF THIS PART (JSON)"))
+             if "## IDEAS OF THIS PART (JSON)\n" in user else [])
     titles, texts, current = {}, {}, None
     for line in _between(user, "TRANSCRIPT OF THIS PART").splitlines():
         heading = re.match(r"^#{3,5} (\d+(?:\.\d+)*) (.*)$", line)
@@ -682,13 +684,22 @@ def _dry_rewrite(user: str) -> str:
             titles[current], texts[current] = heading.group(2), []
         elif line.startswith("#"):
             current = None
-        elif current and (unit := re.match(r"^\[\d+\] (.*)$", line)):
-            texts[current].append(unit.group(1))
+        elif current and (unit := re.match(r"^\[(\d+)\] (.*)$", line)):
+            texts[current].append((int(unit.group(1)), unit.group(2)))
     def items(ids):
         return [{"node": i, "phrase": titles.get(i, i)} for i in ids]
+
+    def cites(node, unit, first):
+        """The ideas a pass-through sentence states: those citing its unit, and, on the first
+        sentence of a node, those of the node that cite no unit."""
+        return [i["id"] for i in ideas if node in i["nodes"]
+                and (unit in (i.get("units") or []) or (first and not i.get("units")))]
+
     sections = []
     for node in shape["sections"]:
-        sentences = [{"origin": "lecture", "text": t} for t in texts.get(node, [])]
+        sentences = [dict({"origin": "lecture", "text": t},
+                          **({"ideas": cites(node, u, k == 0)} if ideas else {}))
+                     for k, (u, t) in enumerate(texts.get(node, []))]
         if not sentences:
             sentences = [{"origin": "added", "text": f"{titles.get(node, node)}."}]
         section = {"node": node, "sentences": sentences}
@@ -696,7 +707,7 @@ def _dry_rewrite(user: str) -> str:
             section["preview"] = items(shape["section_previews"][node])
         sections.append(section)
     part = shape["sections"][0]
-    first = next((t for n in shape["sections"] for t in texts.get(n, [])), titles.get(part, part))
+    first = next((t for n in shape["sections"] for _, t in texts.get(n, [])), titles.get(part, part))
     return json.dumps({"preview": {"intro": f"{titles.get(part, part)}.",
                                    "items": items(shape["preview_items"])},
                        "sections": sections, "recap": [first],

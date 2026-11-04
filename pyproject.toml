@@ -21,6 +21,8 @@ pptx = ["python-pptx>=1.0.2"]  # PowerPoint slides
 voice = ["mlx-audio>=0.6.2"]  # Ming-3.0-tts on Apple chips
 whisper-mac = ["mlx-whisper"]
 whisper = ["faster-whisper"]
+parakeet = ["parakeet-mlx>=0.4"]  # NVIDIA Parakeet speech recognition on Apple chips
+factcheck = ["minicheck @ git+https://github.com/Liyan06/MiniCheck.git@main"]  # local fact-checker
 
 [project.scripts]
 lecture2audio = "lecture2audio.cli:main"

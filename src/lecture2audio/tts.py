@@ -64,6 +64,18 @@ class SayTTS(TTS):
         subprocess.run(command, input=text.encode("utf-8"), check=True)
 
 
+def _write_wav(numpy, pieces: list, rate: int, out_path: Path) -> None:
+    """Float waveforms (one per generated segment) as one 16-bit mono WAV file."""
+    if not pieces:
+        raise TTSError("The voice model returned no audio for a piece of text.")
+    audio = numpy.clip(numpy.concatenate(pieces), -1, 1)
+    with wave.open(str(out_path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(int(rate))
+        out.writeframes((audio * 32767).round().astype("<i2").tobytes())
+
+
 class MingTTS(TTS):
     """Ming-3.0-tts-0.5B (inclusionAI / Ant Group, MIT licence), local through mlx-audio.
     About real time and 4.4 GB of memory at its peak on an Apple chip; 44.1 kHz output.
@@ -81,7 +93,7 @@ class MingTTS(TTS):
             import numpy
             from mlx_audio.tts.utils import load
         except ImportError as exc:
-            raise TTSError(f"Ming needs mlx-audio: pip install 'mlx-audio>=0.6.2' ({exc})") from exc
+            raise TTSError(f"Ming needs mlx-audio: uv pip install 'mlx-audio>=0.6.2' ({exc})") from exc
         self._np = numpy
         self.options: dict = {"voice": voice or self.DEFAULT_VOICE}
         if voice and voice.lower().endswith((".wav", ".mp3", ".m4a", ".flac")):
@@ -97,14 +109,38 @@ class MingTTS(TTS):
     def synth(self, text: str, out_path: Path) -> None:
         results = list(self.model.generate(text, lang_code="en", **self.options))
         pieces = [self._np.asarray(r.audio, dtype=self._np.float32) for r in results if r.samples]
-        if not pieces:
-            raise TTSError("Ming returned no audio for a piece of text.")
-        audio = self._np.clip(self._np.concatenate(pieces), -1, 1)
-        with wave.open(str(out_path), "wb") as out:
-            out.setnchannels(1)
-            out.setsampwidth(2)
-            out.setframerate(results[0].sample_rate)
-            out.writeframes((audio * 32767).round().astype("<i2").tobytes())
+        _write_wav(self._np, pieces, results[0].sample_rate if results else 24000, out_path)
+
+
+class Qwen3TTS(TTS):
+    """Qwen3-TTS (Alibaba Qwen team, 2026, Apache-2.0), local through mlx-audio on Apple chips.
+    Its report gives the lowest word error rate of the open models it compares, stable speech
+    over passages longer than ten minutes, and ten languages, French among them (Ming reads
+    English only). `voice` is a built-in speaker of the CustomVoice model (Ryan by default)."""
+    name = "qwen3"
+    MODEL = "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16"
+    DEFAULT_VOICE = "Ryan"
+    LANGUAGES = {"en": "English", "fr": "French"}
+
+    def __init__(self, language: str = "en", voice: str | None = None, model: str | None = None):
+        try:
+            import numpy
+            from mlx_audio.tts.utils import load_model
+        except ImportError as exc:
+            raise TTSError("Qwen3-TTS needs mlx-audio on an Apple chip: uv pip install "
+                           f"'mlx-audio>=0.6.2' ({exc})") from exc
+        self._np = numpy
+        self.voice = voice or self.DEFAULT_VOICE
+        self.language = self.LANGUAGES.get(language, "English")
+        self.model = load_model(model or self.MODEL)
+
+    def synth(self, text: str, out_path: Path) -> None:
+        results = list(self.model.generate_custom_voice(text=text, speaker=self.voice,
+                                                         language=self.language))
+        pieces = [self._np.asarray(r.audio, dtype=self._np.float32) for r in results]
+        rate = (getattr(results[0], "sample_rate", None) if results else None) \
+            or getattr(self.model, "sample_rate", 24000)
+        _write_wav(self._np, pieces, rate, out_path)
 
 
 class OpenAITTS(TTS):
@@ -197,13 +233,20 @@ class CommandTTS(TTS):
             os.unlink(handle.name)
 
 
-def make_tts(name: str, language: str, voice: str | None = None, command: str | None = None) -> TTS:
+def make_tts(name: str, language: str, voice: str | None = None, command: str | None = None,
+             model: str | None = None) -> TTS:
+    """`auto`: Ming-3.0 for English (the user's choice), Qwen3-TTS for French, which Ming does
+    not speak."""
+    if name == "auto":
+        name = "ming" if language == "en" else "qwen3"
     if name == "fake":
         return FakeTTS()
     if name == "say":
         return SayTTS(voice=voice)
     if name == "ming":
-        return MingTTS(voice=voice)
+        return MingTTS(voice=voice, model=model)
+    if name == "qwen3":
+        return Qwen3TTS(language, voice=voice, model=model)
     if name == "openai":
         return OpenAITTS(voice=voice)
     if name == "command":

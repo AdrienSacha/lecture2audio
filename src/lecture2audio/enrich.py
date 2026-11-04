@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .outline import Outline
 from .web import FetchError, fetch_page, quote_found, same_page
@@ -36,37 +39,71 @@ def part_of(node_id: str) -> int:
 
 # ------------------------------------------------------------------- coverage
 
+class _Idea(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    kind: Literal["definition", "claim", "step", "formula", "condition", "example", "warning"]
+    idea: str = Field(min_length=1)
+    nodes: list[str] = Field(min_length=1)
+    units: list[int] = Field(min_length=1)
+
+    @field_validator("idea")
+    @classmethod
+    def _stripped(cls, value):
+        if not value.strip():
+            raise ValueError("an idea is one non-empty sentence")
+        return value.strip()
+
+    @field_validator("nodes", mode="before")
+    @classmethod
+    def _node_ids(cls, value):
+        return [str(v) for v in value] if isinstance(value, list) else value
+
+
+class _NoContent(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    units: list[int] = Field(min_length=1)
+    kind: Literal["no_teaching", "unclear"] = "no_teaching"
+    reason: str = ""
+
+
+class IdeaList(BaseModel):
+    """The answer of the idea listing. No minimum count anywhere: a schema minimum makes
+    models pad their lists with real but irrelevant text (Barali and Paudel, 2026)."""
+    model_config = ConfigDict(extra="ignore")
+    ideas: list[_Idea]
+    no_content: list[_NoContent] = []
+
+
 def validate_idea_list(data, part, extra_units=()) -> list[str]:
-    """The gate on one part's list of atomic ideas: known kinds, nodes and units of this part,
-    and at least one idea for every node that has units (a node with none was skipped).
+    """The gate on one part's list of atomic ideas: the schema (IdeaList), then node ids and
+    unit numbers of this part. Whether every unit is accounted for is not a format error: it
+    is checked by `unaccounted_units` and asked again with feedback that says fewer is fine.
     `extra_units` are units added to the part for an audit."""
-    if not isinstance(data, dict) or not isinstance(data.get("ideas"), list):
-        return ['the answer must be {"ideas": [...]}']
-    nodes = {node.id: set(node.own_units()) for node in part.walk()}
+    try:
+        parsed = IdeaList.model_validate(data)
+    except ValidationError as exc:
+        return [f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors()[:8]]
+    nodes = {node.id for node in part.walk()}
     units = set(part.all_units()) | set(extra_units)
-    errors, named = [], set()
-    for k, idea in enumerate(data["ideas"], 1):
-        where = f"idea {k}"
-        if not isinstance(idea, dict) or not str(idea.get("idea", "")).strip():
-            errors.append(f'{where} must be {{"kind", "idea", "nodes", "units"}}')
-            continue
-        if idea.get("kind") not in IDEA_KINDS:
-            errors.append(f'{where}: "kind" must be one of {sorted(IDEA_KINDS)}')
-        given = idea.get("nodes")
-        if not isinstance(given, list) or not given or any(str(n) not in nodes for n in given):
-            errors.append(f'{where}: "nodes" must list one or more node ids from {list(nodes)}')
-        else:
-            named.update(str(n) for n in given)
-        cited = idea.get("units")
-        if not isinstance(cited, list) or not cited or any(
-                not isinstance(u, int) or u not in units for u in cited):
-            errors.append(f'{where}: "units" must list one or more unit numbers of this part '
-                          f"({min(units)} to {max(units)})" if units else
-                          f'{where}: this part has no units')
-    empty = [n for n, own in nodes.items() if own and n not in named]
-    if empty and not errors:
-        errors.append(f"nodes {empty} have units but no idea: list the ideas their units teach")
+    span = f"{min(units)} to {max(units)}" if units else "none"
+    errors = []
+    for k, idea in enumerate(parsed.ideas, 1):
+        if any(n not in nodes for n in idea.nodes):
+            errors.append(f'idea {k}: "nodes" must be ids from {sorted(nodes)}')
+        if any(u not in units for u in idea.units):
+            errors.append(f'idea {k}: "units" must be unit numbers of this part ({span})')
+    for k, item in enumerate(parsed.no_content, 1):
+        if any(u not in units for u in item.units):
+            errors.append(f'no_content {k}: "units" must be unit numbers of this part ({span})')
     return errors[:12]
+
+
+def unaccounted_units(data, part) -> list[int]:
+    """Units of the part that neither an idea nor "no_content" accounts for."""
+    parsed = IdeaList.model_validate(data)
+    seen = {u for i in parsed.ideas for u in i.units} | {u for n in parsed.no_content
+                                                         for u in n.units}
+    return [u for u in part.all_units() if u not in seen]
 
 
 def validate_coverage(data, node_ids: list[str], slide_count: int) -> list[str]:

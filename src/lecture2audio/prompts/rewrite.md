@@ -12,6 +12,7 @@ You turn one part of a university lecture into the script of a spoken explanatio
 - GLOSSARY (optional): the correct spelling of the course's technical terms. When a word sounds like a glossary term, it is that term.
 - SLIDES (optional): text of the slides that best match this part. Use them to confirm terms, formulas and the order of ideas. Do not teach slide content the teacher did not reach, unless it is needed to understand what was said.
 - TERMBASE FOR THIS PART (optional, JSON): the technical terms this part uses, each with its one definition, the terms it relies on, the terms it must not be confused with, and "define_here" (true if this part must define it, false if an earlier part already did).
+- IDEAS OF THIS PART (optional, JSON): the atomic ideas the teacher taught in this part (the idea ledger), each with an id (T3.12), its kind, the idea, its nodes and its units. It is the checklist of what the script must teach.
 - SUPPLEMENTS (optional, JSON): facts from outside the lecture that fill gaps the lecture left (a missing slide idea, an undefined term, a skipped step, a fundamental the lecture assumed). Each has an "id", the "node" it belongs to and the "text" to teach. They were found in reliable sources and checked.
 - FEEDBACK (optional): problems a reviewer found in an earlier attempt, shown with that attempt. Fix every problem and keep everything that was correct.
 
@@ -30,7 +31,7 @@ You turn one part of a university lecture into the script of a spoken explanatio
 8. Never change what the teacher said and never correct the teacher. If something looks wrong (a likely recognition error, or a slip of the teacher), keep it as said and add one sentence tagged "added" that flags it, for example: "The recording is unclear here; the value is probably 4."
 9. Remove only noise: filler words, repetitions, false starts, pauses, sips of water, and talk with the class about the room, the microphone or breaks.
 10. The listener has nothing in front of them. When the teacher points at something ("here we have this", "as you can see"), say what it is if the transcript or the slides tell you. If they do not, add one sentence tagged "added" saying plainly that the teacher showed something the recording does not capture. Never invent what was on the board.
-11. Tags. Tag a sentence "lecture" when it states something the teacher said (reworded is fine) or the slides show. Tag it "added" when it is yours. An "added" sentence only clarifies or connects what the lecture already says: a transition, what a term is for, how two ideas relate, a reminder of an earlier point, a flag about a doubtful passage, or a small worked example. It must be correct, it must not extend the lecture to a new topic, and every number in a worked example must be computed correctly.
+11. Tags. Tag a sentence "lecture" when it states something the teacher said (reworded is fine) or the slides show. When IDEAS OF THIS PART is given, give every "lecture" sentence an "ideas" list: the ids of the ideas it states. Every idea is stated by at least one "lecture" sentence, in the section of one of its nodes, with its conditions and numbers. A "lecture" sentence that states something no idea lists has an empty "ideas" list: never cite an idea a sentence does not state. Tag it "added" when it is yours. An "added" sentence only clarifies or connects what the lecture already says: a transition, what a term is for, how two ideas relate, a reminder of an earlier point, a flag about a doubtful passage, or a small worked example. It must be correct, it must not extend the lecture to a new topic, and every number in a worked example must be computed correctly.
 
 # Material from outside the lecture
 
@@ -71,6 +72,7 @@ Return one JSON object and nothing else (no code fence, no commentary). Write ev
     {"node": "1.1", "preview": [{"node": "1.1.1", "phrase": "..."}, {"node": "1.1.2", "phrase": "..."}],
      "sentences": [{"origin": "added", "text": "..."}, {"origin": "lecture", "text": "..."},
                    {"origin": "external", "source": "E1", "text": "..."}]}
+    // with IDEAS OF THIS PART, "lecture" sentences are {"origin": "lecture", "ideas": ["T1.3"], "text": "..."}
   ],
   "recap": ["...", "..."],
   "questions": [{"question": "...", "answer": "..."}],

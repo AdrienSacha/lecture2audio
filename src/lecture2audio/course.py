@@ -11,6 +11,7 @@ writes the result as a Markdown vault.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from pathlib import Path
@@ -18,14 +19,17 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from . import enrich
-from .course_schema import Card, Cards, describe
+from .course_schema import Card, Cards, Exercise, describe
 from .outline import Node, Outline, render_outline
 from .pipeline import (_NUMBER, SOFT_ISSUES, NumberIndex, TextPipeline, _and, _section, blocking,
                        format_feedback, numbers_lost, sentences_of, unsupported_numbers)
 
 REVIEW_PER_PART = 3
 LOOSE_KINDS = {"undefined_term", "missing_prerequisite", "skipped_step", "forward_reference",
-               "undefined_symbol", "ambiguous"}
+               "undefined_symbol", "ambiguous", "confusing_sentence", "missing_context"}
+EXERCISE_STATUSES = {"correct": None, "wrong": "exercise_wrong", "added_fact": "added_fact"}
+PLAIN_MAX_WORDS = 25  # per sentence of "In short"; a warning, not a gate (readability formulas
+# do not predict comprehension: Guo et al., 2025)
 JUDGE_STATUSES = {"faithful": None, "changed": "changed", "added_fact": "added_fact",
                   "lost": "lost", "analogy": "analogy"}
 SOFT = SOFT_ISSUES
@@ -43,8 +47,8 @@ ANALOGY = {
 def _texts(card: dict, everything: bool = False) -> list[str]:
     """The prose of a card, for the checks on wording; with `everything`, also its tables,
     figures, code and notation, for the checks on what the card holds."""
-    texts = [card["title"], card["definition"], card["instance"], *card["explanation"],
-             *card["formulas"]]
+    texts = [card["title"], card.get("plain", ""), card["definition"], card["instance"],
+             *card["explanation"], *card["formulas"], *card.get("proof", [])]
     if card.get("example"):
         texts += [card["example"]["title"], *card["example"]["steps"]]
     for check in card["checks"]:
@@ -92,6 +96,9 @@ def validate_cards(data, ctx: dict) -> list[str]:
         if unknown:
             errors.append(f'{where}: "ideas" {unknown} are not in IDEAS TO TEACH; use the ids '
                           f"{sorted(idea_ids)} or an empty list")
+    for k, exercise in enumerate(parsed.exercises, 1):
+        if any(not 1 <= n <= count for n in exercise.covers):
+            errors.append(f'exercises.{k}: sentence numbers in "covers" are between 1 and {count}')
     return errors
 
 
@@ -131,6 +138,16 @@ def card_issues(cards: list[dict], ctx: dict, language: str) -> list[dict]:
         if card["kind"] == "procedure" and not card["example"]:
             issues.append(_issue("no_example", "a procedure needs a worked example.", k,
                                  card["node"]))
+        if not card.get("plain"):
+            issues.append(_issue("no_plain", 'every card needs "plain": the idea in one to three '
+                                             "short sentences of everyday words.", k, card["node"]))
+        for sentence in re.split(r"(?<=[.!?])\s+", card.get("plain", "")):
+            if len(sentence.split()) > PLAIN_MAX_WORDS:
+                issues.append(_issue("plain_long", f'"{sentence[:60]}..." has '
+                                                   f"{len(sentence.split())} words; keep each "
+                                                   f"sentence of \"plain\" under "
+                                                   f"{PLAIN_MAX_WORDS} words.", k, card["node"]))
+                break
         for term in card["terms"]:
             defined.setdefault(enrich._key(term), []).append(k)
         for text in _texts(card):
@@ -172,7 +189,8 @@ def card_issues(cards: list[dict], ctx: dict, language: str) -> list[dict]:
     source = " ".join(s["text"] for s in script)
     for k, card in enumerate(cards, 1):
         fields = [{"origin": "lecture", "text": t} for t in
-                  [card["definition"], *card["explanation"], *card["formulas"]] if t]
+                  [card.get("plain", ""), card["definition"], *card["explanation"],
+                   *card["formulas"], *card.get("proof", [])] if t]
         for issue in unsupported_numbers(fields, source, ctx["slides"], language):
             issues.append(_issue("unsupported", issue["detail"].split(" appears")[0]
                                  + " is in neither the script nor the slides; the definition, the "
@@ -199,7 +217,24 @@ def card_issues(cards: list[dict], ctx: dict, language: str) -> list[dict]:
     return issues
 
 
-def validate_judgement(data, count: int, idea_ids=()) -> list[str]:
+def question_issues(cards: list[dict], exercises: list[dict]) -> list[dict]:
+    """Near-duplicate questions waste the reader's retrieval practice (deterministic QC of
+    generated questions: Shintani, 2026)."""
+    asked = [(f"card {k}", c["question"]) for k, card in enumerate(cards, 1)
+             for c in card["checks"]]
+    asked += [(f"exercise {k}", e["question"]) for k, e in enumerate(exercises, 1)]
+    issues = []
+    for a in range(len(asked)):
+        for b in range(a + 1, len(asked)):
+            ratio = difflib.SequenceMatcher(None, asked[a][1].lower(), asked[b][1].lower()).ratio()
+            if ratio >= 0.9:
+                issues.append(_issue("duplicate_question", f"the questions of {asked[a][0]} and "
+                                                           f"{asked[b][0]} are nearly the same; "
+                                                           "ask about another point."))
+    return issues
+
+
+def validate_judgement(data, count: int, idea_ids=(), exercises: int = 0) -> list[str]:
     if not isinstance(data, dict) or not isinstance(data.get("cards"), list):
         return ['the answer must be {"cards": [...]}']
     errors, seen = [], set()
@@ -225,6 +260,14 @@ def validate_judgement(data, count: int, idea_ids=()) -> list[str]:
                     not isinstance(n, int) or not 1 <= n <= count for n in numbers):
                 errors.append(f'idea {item.get("idea") if isinstance(item, dict) else item}: '
                               f'"cards" lists card numbers between 1 and {count}')
+    if exercises:
+        given = {i.get("exercise"): i.get("status") for i in data.get("exercises", [])
+                 if isinstance(i, dict)}
+        absent = [n for n in range(1, exercises + 1) if given.get(n) not in EXERCISE_STATUSES]
+        if absent:
+            errors.append('give {"exercise": number, "status": one of '
+                          f'{sorted(EXERCISE_STATUSES)}, "detail": "..."}} for every exercise; '
+                          f"missing {absent}")
     return errors
 
 
@@ -245,6 +288,8 @@ def reader_text(cards: list[dict]) -> str:
     out = []
     for card in cards:
         out.append(f"[{card['id']}] {card['title']} ({card['kind']})")
+        if card.get("plain"):
+            out.append(f"In short: {card['plain']}")
         if card["definition"]:
             out.append(f"Definition: {card['definition']}")
         if card["instance"]:
@@ -254,6 +299,8 @@ def reader_text(cards: list[dict]) -> str:
         out += [f"Symbol {n['symbol']}: {n['meaning']}" for n in card["notation"]]
         if card["example"]:
             out += [f"Example, {card['example']['title']}:"] + card["example"]["steps"]
+        if card.get("proof"):
+            out += ["Proof:"] + card["proof"]
         if card["diagram"]:
             out += [f"Figure: {f['caption']}" for f in card["diagram"]["frames"]]
         if card.get("table"):
@@ -351,6 +398,8 @@ class CoursePipeline:
                 number += 1
                 tag = sentence["origin"] + (f" {sentence.get('source')}"
                                             if sentence["origin"] == "external" else "")
+                if sentence.get("ideas"):
+                    tag += " " + ",".join(map(str, sentence["ideas"]))
                 lines.append(f"{number}. [{tag}] {sentence['text']}")
             lines.append("")
         return "\n".join(lines).strip()
@@ -375,15 +424,18 @@ class CoursePipeline:
                 + "## SCRIPT\n" + self._numbered(outline, record))
         data = self.p._ask_json(self.p.rewrite_llm, self.p.prompts.course, user,
                                 lambda d: validate_cards(d, ctx), f"course of part {part.id}")
-        return [normalise(c) for c in data["cards"]]
+        exercises = [Exercise.model_validate(e).model_dump(mode="json")
+                     for e in data.get("exercises") or []]
+        return [normalise(c) for c in data["cards"]], exercises
 
-    def _judge(self, ctx: dict, record: dict, outline: Outline,
-               cards: list[dict]) -> tuple[list[dict], list[dict]]:
+    def _judge(self, ctx: dict, record: dict, outline: Outline, cards: list[dict],
+               exercises: list[dict] = ()) -> tuple[list[dict], list[dict]]:
         """The issues, and for each idea of the part its status and the numbers of the cards
         that teach it (the judge's, else the cards that claim the idea)."""
         part = ctx["part"]
-        shown = [{"card": k, "title": c["title"], "terms": c["terms"],
+        shown = [{"card": k, "title": c["title"], "plain": c.get("plain", ""), "terms": c["terms"],
                   "definition": c["definition"], "explanation": c["explanation"],
+                  "proof": c.get("proof", []),
                   "formulas": c["formulas"], "instance": c["instance"], "example": c["example"],
                   "diagram": c["diagram"], "table": c["table"], "checks": c["checks"],
                   "covers": c["covers"], "ideas": c.get("ideas", [])}
@@ -395,9 +447,13 @@ class CoursePipeline:
                 + _section("IDEAS (JSON)", json.dumps(
                     [{k: i[k] for k in ("id", "kind", "idea")} for i in ctx["ideas"]],
                     ensure_ascii=False, indent=1) if ctx["ideas"] else "")
+                + _section("EXERCISES (JSON)", json.dumps(
+                    [dict(e, exercise=k) for k, e in enumerate(exercises, 1)], ensure_ascii=False,
+                    indent=1) if exercises else "")
                 + "## CARDS (JSON)\n" + json.dumps(shown, ensure_ascii=False, indent=1))
         data = self.p._ask_json(self.p.verify_llm, self.p.prompts.course_check, user,
-                                lambda d: validate_judgement(d, len(cards), idea_ids),
+                                lambda d: validate_judgement(d, len(cards), idea_ids,
+                                                             len(exercises)),
                                 f"check of the course of part {part.id}")
         issues = []
         for item in data["cards"]:
@@ -405,6 +461,11 @@ class CoursePipeline:
             if kind and 1 <= item["card"] <= len(cards):
                 issues.append(_issue(kind, str(item.get("detail") or item["status"]),
                                      item["card"], cards[item["card"] - 1]["node"]))
+        for item in data.get("exercises", []) if exercises else []:
+            kind = EXERCISE_STATUSES.get(item.get("status"))
+            if kind and isinstance(item.get("exercise"), int):
+                issues.append(_issue(kind, f'exercise {item["exercise"]}: '
+                                           + str(item.get("detail") or item["status"])))
         by_id = {str(i["id"]): i for i in ctx["ideas"]}
         ideas = []
         for item in data.get("ideas", []) if idea_ids else []:
@@ -437,41 +498,58 @@ class CoursePipeline:
                                      None, str(idea["nodes"][0])))
         return issues, ideas
 
-    def _process(self, outline: Outline, part: Node, record: dict) -> dict:
+    def _process(self, outline: Outline, part: Node, record: dict, start: dict | None = None,
+                 feedback: str = "", tries: int | None = None) -> dict:
+        """Write, check by code, judge, and keep the best attempt. `start` (a finished result)
+        and `feedback` make a revision: the earlier result stays unless the new one has no more
+        blocking problems."""
         ctx = self._context(outline, part, record)
         ctx["slides"] = " ".join(self.p.slides) if self.p.slides else ""
         language = self.p.language
-        best, feedback, attempts = None, "", 0
-        for _ in range(self.p.max_retries + 1):
+        best, attempts = None, 0
+        if start:
+            best = {"cards": start["cards"], "exercises": start.get("exercises", []),
+                    "issues": start["issues"], "blocking": start["blocking"],
+                    "ideas": [dict(i, cards=[int(c.rsplit(".", 1)[1]) for c in i["cards"]])
+                              for i in start.get("ideas", [])]}
+        for _ in range(self.p.max_retries + 1 if tries is None else tries):
             attempts += 1
-            cards = self._write(outline, ctx, record, feedback)
-            judged, ideas = self._judge(ctx, record, outline, cards)
-            issues = card_issues(cards, ctx, language) + judged
+            cards, exercises = self._write(outline, ctx, record, feedback)
+            judged, ideas = self._judge(ctx, record, outline, cards, exercises)
+            issues = card_issues(cards, ctx, language) + question_issues(cards, exercises) + judged
             count = len([i for i in issues if i["type"] not in SOFT])
-            if best is None or count < best["blocking"]:
-                best = {"cards": cards, "issues": issues, "blocking": count, "ideas": ideas}
+            better = count <= best["blocking"] if (start and attempts == 1) else (
+                best is None or count < best["blocking"])
+            if better:
+                best = {"cards": cards, "exercises": exercises, "issues": issues,
+                        "blocking": count, "ideas": ideas, "revised": bool(start)}
             if best["blocking"] == 0:
                 break
             more = attempts <= self.p.max_retries
             self.p.log(f"[course] part {part.id}: {best['blocking']} problem(s), "
                        + ("rewriting with feedback" if more else "keeping the best attempt"))
-            feedback = format_feedback(json.dumps(best["cards"], ensure_ascii=False),
+            feedback = format_feedback(json.dumps({"cards": best["cards"],
+                                                   "exercises": best["exercises"]},
+                                                  ensure_ascii=False),
                                        [i for i in best["issues"] if i["type"] not in SOFT])
         source = " ".join(s["text"] for s in ctx["script"])
         cards = [dict(derive(c, ctx["script"], source, ctx["slides"], language),
                       id=f"{part.id}.{k}") for k, c in enumerate(best["cards"], 1)]
+        exercises = [dict(e, id=f"{part.id}.x{k}") for k, e in enumerate(best["exercises"], 1)]
         # the ledger's view: which card (by id) teaches each idea of the part
         ideas = [dict(i, cards=[cards[n - 1]["id"] for n in i["cards"]]) for i in best["ideas"]]
-        return {"part": part.id, "title": part.title, "cards": cards, "issues": best["issues"],
-                "blocking": best["blocking"], "attempts": attempts,
-                "flagged": best["blocking"] > 0, "ideas": ideas}
+        return {"part": part.id, "title": part.title, "cards": cards, "exercises": exercises,
+                "issues": best["issues"], "blocking": best["blocking"],
+                "attempts": (start or {}).get("attempts", 0) + attempts,
+                "flagged": best["blocking"] > 0, "ideas": ideas,
+                "revised": best.get("revised", False)}
 
-    def cold_read(self, parts: list[dict]) -> list[dict]:
+    def cold_read(self, parts: list[dict], tag: str = "cold") -> list[dict]:
         """A reader that knows only the earlier parts looks for loose ends, part by part."""
         directory = self.p._dir("course")
 
         def one(part: dict) -> dict:
-            cache = directory / f"cold_{int(part['part']):03d}.json"
+            cache = directory / f"{tag}_{int(part['part']):03d}.json"
             if cache.exists():
                 return json.loads(cache.read_text(encoding="utf-8"))
             pid = int(part["part"])
@@ -512,12 +590,65 @@ class CoursePipeline:
             return result
 
         parts = self.p._map(one, outline.parts, on_done)
+        cold = self.cold_read(parts)
+        parts, cold = self.revise(outline, parts, cold, by_part)
+        for part in parts:  # the ledger follows a revision too
+            if on_done and part.get("revised"):
+                on_done(part)
         notation, clashes = collect_notation(parts)
         (directory / "notation.json").write_text(json.dumps(notation, ensure_ascii=False,
                                                             indent=2), encoding="utf-8")
         return {"parts": parts, "notation": notation, "clashes": clashes,
-                "review": build_review(parts), "cold": self.cold_read(parts),
+                "review": build_review(parts), "cold": cold,
                 "audit": self.audit_judge(outline, parts, by_part) if audit else None}
+
+    def revise(self, outline: Outline, parts: list[dict], cold: list[dict],
+               by_part: dict) -> tuple[list[dict], list[dict]]:
+        """One revision round from the cold read: the loose ends a simulated first reader found
+        (unknown terms, missing context, confusing sentences) go back to the writer once, and
+        the revision is kept only if it has no more blocking problems. Feedback from simulated
+        readers, applied by one editor, improves both readability and factuality, best at one
+        or two rounds (Jung et al., 2026)."""
+        directory = self.p._dir("course")
+        loose = {c["part"]: c["loose"] for c in cold if c.get("loose")}
+        if not loose:
+            return parts, cold
+
+        def one(part: dict) -> dict:
+            if part["part"] not in loose:
+                return part
+            cache = directory / f"revised_{int(part['part']):03d}.json"
+            if cache.exists():
+                return json.loads(cache.read_text(encoding="utf-8"))
+            self.p.log(f"[course] part {part['part']}: revising {len(loose[part['part']])} "
+                       "loose end(s) found by the cold read")
+            feedback = ("A first-year reader who knows only the earlier parts read these cards "
+                        "and was lost at the places below. Fix each one in the card named (define "
+                        "the term, add the missing step or context, rewrite the confusing "
+                        "sentence), using only the SCRIPT, and keep everything else as it is.\n\n"
+                        + json.dumps({"cards": part["cards"], "exercises": part.get("exercises",
+                                                                                    [])},
+                                     ensure_ascii=False)
+                        + "\n\nLoose ends:\n" + "\n".join(
+                            f"- card {i['card']} ({i['kind']}): {i['detail']}"
+                            for i in loose[part["part"]]))
+            try:
+                result = self._process(outline, outline.node(part["part"]), by_part[part["part"]],
+                                       start=part, feedback=feedback, tries=1)
+            except Exception as exc:  # a failed revision keeps the reviewed cards
+                self.p.log(f"[course] revision of part {part['part']}: {exc}")
+                return part
+            result["revision_checked"] = True
+            cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            return result
+
+        parts = self.p._map(one, parts)
+        changed = [p for p in parts if p.get("revised")]
+        if changed:  # read again what changed, so the report shows the loose ends that remain
+            again = {c["part"]: c for c in self.cold_read(changed, tag="cold_revised")}
+            cold = [dict(again[c["part"]], before=len(c["loose"])) if c["part"] in again else c
+                    for c in cold]
+        return parts, cold
 
     def audit_judge(self, outline: Outline, parts: list[dict], by_part: dict) -> dict:
         """Empty, in an accepted part, the one card that teaches an idea (it keeps its title
@@ -543,8 +674,9 @@ class CoursePipeline:
             ctx = self._context(outline, node, by_part[part["part"]])
             ctx["slides"] = " ".join(self.p.slides) if self.p.slides else ""
             hollow = [c if c["id"] != target["cards"][0] else dict(
-                c, definition="", instance="", explanation=[c["title"]], formulas=[],
-                notation=[], example=None, diagram=None, code=[], table=None, checks=[])
+                c, plain="", definition="", instance="", explanation=[c["title"]], formulas=[],
+                notation=[], example=None, proof=[], diagram=None, code=[], table=None,
+                checks=[])
                 for c in part["cards"]]
             self.p.log(f"[audit] emptying card {target['cards'][0]} to test the course judge")
             try:
@@ -589,7 +721,7 @@ def dry_course(user: str) -> str:
         if not section["lines"]:
             continue
         card = {"node": section["node"], "kind": "concept", "title": f"Section {section['node']}",
-                "terms": [], "definition": "", "instance": "",
+                "plain": section["lines"][0][1], "terms": [], "definition": "", "instance": "",
                 "explanation": [text for _, text in section["lines"]], "formulas": [],
                 "notation": [], "example": None, "diagram": None, "code": [], "table": None,
                 "checks": [], "covers": [n for n, _ in section["lines"]]}
@@ -605,7 +737,7 @@ def dry_course(user: str) -> str:
     for idea in ideas if cards else []:  # the card of the idea's node, else the first card
         place = next((k for k, n in enumerate(nodes) if n in map(str, idea.get("nodes", []))), 0)
         cards[place].setdefault("ideas", []).append(idea["id"])
-    return json.dumps({"cards": cards})
+    return json.dumps({"cards": cards, "exercises": []})
 
 
 def dry_course_check(user: str) -> str:
@@ -615,8 +747,12 @@ def dry_course_check(user: str) -> str:
         ideas = [{"idea": i["id"], "status": "taught", "detail": "",
                   "cards": [c["card"] for c in cards if i["id"] in c.get("ideas", [])]}
                  for i in json.loads(user.split("## IDEAS (JSON)\n", 1)[1].split("\n\n## ", 1)[0])]
+    exercises = []
+    if "## EXERCISES (JSON)\n" in user:
+        exercises = [{"exercise": e["exercise"], "status": "correct", "detail": ""} for e in
+                     json.loads(user.split("## EXERCISES (JSON)\n", 1)[1].split("\n\n## ", 1)[0])]
     return json.dumps({"cards": [{"card": c["card"], "status": "faithful", "detail": ""}
-                                 for c in cards], "ideas": ideas})
+                                 for c in cards], "ideas": ideas, "exercises": exercises})
 
 
 # ---------------------------------------------------------------------- report
@@ -630,6 +766,15 @@ def course_report(course: dict, stats: dict, language: str = "en") -> str:
                  f"diagrams, written as {stats['notes']} notes of a Markdown vault. Every sentence "
                  f"of the verified script is covered by at least one card, unless a part is listed "
                  f"below as having open problems.")
+    exercises = sum(len(p.get("exercises", [])) for p in parts)
+    if exercises:
+        lines.append(f"{exercises} practice exercise(s) with worked solutions close the parts, "
+                     "each checked by the judge against the script.")
+    revised = [p["part"] for p in parts if p.get("revised")]
+    if revised:
+        lines.append(f"Parts {', '.join(revised)} were revised once from the loose ends of the "
+                     "cold read; a revision is kept only when it has no more problems than the "
+                     "cards it replaces.")
     external = [c for c in cards if c["origin"] == "external"]
     lines.append(f"{len(external)} card(s) teach facts from outside the lecture and are marked "
                  "as such in the notes.")
@@ -639,9 +784,13 @@ def course_report(course: dict, stats: dict, language: str = "en") -> str:
                      "numbers are not in the script; the notes mark them as illustrations added "
                      "by the course material.")
     loose = [(c["part"], i) for c in course.get("cold", []) for i in c["loose"]]
+    before = sum(c.get("before", len(c["loose"])) for c in course.get("cold", []))
+    if before > len(loose):
+        lines.append(f"The cold read found {before} loose end(s) before the revision round and "
+                     f"{len(loose)} after it.")
     if loose:
         lines += ["", "A cold read of the notes, by a reader who knows only the earlier parts, "
-                  f"found {len(loose)} loose end(s):", ""]
+                  f"found {len(loose)} loose end(s) that remain:", ""]
         lines += [f"- Card {i['card']} ({i['kind']}): {i['detail']}" for _, i in loose]
         lines.append("")
     elif course.get("cold"):

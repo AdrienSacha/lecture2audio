@@ -327,8 +327,39 @@ class Ideas(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pipeline = harness.pipeline(tmp)
             found = pipeline.run_ideas(pipeline.run_outline(UNITS))
-        self.assertIn("nodes ['1.2'] have units but no idea", answers[1])
+        self.assertIn("## UNITS NOT ACCOUNTED FOR\nUnits 3-5 are cited by no idea", answers[1])
+        self.assertIn("fewer ideas are fine", answers[1])  # no pressure to pad the list
         self.assertEqual(len([i for i in found if i["id"].startswith("T1.")]), 4)
+
+    def test_units_that_teach_nothing_may_be_declared_instead_of_padded(self):
+        def ideas(system, user):
+            data = json.loads(dry_run_handler(system, user))
+            data["ideas"] = [i for i in data["ideas"] if i["units"] != [4]]
+            if any(u == 4 for i in json.loads(dry_run_handler(system, user))["ideas"]
+                   for u in i["units"]):
+                data["no_content"] = [{"units": [4], "kind": "unclear", "reason": "garbled"}]
+            return json.dumps(data)
+
+        harness = Harness(ideas=ideas)
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = harness.pipeline(tmp)
+            pipeline.run_ideas(pipeline.run_outline(UNITS))
+        self.assertEqual(len(harness.prompts("ideas")), 2)  # accounted for at the first try
+        self.assertEqual(pipeline.idea_notes["no_content"],
+                         [{"part": "1", "units": [4], "kind": "unclear", "reason": "garbled"}])
+        self.assertEqual(pipeline.idea_notes["unaccounted"], {})
+
+    def test_units_still_unaccounted_after_the_retries_are_kept_for_the_report(self):
+        def ideas(system, user):
+            data = json.loads(dry_run_handler(system, user))
+            data["ideas"] = [i for i in data["ideas"] if i["units"] != [5]]
+            return json.dumps(data)
+
+        harness = Harness(ideas=ideas)
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = harness.pipeline(tmp, max_retries=1)
+            pipeline.run_ideas(pipeline.run_outline(UNITS))
+        self.assertEqual(pipeline.idea_notes["unaccounted"], {"1": [5]})
 
     def test_a_part_that_keeps_failing_is_left_empty_and_tried_again_next_run(self):
         def ideas(system, user):
@@ -344,6 +375,90 @@ class Ideas(unittest.TestCase):
             self.assertEqual({i["id"][:3] for i in found}, {"T1."})
             self.assertFalse((pathlib.Path(tmp) / "ideas" / "part_002.json").exists())
             self.assertTrue((pathlib.Path(tmp) / "ideas" / "part_001.json").exists())
+
+
+class Citations(unittest.TestCase):
+    def test_every_idea_must_be_cited_by_a_lecture_sentence(self):
+        def rewrite(system, user):
+            data = json.loads(good_rewrite(user))
+            if len(harness.prompts("rewrite")) == 1:
+                for section in data["sections"]:
+                    for sentence in section["sentences"]:
+                        sentence.pop("ideas", None)
+            return json.dumps(data)
+
+        harness = Harness(rewrite)
+        _, records, _ = run_text(harness, coverage=LEDGER)
+        self.assertEqual(records[0]["attempts"], 2)
+        second = harness.prompts("rewrite")[1]
+        self.assertIn("idea_uncited", second)
+        self.assertIn("No \"lecture\" sentence cites the idea T1", second)
+        self.assertIn("## IDEAS OF THIS PART (JSON)", second)
+
+    def test_a_sentence_citing_no_idea_is_a_warning_and_an_unknown_id_is_refused(self):
+        _, records, _ = run_text(Harness(), coverage=LEDGER)
+        unledgered = [i for i in records[0]["issues"] if i["type"] == "unledgered"]
+        self.assertTrue(unledgered)  # 1.2 has three units but one idea, cited once
+        self.assertFalse(records[0]["flagged"])
+        shape = {"preview_items": [], "sections": ["1"], "section_previews": {}, "ideas": ["T1"]}
+        data = {"preview": {"intro": "i", "items": []}, "recap": ["r"],
+                "questions": [{"question": "q", "answer": "a"}],
+                "sections": [{"node": "1", "sentences": [
+                    {"origin": "lecture", "text": "t", "ideas": ["T9"]}]}]}
+        from lecture2audio.pipeline import validate_part
+        self.assertTrue(any("T9" not in e and "IDEAS OF THIS PART" in e
+                            for e in validate_part(data, shape)))
+        data["sections"][0]["sentences"][0]["ideas"] = ["T1"]
+        self.assertEqual(validate_part(data, shape), [])
+
+
+class SpeechRecognition(unittest.TestCase):
+    def test_known_hallucinations_and_loops_are_dropped_and_reported(self):
+        from lecture2audio.transcribe import clean_segments
+        kept, removed = clean_segments([
+            "A router forwards packets.", "Thank you for watching!", "The table is built.",
+            "The table is built.", "The table is built.", "Sous-titres réalisés par la "
+            "communauté d'Amara.org", "Thank you for watching the router forward packets."])
+        self.assertEqual(kept, ["A router forwards packets.", "The table is built.",
+                                "The table is built.",
+                                "Thank you for watching the router forward packets."])
+        self.assertEqual(len(removed), 3)
+        self.assertIn("silence", removed[0]["reason"])
+        self.assertIn("third time", removed[1]["reason"])
+
+
+class VoiceRepair(unittest.TestCase):
+    def test_a_chunk_heard_wrong_is_voiced_again_and_the_better_take_kept(self):
+        from lecture2audio.assemble import repair_chunks
+        from lecture2audio.tts import FakeTTS
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg missing")
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = pathlib.Path(tmp)
+            first = audio / "a.wav"
+            FakeTTS().synth("x", first)
+            voiced = [[{"kind": "chunk", "path": first, "text": "the window holds packets"},
+                       {"kind": "pause", "path": first, "text": None}]]
+            heard = iter(["the window holes", "the window holds packets"])
+            results = repair_chunks(FakeTTS(), voiced, lambda p: next(heard), 0.88, 2,
+                                    audio / "roundtrip.json", silent)
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["tries"], 1)
+            self.assertEqual(results[0]["score"], 1.0)
+            self.assertLess(results[0]["first"], 0.88)
+            self.assertEqual(sorted(p.name for p in audio.glob("*.wav")), ["a.wav"])
+            again = repair_chunks(FakeTTS(), voiced, lambda p: 1 / 0, 0.88, 2,
+                                  audio / "roundtrip.json", silent)  # cached: nothing heard
+            self.assertEqual(again[0]["score"], 1.0)
+
+    def test_the_voice_is_chosen_by_language(self):
+        from lecture2audio import tts
+        made = []
+        with mock.patch.object(tts, "MingTTS", lambda **k: made.append("ming")), \
+                mock.patch.object(tts, "Qwen3TTS", lambda *a, **k: made.append("qwen3")):
+            tts.make_tts("auto", "en")
+            tts.make_tts("auto", "fr")
+        self.assertEqual(made, ["ming", "qwen3"])
 
 
 class IdeaAudit(unittest.TestCase):
@@ -544,7 +659,8 @@ class EndToEnd(unittest.TestCase):
         source.write_text(self.TRANSCRIPT, encoding="utf-8")
         out = pathlib.Path(tmp) / "out"
         code = self.run_cli("build", str(source), "--llm", "dry", "--tts", "fake", "--out", str(out),
-                            "--language", "en", "--max-part-words", "25", "--quiz-pause", "1", *extra)
+                            "--language", "en", "--max-part-words", "25", "--quiz-pause", "1",
+                            "--factcheck", "off", *extra)
         self.assertEqual(code, 0)
         return out / "lecture"
 

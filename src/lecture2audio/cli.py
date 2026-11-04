@@ -17,7 +17,8 @@ import urllib.parse
 from pathlib import Path
 
 from . import ledger
-from .assemble import encode_final, encode_part_files, join_parts, synth_blocks
+from .assemble import encode_final, encode_part_files, join_parts, repair_chunks, synth_blocks
+from .factcheck import run_factcheck
 from .course import CoursePipeline, course_report
 from .course_render import write_vault
 from .series import load_lecture, merge_termbases, series_report
@@ -26,11 +27,10 @@ from .web import SEARCH_ENGINES, FetchError, make_search, pick_engine
 from .pipeline import PipelineError, TextPipeline, chapter_titles, load_prompts
 from .report import (write_glossary, write_index, write_questions, write_reference,
                      write_report, write_script)
-from .roundtrip import check_chunks
 from .segment import split_units
 from .sources import (AUDIO_EXT, detect_language, discover_inputs, load_glossary, load_slides,
                       load_transcript, slugify)
-from .transcribe import STTError, transcribe_audio
+from .transcribe import STTError, available as stt_available, transcribe_audio
 from .tts import TTSError, make_tts
 
 # What --redo X discards: the results of stage X and of every stage after it. The idea
@@ -39,14 +39,16 @@ GAPS = ["coverage.json", "coverage_audit.json", "termbase.json", "research"]
 DERIVED = ["ideas.csv", "anki.csv"]
 VOICE = ["spoken", "audio", "parts"]
 IDEAS = ["ideas", "ideas_audit.json"]
-LATER = {"transcribe": ["outline.json", *GAPS, *IDEAS, "rewrite", "audit.json", *VOICE,
+CHECKS = ["factcheck"]
+LATER = {"transcribe": ["outline.json", *GAPS, *IDEAS, "rewrite", "audit.json", *CHECKS, *VOICE,
                         "course", "vault", *DERIVED],
-         "outline": ["outline.json", *GAPS, *IDEAS, "rewrite", "audit.json", *VOICE, "course",
+         "outline": ["outline.json", *GAPS, *IDEAS, "rewrite", "audit.json", *CHECKS, *VOICE, "course",
                      "vault", *DERIVED],
-         "ideas": [*IDEAS, "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
-         "gaps": [*GAPS, "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
-         "research": ["research", "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
-         "rewrite": ["rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
+         "ideas": [*IDEAS, "rewrite", "audit.json", *CHECKS, *VOICE, "course", "vault",
+                   *DERIVED],
+         "gaps": [*GAPS, "rewrite", "audit.json", *CHECKS, *VOICE, "course", "vault", *DERIVED],
+         "research": ["research", "rewrite", "audit.json", *CHECKS, *VOICE, "course", "vault", *DERIVED],
+         "rewrite": ["rewrite", "audit.json", *CHECKS, *VOICE, "course", "vault", *DERIVED],
          "spoken": VOICE, "audio": ["audio", "parts"],
          "course": ["course", "vault", *DERIVED]}
 COMMANDS = ("build", "text", "series")
@@ -133,8 +135,9 @@ def build_parser() -> argparse.ArgumentParser:
                               "gpt-6-astra (openai) or deepseek-v4-pro (deepseek); otherwise "
                               "the rewrite model")
         llm.add_argument("--verify-base-url", help="API base URL for --verify-llm openai or local")
-        llm.add_argument("--max-part-words", type=int, default=2500,
-                         help="longest part of the outline, in words (default 2500)")
+        llm.add_argument("--max-part-words", type=int, default=1500,
+                         help="longest part of the outline, in words (default 1500: long outputs "
+                              "lose faithfulness towards their end, so parts are kept short)")
         llm.add_argument("--max-retries", type=int, default=2,
                          help="rewrites allowed after a failed verification (default 2)")
         llm.add_argument("--workers", type=int, default=3,
@@ -158,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
                                    "(BRAVE_API_KEY) or searxng (free, self-hosted, "
                                    "--searxng-url). 'auto' takes the first one available")
         research.add_argument("--searxng-url", help="address of a SearXNG instance with JSON output")
+        research.add_argument("--factcheck", choices=["auto", "minicheck", "off"], default="auto",
+                              help="check every lecture sentence of the script against the "
+                                   "transcript units it cites with MiniCheck, a small local "
+                                   "fact-checker (auto: when it is installed, "
+                                   "uv pip install -e '.[factcheck]')")
         research.add_argument("--research-depth", type=int, default=30,
                               help="searches and page reads allowed per gap (default 30). Every "
                                    "gap is researched; raise this for deeper research")
@@ -166,17 +174,24 @@ def build_parser() -> argparse.ArgumentParser:
                               "spoken.md, coverage.md, ideas.md, termbase.md, research.md, "
                               "terms.md, course.md, course_check.md, cold_read.md)")
         stt = p.add_argument_group("speech to text (recording input, round trip)")
-        stt.add_argument("--stt", choices=["auto", "mlx", "faster"], default="auto")
+        stt.add_argument("--stt", choices=["auto", "mlx", "faster", "parakeet"], default="auto",
+                         help="mlx = Whisper large-v3 on Apple chips; faster = faster-whisper; "
+                              "parakeet = NVIDIA Parakeet TDT (no hallucination over silence, "
+                              "but no glossary prompt); auto = the first one installed, in "
+                              "that order")
         stt.add_argument("--stt-model", help="model name for the chosen backend")
         stt.add_argument("--transcribe-only", action="store_true",
                          help="stop after writing transcript.txt, so you can correct it first")
         if command == "build":
             voice = p.add_argument_group("voice")
-            voice.add_argument("--tts", choices=["ming", "openai", "say", "command", "fake"],
-                               default="ming",
-                               help="ming = Ming-3.0-tts, open voice, local (default); openai = "
-                                    "OpenAI speech API; say = macOS voice; command = your own "
-                                    "script; fake = tones, for tests")
+            voice.add_argument("--tts", choices=["auto", "ming", "qwen3", "openai", "say",
+                                                 "command", "fake"],
+                               default="auto",
+                               help="auto = Ming-3.0-tts in English, Qwen3-TTS in French "
+                                    "(default); ming = Ming-3.0-tts, local; qwen3 = Qwen3-TTS, "
+                                    "local, ten languages; openai = OpenAI speech API; say = "
+                                    "macOS voice; command = your own script; fake = tones")
+            voice.add_argument("--tts-model", help="model of the local voice (a Hugging Face id)")
             voice.add_argument("--voice", help="ming: US_James (default), US_Emma, UK_George, "
                                                "UK_Charlotte, US_Stella, or a WAV file of a voice; "
                                                "openai or say: a voice name")
@@ -190,9 +205,14 @@ def build_parser() -> argparse.ArgumentParser:
             voice.add_argument("--quiz-pause", type=float, default=8.0,
                                help="seconds of silence after each question (default 8)")
             voice.add_argument("--no-loudnorm", action="store_true", help="skip loudness normalisation")
-            voice.add_argument("--roundtrip", action="store_true",
-                               help="transcribe the audio again and flag chunks that differ from the script")
+            voice.add_argument("--roundtrip", action=argparse.BooleanOptionalAction, default=None,
+                               help="transcribe every chunk of the voice again and voice it anew "
+                                    "when the words heard differ from the script (default: on "
+                                    "when speech recognition is installed and the voice is a "
+                                    "model)")
             voice.add_argument("--roundtrip-threshold", type=float, default=0.88)
+            voice.add_argument("--voice-retries", type=int, default=2,
+                               help="new takes of a chunk that fails the round trip (default 2)")
     return parser
 
 
@@ -267,8 +287,15 @@ def _transcript(args, work: Path, glossary: str, log) -> str:
                                                 "recording takes several minutes" if minutes else ""))
             terms = ", ".join(line.split(":")[0].strip() for line in glossary.splitlines())[:800]
             language = None if args.language == "auto" else args.language
+            removed: list[dict] = []
             target.write_text(transcribe_audio(source, args.stt, language, terms or None,
-                                               args.stt_model, progress=True), encoding="utf-8")
+                                               args.stt_model, progress=True, removed=removed),
+                              encoding="utf-8")
+            (work / "transcript_notes.json").write_text(
+                json.dumps({"removed": removed}, ensure_ascii=False, indent=2), encoding="utf-8")
+            if removed:
+                log(f"[transcribe] {len(removed)} segment(s) dropped as hallucinations or loops "
+                    "(listed in report.md)")
             log(f"[transcribe] saved {target}. Correct misheard technical terms there; "
                 "running the same command again reuses your corrected file.")
         return target.read_text(encoding="utf-8")
@@ -319,6 +346,13 @@ def _resolve_folder(args, log) -> None:
     if found["skipped"]:
         log("[inputs] not used: " + ", ".join(f.name for f in found["skipped"])
             + " (give --slides or --glossary, or the file itself as INPUT, to choose another)")
+
+
+def _asr_notes(work: Path) -> list[dict]:
+    notes = work / "transcript_notes.json"
+    if not notes.exists():
+        return []
+    return json.loads(notes.read_text(encoding="utf-8")).get("removed", [])
 
 
 def _open_obsidian(args, entry: str | None, log) -> None:
@@ -402,6 +436,13 @@ def run(args, series: dict | None = None) -> int:
             "supplements": supplements, "note": research_note,
             "audit": None if args.no_audit else pipeline.audit_coverage(outline)}
     records = pipeline.run_parts(outline, on_done=book.script_done)
+    factcheck = None
+    if args.factcheck != "off":
+        factcheck = run_factcheck(work, outline, records, coverage.get("transcript_ideas", []),
+                                  log)
+        if factcheck is None and args.factcheck == "minicheck":
+            raise SystemExit("--factcheck minicheck needs MiniCheck: uv pip install -e "
+                             "'.[factcheck]'")
     audit = None if args.no_audit else pipeline.audit_verifier(outline, records)
     notes = pipeline.global_notes(outline, records)
     spoken = pipeline.run_spoken(outline, records)
@@ -447,7 +488,13 @@ def run(args, series: dict | None = None) -> int:
         write_report(work / "report.md", name, outline, records, spoken, notes, audit, usage,
                      roundtrip, gaps, {"rows": ideas, "course": bool(course),
                                        "empty_parts": ledger.parts_without_ideas(outline, ideas),
-                                       "audit": ideas_audit})
+                                       "audit": ideas_audit,
+                                       "no_content": pipeline.idea_notes["no_content"],
+                                       "unaccounted": pipeline.idea_notes["unaccounted"],
+                                       "unledgered": [(r["part"], i) for r in records
+                                                      for i in r["issues"]
+                                                      if i["type"] == "unledgered"]},
+                     factcheck, _asr_notes(work))
         if course:  # before the list of noise, which stays last
             report = (work / "report.md").read_text(encoding="utf-8")
             cut = report.find("\n## Removed as noise")
@@ -472,9 +519,22 @@ def run(args, series: dict | None = None) -> int:
             _open_obsidian(args, course_stats.get("entry"), log)
         return 0
 
-    backend = make_tts(args.tts, language, args.voice, args.tts_command)
+    backend = make_tts(args.tts, language, args.voice, args.tts_command, args.tts_model)
     voiced = synth_blocks(backend, [s["blocks"] for s in spoken], work / "audio", args.chunk_chars,
                           not args.no_quiz, args.quiz_pause, log)
+    roundtrip = None
+    check = args.roundtrip if args.roundtrip is not None else (
+        backend.name not in ("fake", "command") and stt_available())
+    if check:
+        log("[roundtrip] transcribing every chunk again; a chunk heard wrong is voiced anew")
+        results = repair_chunks(
+            backend, voiced,
+            lambda p: transcribe_audio(p, args.stt, language, None, args.stt_model),
+            args.roundtrip_threshold, args.voice_retries, work / "audio" / "roundtrip.json", log)
+        roundtrip = [r for r in results if r["score"] < args.roundtrip_threshold]
+        repaired = sum(1 for r in results if r["tries"] and r["score"] > r["first"])
+        log(f"[roundtrip] {len(results)} chunk(s) checked, {repaired} improved by a new take, "
+            f"{len(roundtrip)} still below {args.roundtrip_threshold}")
     joined, chapters = join_parts(voiced, work / "audio")
     titles = chapter_titles(outline, language, not args.no_quiz)
     output = work / f"{name}.{args.format}"
@@ -487,15 +547,6 @@ def run(args, series: dict | None = None) -> int:
                                        work / "parts", name, args.format, titles,
                                        loudness=not args.no_loudnorm)
         course_stats = write_course({"full": output, "parts": part_files})
-    roundtrip = None
-    if args.roundtrip:
-        log("[roundtrip] transcribing the audio again")
-        groups = [[(e["path"], e["text"]) for e in entries if e["kind"] == "chunk"]
-                  for entries in voiced]
-        results = check_chunks(
-            lambda p: transcribe_audio(p, args.stt, language, None, args.stt_model), groups)
-        roundtrip = [r for r in results if r["score"] < args.roundtrip_threshold]
-        log(f"[roundtrip] {len(roundtrip)} of {len(results)} chunks below {args.roundtrip_threshold}")
     reports(chapters, roundtrip)
     log(f"Done. Audio: {output}")
     if course_stats:

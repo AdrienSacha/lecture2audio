@@ -22,7 +22,8 @@ TERM = {"term": "window", "definition": "A window is the number of packets the s
 
 
 def card(**over):
-    base = {"node": "1.1", "kind": "concept", "title": "T", "terms": [], "definition": "",
+    base = {"node": "1.1", "kind": "concept", "title": "T", "plain": "In short.", "terms": [],
+            "definition": "",
             "instance": "", "explanation": ["A sentence."], "formulas": [], "notation": [],
             "example": None, "diagram": None, "code": [], "table": None, "checks": [],
             "covers": [1]}
@@ -434,6 +435,115 @@ class JudgeChecks(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.assertTrue(result["audit"]["caught"])
         self.assertTrue((pathlib.Path(tmp.name) / "course" / "audit.json").exists())
+
+
+class Recitation(unittest.TestCase):
+    def test_every_card_needs_its_plain_version_and_long_sentences_are_flagged(self):
+        self.assertIn("no_plain", kinds(card_issues([card(plain="")], ctx(), "en")))
+        long = " ".join(["word"] * 30) + "."
+        issues = card_issues([card(plain=long)], ctx(), "en")
+        self.assertEqual(kinds(issues), ["plain_long"])
+        self.assertIn("plain_long", course.SOFT)  # a warning: readability formulas do not
+        self.assertIn("duplicate_question", course.SOFT)  # predict comprehension
+
+    def test_the_plain_version_holds_no_number_the_script_lacks(self):
+        issues = card_issues([card(plain="It holds 99 packets.")], ctx(), "en")
+        self.assertEqual(kinds(issues), ["unsupported"])
+
+    def test_duplicate_questions_are_found(self):
+        a = card(checks=[{"question": "What does the window hold?", "answer": "64 packets."}])
+        exercise = {"question": "What does the window hold?", "steps": ["s"], "answer": "a",
+                    "covers": [1]}
+        self.assertEqual(kinds(course.question_issues([a], [exercise])), ["duplicate_question"])
+        self.assertEqual(course.question_issues([a], []), [])
+
+    def test_exercises_are_written_judged_and_rendered_with_collapsed_solutions(self):
+        exercise = {"question": "A window of 64 packets: how many may be sent before waiting?",
+                    "steps": ["The window is the number sent before waiting.", "So 64."],
+                    "answer": "64 packets.", "covers": [1]}
+
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            if "Sending" in user.split("## SCRIPT", 1)[1][:200]:
+                data["exercises"] = [exercise]
+                data["cards"][0]["proof"] = ["The window is fixed.", "Hence the bound holds."]
+            return json.dumps(data)
+
+        outline, records, result, calls, tmp = stage(writer=writer)
+        self.addCleanup(tmp.cleanup)
+        part = result["parts"][0]
+        self.assertEqual(part["exercises"][0]["id"], "1.x1")
+        self.assertIn("## EXERCISES (JSON)", calls["judge"][0])
+        data = {"cards": [{"card": 1, "status": "faithful"}], "ideas": []}
+        self.assertTrue(course.validate_judgement(data, 1, (), exercises=1))
+        data["exercises"] = [{"exercise": 1, "status": "correct"}]
+        self.assertEqual(course.validate_judgement(data, 1, (), exercises=1), [])
+        folder = pathlib.Path(tmp.name) / "vault"
+        write_vault(folder, [lecture(outline, records, result, [])], "en")
+        note = next(folder.glob("flow – 01 *.md")).read_text()
+        self.assertIn("> [!abstract] In short", note)
+        self.assertIn("> [!proof] Proof\n> 1. The window is fixed.", note)
+        self.assertIn("## Exercises", note)
+        self.assertIn("> [!check]- Solution", note)
+        self.assertIn("> **Answer:** 64 packets.", note)
+
+    def test_a_wrong_exercise_is_a_blocking_problem(self):
+        exercise = {"question": "Q?", "steps": ["s"], "answer": "a", "covers": [1]}
+
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            data["exercises"] = [exercise] if n == 1 else []
+            return json.dumps(data)
+
+        def judge(user, n):
+            data = json.loads(dry_course_check(user))
+            for item in data["exercises"]:
+                item.update(status="wrong", detail="the answer does not follow")
+            return json.dumps(data)
+
+        outline, records, result, calls, tmp = stage(writer=writer, judge=judge)
+        self.addCleanup(tmp.cleanup)
+        self.assertEqual(result["parts"][0]["attempts"], 2)
+        self.assertIn("exercise_wrong", calls["write"][1])
+        self.assertEqual(result["parts"][0]["exercises"], [])
+
+
+class Revision(unittest.TestCase):
+    def test_loose_ends_go_back_to_the_writer_once_and_the_part_is_read_again(self):
+        def cold(user):
+            if "[1.1]" in user.split("## THIS PART", 1)[1]:
+                return json.dumps({"loose": [{"card": "1.1", "kind": "confusing_sentence",
+                                              "detail": "the second sentence is hard to follow"}]})
+            return json.dumps({"loose": []})
+        outline, records, result, calls, tmp = stage(cold=cold)
+        self.addCleanup(tmp.cleanup)
+        self.assertTrue(result["parts"][0]["revised"])
+        self.assertFalse(result["parts"][1].get("revised"))
+        self.assertIn("confusing_sentence", calls["write"][-1])
+        self.assertIn("first-year reader", calls["write"][-1])
+        self.assertEqual(len(calls["cold"]), 3)  # two parts, then the revised part again
+        self.assertEqual(result["cold"][0]["before"], 1)
+        report = course.course_report(result, {"cards": 2, "diagrams": 0, "notes": 1})
+        self.assertIn("revised once from the loose ends", report)
+
+    def test_a_revision_with_more_problems_is_not_kept(self):
+        def cold(user):
+            if "[1.1]" in user.split("## THIS PART", 1)[1]:
+                return json.dumps({"loose": [{"card": "1.1", "kind": "undefined_term",
+                                              "detail": "packet"}]})
+            return json.dumps({"loose": []})
+
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            if "first-year reader" in user:
+                data["cards"][0]["plain"] = ""  # the revision breaks a rule
+            return json.dumps(data)
+
+        outline, records, result, calls, tmp = stage(writer=writer, cold=cold)
+        self.addCleanup(tmp.cleanup)
+        first = result["parts"][0]
+        self.assertFalse(first["revised"])
+        self.assertTrue(first["cards"][0]["plain"])
 
 
 class ColdRead(unittest.TestCase):

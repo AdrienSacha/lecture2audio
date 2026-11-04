@@ -19,7 +19,7 @@ from typing import Callable
 from . import enrich
 from .llm import LLM, LLMError, extract_json
 from .outline import (Node, Outline, checklist, dump, fallback_outline, moves, noise_by_part,
-                      parse_outline, part_source, part_words, render_outline,
+                      parse_outline, part_source, part_words, ranges, render_outline,
                       render_part_transcript, structure)
 from .sources import select_slides
 from .spoken import (en_cardinal, en_ordinal, find_residue, fr_cardinal, fr_ordinal,
@@ -29,7 +29,9 @@ PROMPT_DIR = Path(__file__).parent / "prompts"
 LANGUAGE_NAMES = {"en": "English", "fr": "French"}
 ORIGINS = {"lecture", "added", "external"}
 STATUSES = {"complete", "incomplete", "misplaced"}
-SOFT_ISSUES = {"long", "filler", "plan", "marker", "idea_numbers"}
+# Warnings: reported and shown to the writer with other feedback, never a reason to rewrite.
+SOFT_ISSUES = {"long", "filler", "plan", "marker", "idea_numbers", "unledgered", "plain_long",
+               "duplicate_question"}
 
 
 class PipelineError(RuntimeError):
@@ -116,6 +118,10 @@ def validate_part(data, shape: dict) -> list[str]:
             elif item["origin"] == "external" and item.get("source") not in shape.get("sources", []):
                 errors.append(f'section {node}, sentence {k} is "external": its "source" must be '
                               f'the id of a supplement, one of {shape.get("sources", [])}')
+            elif "ideas" in item and (not isinstance(item["ideas"], list) or any(
+                    str(i) not in shape.get("ideas", []) for i in item["ideas"])):
+                errors.append(f'section {node}, sentence {k}: "ideas" lists ids of IDEAS OF THIS '
+                              f'PART only, one of {shape.get("ideas", [])}, or is empty')
         if node in shape["section_previews"]:
             errors += _check_items(section.get("preview"), shape["section_previews"][node],
                                    f'"preview" of section {node}')
@@ -231,6 +237,30 @@ def unsupported_numbers(script: list[dict], source: str, slides: str, language: 
 # An exponent or an index ("n^2", "10^6", "x_1") is usually said in words ("n squared", "a
 # million"), so it is not looked for.
 _SCRIPTED = re.compile(r"[\^_]\s*\{?\s*$")
+
+
+def idea_citations(script: list[dict], ideas: list[dict]) -> list[dict]:
+    """The two invariants of a claim-anchored script (Guan, 2026). Coverage: every idea of the
+    part is cited by at least one "lecture" sentence, else a blocking "idea_uncited". Ledger
+    completeness: a "lecture" sentence that cites no idea states something the idea list may
+    have missed, a soft "unledgered" that report.md lists."""
+    if not ideas:
+        return []
+    cited = {str(i) for s in script if s["origin"] == "lecture" for i in s.get("ideas") or []}
+    issues = []
+    for idea in ideas:
+        if str(idea["id"]) not in cited:
+            issues.append({"type": "idea_uncited", "node": str(idea["nodes"][0]), "sentence": None,
+                           "unit": (idea.get("units") or [None])[0],
+                           "detail": (f'No "lecture" sentence cites the idea {idea["id"]} '
+                                      f'({idea["kind"]}: {idea["idea"]}). Teach it in its node '
+                                      'and list its id in the sentence\'s "ideas".')})
+    for k, sentence in enumerate(script, 1):
+        if sentence["origin"] == "lecture" and not sentence.get("ideas"):
+            issues.append({"type": "unledgered", "node": None, "sentence": k, "unit": None,
+                           "detail": ("This lecture sentence cites no idea of the ledger: "
+                                      f'"{sentence["text"][:90]}"')})
+    return issues
 
 
 def _and(items: list[str]) -> str:
@@ -437,7 +467,7 @@ class TextPipeline:
     def __init__(self, work_dir: Path, language: str, rewrite_llm: LLM, verify_llm: LLM,
                  prompts: Prompts, glossary: str = "", slides: list[str] | None = None,
                  max_retries: int = 2, log: Callable[[str], None] = print,
-                 max_part_words: int = 2500, workers: int = 3,
+                 max_part_words: int = 1500, workers: int = 3,
                  researcher: Callable[[str, str], tuple[str, list[dict]]] | None = None):
         self.work_dir = Path(work_dir)
         self.language = language
@@ -456,6 +486,7 @@ class TextPipeline:
         # Filled by the gap stages; empty when they are not run.
         self.coverage: dict = {"slide_ideas": [], "gaps": [], "transcript_ideas": []}
         self.terms: list[dict] = []
+        self.idea_notes: dict = {"no_content": [], "unaccounted": {}}
         self.research: dict[str, dict] = {}
         self.supplements: list[dict] = []
 
@@ -558,37 +589,65 @@ class TextPipeline:
     def run_ideas(self, outline: Outline) -> list[dict]:
         """The atomic ideas the teacher taught, listed part by part (in parallel), so that no
         output limit cuts the list on a long lecture. Ids are scoped to the part (T3.12 is the
-        twelfth idea of part 3): redoing one part never renumbers the others. A part whose list
-        keeps failing the gate is logged, left empty (report.md names it) and not cached, so the
-        next run tries it again."""
+        twelfth idea of part 3): redoing one part never renumbers the others.
+
+        Every unit must be accounted for: cited by an idea, or declared as teaching nothing or as
+        unclear ("no_content"), so the model can abstain instead of padding (Claimify, 2025;
+        Barali and Paudel, 2026). Units left unaccounted for are asked again with feedback that
+        says fewer is fine, and the attempt with the fewest is kept; any that remain are named in
+        report.md. A part whose list keeps failing the gate is logged, left empty and not cached,
+        so the next run tries it again."""
         directory = self._dir("ideas")
         noise = noise_by_part(outline)
 
-        def one(part: Node) -> list[dict]:
+        def one(part: Node) -> dict:
             cache = directory / f"part_{int(part.id):03d}.json"
             if cache.exists():
-                return json.loads(cache.read_text(encoding="utf-8"))
+                saved = json.loads(cache.read_text(encoding="utf-8"))
+                return saved if isinstance(saved, dict) else {"ideas": saved}
             if not part.all_units():
-                return []
+                return {"ideas": []}
             user = self._ideas_request(outline, part, render_part_transcript(outline, part, []),
                                        noise[part.id])
-            try:
-                data = self._ask_json(self.rewrite_llm, self.prompts.ideas, user,
-                                      lambda d: enrich.validate_idea_list(d, part),
-                                      f"ideas of part {part.id}")
-            except PipelineError as exc:
-                self.log(f"[ideas] part {part.id}: {exc}")
-                return []
-            ideas = [{"id": f"T{part.id}.{k}", "kind": i["kind"], "idea": str(i["idea"]).strip(),
-                      "nodes": [str(n) for n in i["nodes"]],
-                      "units": sorted({int(u) for u in i["units"]})}
-                     for k, i in enumerate(data["ideas"], 1)]
-            cache.write_text(json.dumps(ideas, ensure_ascii=False, indent=2), encoding="utf-8")
-            return ideas
+            best, note = None, ""
+            for _ in range(self.max_retries + 1):
+                try:
+                    data = self._ask_json(self.rewrite_llm, self.prompts.ideas, user + note,
+                                          lambda d: enrich.validate_idea_list(d, part),
+                                          f"ideas of part {part.id}")
+                except PipelineError as exc:
+                    self.log(f"[ideas] part {part.id}: {exc}")
+                    break
+                left = enrich.unaccounted_units(data, part)
+                if best is None or len(left) < len(best[1]):
+                    best = (data, left)
+                if not left:
+                    break
+                note = ("\n\n## UNITS NOT ACCOUNTED FOR\nUnits " + ranges(left) + " are cited by no "
+                        "idea and are not in no_content. List the ideas they teach. If a unit "
+                        "teaches nothing, or is too garbled to interpret, list it under "
+                        "no_content: fewer ideas are fine, and an invented idea is worse than none.")
+            if best is None:
+                return {"ideas": []}
+            parsed = enrich.IdeaList.model_validate(best[0])
+            result = {"ideas": [{"id": f"T{part.id}.{k}", "kind": i.kind, "idea": i.idea,
+                                 "nodes": i.nodes, "units": sorted(set(i.units))}
+                                for k, i in enumerate(parsed.ideas, 1)],
+                      "no_content": [{"part": part.id, "units": sorted(set(n.units)),
+                                      "kind": n.kind, "reason": n.reason.strip()}
+                                     for n in parsed.no_content],
+                      "unaccounted": best[1]}
+            cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            return result
 
         self.log(f"[ideas] listing the atomic ideas of {len(outline.parts)} part(s)")
-        ideas = [i for part_ideas in self._map(one, outline.parts) for i in part_ideas]
+        results = self._map(one, outline.parts)
+        ideas = [i for r in results for i in r.get("ideas", [])]
         self.coverage["transcript_ideas"] = ideas
+        self.idea_notes = {"no_content": [n for r in results for n in r.get("no_content", [])],
+                           "unaccounted": {p.id: r.get("unaccounted", [])
+                                           for p, r in zip(outline.parts, results)
+                                           if r.get("unaccounted")}}
         return ideas
 
     def _ideas_request(self, outline: Outline, part: Node, transcript: str, noise: list[int]) -> str:
@@ -770,9 +829,10 @@ class TextPipeline:
                 termbase.append({"term": term["term"], "definition": term["definition"],
                                  "depends_on": term["depends_on"],
                                  "confusable": term["confusable"], "define_here": here})
-        shape = dict(structure(part), sources=[s["id"] for s in supplements])
         ideas = [i for i in self.coverage.get("transcript_ideas", [])
                  if any(str(n) in nodes for n in i.get("nodes", []))]
+        shape = dict(structure(part), sources=[s["id"] for s in supplements],
+                     ideas=[str(i["id"]) for i in ideas])
         return {"part": part, "noise": noise, "source": source, "slides": slides,
                 "transcript": render_part_transcript(outline, part, noise),
                 "shape": shape, "checklist": checklist(part),
@@ -796,6 +856,9 @@ class TextPipeline:
                 + _section("TERMBASE FOR THIS PART (JSON)",
                            json.dumps(ctx["termbase"], ensure_ascii=False, indent=1)
                            if ctx["termbase"] else "")
+                + _section("IDEAS OF THIS PART (JSON)", json.dumps(
+                    [{k: i[k] for k in ("id", "kind", "idea", "nodes", "units") if k in i}
+                     for i in ctx["ideas"]], ensure_ascii=False, indent=1) if ctx["ideas"] else "")
                 + _section("SUPPLEMENTS (JSON)", self._supplements_json(ctx, quotes=False))
                 + _section("GLOSSARY", self.glossary) + _section("SLIDES", ctx["slides"])
                 + _section("FEEDBACK", feedback)
@@ -841,13 +904,20 @@ class TextPipeline:
                            "unit": unit if isinstance(unit, int) else None})
         ideas, by_id = [], {str(i["id"]): i for i in ctx.get("ideas", [])}
         source = NumberIndex(ctx["source"], self.language)
-        said = NumberIndex(" ".join(x["text"] for x in sentences_of(result)), self.language)
+        script = sentences_of(result)
+        said = NumberIndex(" ".join(x["text"] for x in script), self.language)
+        citing: dict[str, list[str]] = {}
+        for sentence in script:
+            for cited in sentence.get("ideas") or []:
+                citing.setdefault(str(cited), []).append(sentence["text"])
         for item in data.get("ideas", []) if idea_ids else []:
             idea = by_id.get(str(item.get("idea"))) if isinstance(item, dict) else None
             if idea is None:
                 continue
             status, detail = item["status"], str(item.get("detail") or "")
-            lost = numbers_lost(idea["idea"], source, said) if status == "taught" else []
+            where = (NumberIndex(" ".join(citing[str(idea["id"])]), self.language)
+                     if citing.get(str(idea["id"])) else said)
+            lost = numbers_lost(idea["idea"], source, where) if status == "taught" else []
             ideas.append({"idea": idea["id"], "status": status, "judged": status,
                           "detail": detail, "lost": lost})
             if status == "missing":
@@ -900,6 +970,7 @@ class TextPipeline:
                                       "do not use it here, or say the same thing without it.")})
         allowed = {t["term"].lower() for t in ctx["termbase"]}
         issues += enrich.stray_terms(script, self.terms, ctx["sources_text"], allowed)
+        issues += idea_citations(script, ctx.get("ideas", []))
         return issues
 
     def _check_terms(self, outline: Outline, ctx: dict, result: dict) -> list[dict]:

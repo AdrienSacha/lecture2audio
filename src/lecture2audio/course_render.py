@@ -27,6 +27,8 @@ ASSETS = Path(__file__).parent / "assets"
 LABELS = {
     "en": {"needs": "Prerequisites", "external": "From outside the lecture",
            "read_all": "Read the whole lecture as one chapter", "book": "Full Lecture",
+           "plain": "In short", "proof": "Proof", "exercises": "Exercises",
+           "exercise": "Exercise", "solution": "Solution", "answer": "Answer",
            "external_text": "The lecture does not state this. It is added from the sources:",
            "definition": "Definition", "concept": "Idea", "procedure": "Procedure",
            "remark": "Remark", "instance": "Instance", "example": "Worked example",
@@ -42,6 +44,8 @@ LABELS = {
            "sources": "Sources", "final": "Review", "card": "card"},
     "fr": {"needs": "Prérequis", "external": "Hors du cours",
            "read_all": "Lire tout le cours comme un seul chapitre", "book": "Cours complet",
+           "plain": "En bref", "proof": "Démonstration", "exercises": "Exercices",
+           "exercise": "Exercice", "solution": "Solution", "answer": "Réponse",
            "external_text": "Le cours ne le dit pas. C'est ajouté depuis les sources :",
            "definition": "Définition", "concept": "Idée", "procedure": "Procédure",
            "remark": "Remarque", "instance": "Cas concret", "example": "Exemple détaillé",
@@ -120,6 +124,8 @@ def render_card(card: dict, terms: list[dict], index: dict[str, int], source_lin
     view = dict(card)
     view["definition"] = bold_definition(card, terms, seen, own) if card["definition"] else ""
     view["instance"] = link_terms(card["instance"], terms, seen, own)
+    view["plain"] = card.get("plain", "")
+    view["proof"] = card.get("proof", [])
     view["explanation"] = [link_terms(p, terms, seen, own) for p in card["explanation"]]
     if card["example"]:
         view["example"] = dict(card["example"], steps=[link_terms(s, terms, seen, own)
@@ -266,7 +272,8 @@ def write_vault(root: Path, lectures: list[dict], language: str, title: str | No
                   groups=groups, prev=notes[parts[p - 1]["part"]] if p else "",
                   next=notes[parts[p + 1]["part"]] if p + 1 < len(parts) else "",
                   review=review_items(lecture, course["review"].get(part.id, [])),
-                  part_audio_file=part_audio.get(part.id, ""))
+                  part_audio_file=part_audio.get(part.id, ""),
+                  exercises=part_data.get("exercises", []))
         final = review_items(lecture, course["review"].get("final", []))
         lecture["final"] = final
         write(lecture["folder"] / f"{lecture['prefix']} – Index.md", "index.md.j2",

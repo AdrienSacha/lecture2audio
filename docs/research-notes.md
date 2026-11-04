@@ -268,6 +268,28 @@ Zhang's study supports these choices. It also shows that counting blocking probl
 
 **Every judge of completeness is tested.** Section 2.7 argues that a verifier must itself be checked. The same planted-fault test now covers the idea listing (one unmistakable fact planted in a copy of a part must be listed) and the course judge (an emptied card must make its idea "missing", scored on the judge's own verdict), besides the verifier and the gap search. When a judge says "taught" but the script or the named cards lack a number of the idea that the transcript holds, code marks the idea `disputed` instead of overruling the judge, in the spirit of section 2.4: a code check that cannot tell "10^6" from "a million" must not force repairs, and each audit scores the judge's own verdict, so that the code check never hides a judge that passes everything. The architecture is recorded in `docs/adr/0001-pipeline-architecture.md`.
 
+### 2.17 Grounding by construction, abstention, plain language, recitation material and independent checks (November 2026)
+
+The owner asked for the best material possible, checked as far as the evidence allows. A search of 2025 and 2026 work (alphaXiv and the web) changed the build in eight places; `docs/adr/0002-grounding-plain-layer-voice-checks.md` records the decision.
+
+**Attribution should be built in, not predicted.** Guan (2026) makes every summary sentence carry claim identifiers that resolve by code to verbatim source spans; post-hoc attribution leaves 11% of sentences uncited, while construction guarantees provenance at little cost, and verification time per claim falls 3.4 times. Ive et al. (2026) find that letting a model select numbered source lines beats letting it rewrite or copy text, for recall and against hallucination. *Change:* every "lecture" sentence of the script cites the ideas it states; code requires every idea to be cited (`idea_citations`, blocking) and lists sentences that cite none (warning). Ideas already cite numbered units, which is the line-selection design.
+
+**Extraction must be allowed to abstain.** Claimify (Metropolitansky and Larson, 2025) outperforms other claim extractors by first deciding whether a sentence holds a verifiable claim and by refusing to guess an ambiguous one. Barali and Paudel (2026) show that a minimum count in a schema makes models pad their lists with real but irrelevant text (over-count from 34.5% to 55.4%), and that re-asking with the bare validation error makes it far worse. *Change:* the idea listing accounts for every unit in an idea or in `no_content` ("no_teaching" or "unclear"), with no minimum; units left unaccounted are asked again with "fewer is fine" (`run_ideas`, `enrich.IdeaList`).
+
+**Long outputs drift.** Faithfulness falls in the last fifth of long generated outputs; generating chunk by chunk removes the effect (Yang et al., 2025). *Change:* the default part is 1,500 words instead of 2,500.
+
+**Plain language for comprehension, not for readability scores.** In 150 readers, LLM plain-language summaries were rated as good as human ones but produced lower comprehension; readability formulas did not predict comprehension, while faithfulness, added background and coherence did (Guo et al., 2025). Simulated readers (a young student, a non-native reader, a reader with attention difficulties) that flag unknown terms, missing context and confusing sentences, followed by one editor's revision, improved readability and factuality together, best at one or two rounds (Jung et al., 2026). ISO 24495-1:2023 sets the same governing principles: the reader finds, understands and uses the information. *Change:* every card has an "In short" text (one to three short sentences of everyday words, the same facts, no analogy), checked by code and by the judge; the cold read also reports confusing sentences and missing context, and its loose ends drive one revision that is kept only if it is not worse.
+
+**Practice problems.** An iterative generate, critique and revise loop produced exam items whose difficulty and discrimination matched standardized-test items in a field study of about 1,700 students (Isley et al., 2025). Deterministic checks catch duplicated and ill-posed questions that a model misses (Shintani, 2026). *Change:* up to four exercises per part with complete worked solutions, each solved again by the judge (`exercise_wrong` blocks), and a near-duplicate check over all questions.
+
+**Independent checks need another family or other evidence.** A panel of judges built on one model, sharing one evidence pool, mostly moves its decision threshold and its members' errors are strongly correlated (Ji, 2026). A 770M fact-checker matches GPT-4 on grounding documents at about 400 times lower cost (Tang et al., 2024); a 1B reasoning verifier reaches 78.1 balanced accuracy (Rao et al., 2026). *Change:* MiniCheck checks each lecture sentence against the units of the ideas it cites (`factcheck.py`), and its findings are reported, never acted on.
+
+**Format and reasoning.** Requiring structured output costs open-weight models accuracy at the prompt, not the decoder, and reasoning first (thinking) recovers it (Lee et al., 2026). *No change:* the default writer runs with thinking on; this is why it should stay on.
+
+**Voice and recognition.** Qwen3-TTS has the lowest error rate of the open models in its report and speaks ten languages, French among them (Qwen Team, 2026). Autoregressive voices skip or invent words on some samples; detecting and regenerating the failure, or picking the best of several takes by recognition, is the measured fix (Wang et al., 2026). Whisper writes words over silence on most clips of room tone (Zolkepli, 2026), and blocking its known phrases works once the audio is known to be blank (Barański et al., 2025). Terminology errors in long recordings are best repaired with the whole transcript as context (Zhu et al., 2026). *Change:* `--tts auto` uses Qwen3-TTS for French; the round trip runs by default when recognition is installed, and voices a failing chunk again up to two times, keeping the take heard best; recognition decodes without the previous text, skips unsure silence, and a code filter removes known hallucination phrases and third repeats, all reported. Parakeet is offered (`--stt parakeet`).
+
+**What this does not do.** Conformal risk control can bound the rate of missed omissions with about 100 labelled documents (Bedi et al., 2026); it needs labelled lectures this project does not have yet (idea 13). Transcript terminology repair (Zhu et al., 2026) is idea 14.
+
 ## 3. The CLAUDE.md file
 
 **Source.** Anthropic's Claude Code documentation (pages "Best practices for Claude Code" and "How Claude remembers your project", 2026):
@@ -299,6 +321,8 @@ Each idea comes with the source that suggests it and the reason it is not built.
 10. **An estimate of listening effort** (Hoffner et al., 2026; Ramonda et al., 2026). The round-trip check (`roundtrip.py`, `--roundtrip`) compares what the voice was given with what speech recognition hears. It shows that the words were pronounced, but Ramonda and colleagues found that recognition errors are almost unrelated to how hard a text is for people, so it says nothing about how easy the audio is to follow. Hoffner and colleagues predicted listeners' ratings of effort and intelligibility for synthetic speech with a correlation above 0.88. A model of this kind could flag chunks that are hard to listen to. It would touch `roundtrip.py` and `cli.py`, as an optional package imported inside the function. Not built because I have not confirmed that either model is available as an installable package.
 11. **Spoken emphasis on key terms** (Chen et al., 2026). Ask the voice to stress the name of each point and each newly defined term. Low priority: the only study found measured intention to engage, not learning, and only `OpenAITTS` in `tts.py` accepts instructions about delivery.
 12. **Ideas listed part by part.** Built in November 2026 (section 2.16).
+13. **Calibrated omission flags** (Bedi et al., 2026). Label the omissions of about 100 lecture parts, then calibrate the verifier's statuses with conformal risk control, so that report.md can state a bound on missed omissions. Not built: no labelled lectures yet.
+14. **Terminology repair of transcripts** (Zhu et al., 2026). With the whole transcript, the glossary and the slides as context, propose minimal corrections of misrecognised terms, accept only those whose new term occurs in the glossary, the slides or elsewhere in the transcript, and log every edit. It would touch `cli._transcript`, a new prompt and gate, and the tests.
 
 ---
 
@@ -356,6 +380,29 @@ Each idea comes with the source that suggests it and the reason it is not built.
 - Kamoi, R., Zhang, Y., Zhang, N., Han, J., & Zhang, R. (2024). When can LLMs actually correct their own mistakes? A critical survey of self-correction of LLMs. *Transactions of the Association for Computational Linguistics*, 12, 1417–1440. https://doi.org/10.1162/tacl_a_00713
 - Kim, Y., Gu, K., Park, C., Park, C., Schmidgall, S., Heydari, A. A., Yan, Y., Zhang, Z., Zhuang, Y., Liu, Y., Malhotra, M., Liang, P. P., Park, H. W., Yang, Y., Xu, X., Du, Y., Patel, S., Althoff, T., McDuff, D., & Liu, X. (2025). Towards a science of scaling agent systems. arXiv:2512.08296. Google Research blog: https://research.google/blog/towards-a-science-of-scaling-agent-systems-when-and-why-agent-systems-work/
 - Panickssery, A., Bowman, S. R., & Feng, S. (2024). LLM evaluators recognize and favor their own generations. *Advances in Neural Information Processing Systems 37* (NeurIPS 2024), 68772–68802. https://doi.org/10.52202/079017-2197
+
+### Language-model systems, speech and learning, added November 2026
+
+- Barali, A., & Paudel, A. (2026). Padding to k: A minimum count in the schema makes open-weight models pad their extraction lists. arXiv:2610.30997. https://arxiv.org/abs/2610.30997
+- Barański, M., Jasiński, J., Bartolewska, J., Kacprzak, S., Witkowski, M., & Kowalczyk, K. (2025). Investigation of Whisper ASR hallucinations induced by non-speech audio. arXiv:2501.11378. https://arxiv.org/abs/2501.11378
+- Bedi, S., Lin, B., Zhou, A. Y., Stanwyck, C. O., Jindal, J. A., Koyejo, S., Stutz, D., & Shah, N. H. (2026). CARE: A conformal safety layer for medical summarization. arXiv:2606.08969. https://arxiv.org/abs/2606.08969
+- Guan, S. (2026). Attributable by construction: Claim-anchored provenance for multi-document summarization. arXiv:2606.23989. https://arxiv.org/abs/2606.23989
+- Guo, Y., Sohn, J. H., Leroy, G., & Cohen, T. (2025). Are LLM-generated plain language summaries truly understandable? A large-scale crowdsourced evaluation. arXiv:2505.10409. https://arxiv.org/abs/2505.10409
+- International Organization for Standardization (2023). ISO 24495-1:2023, Plain language, Part 1: Governing principles and guidelines.
+- Isley, C., Gilbert, J., Kassos, E., Kocher, M., Nie, A., Brunskill, E., Domingue, B., Hofman, J., Legewie, J., Svoronos, T., Tuminelli, C., & Goel, S. (2025). Assessing the quality of AI-generated exams: A large-scale field study. arXiv:2508.08314. https://arxiv.org/abs/2508.08314
+- Ive, J., Jozsa, F., Georgaki, E., Sheikh, N., Cattell, E., Jackson, N., Bondaronek, P., Hill, C. S., & Dobson, R. (2026). SafeLLM: Extraction as a hallucination-resistant alternative to rewriting in safety-critical settings. arXiv:2606.12897. https://arxiv.org/abs/2606.12897
+- Ji, Y. (2026). More debate, same evidence: Structural limits of homogeneous multi-agent groundedness judges. arXiv:2608.00243. https://arxiv.org/abs/2608.00243
+- Jung, J., Kim, M., Seo, J., & Lim, H. (2026). No reader left behind: Multi-agent summaries everyone can understand. arXiv:2605.28836. https://arxiv.org/abs/2605.28836
+- Lee, I. Y., D'Antoni, L., & Berg-Kirkpatrick, T. (2026). The format tax. arXiv:2604.03616. https://arxiv.org/abs/2604.03616
+- Metropolitansky, D., & Larson, J. (2025). Towards effective extraction and evaluation of factual claims (Claimify). arXiv:2502.10855. https://arxiv.org/abs/2502.10855
+- Qwen Team (2026). Qwen3-TTS technical report. arXiv:2601.15621. https://arxiv.org/abs/2601.15621
+- Rao, D., Han, F., & Callison-Burch, C. (2026). ThinknCheck: Grounded claim verification with compact, reasoning-driven, and interpretable models. arXiv:2604.01652. https://arxiv.org/abs/2604.01652
+- Shintani, S. A. (2026). Self-hosted lecture-to-quiz: Local LLM MCQ generation with deterministic quality control. arXiv:2603.08729. https://arxiv.org/abs/2603.08729
+- Tang, L., Laban, P., & Durrett, G. (2024). MiniCheck: Efficient fact-checking of LLMs on grounding documents. In *Proceedings of EMNLP 2024*. arXiv:2404.10774. https://arxiv.org/abs/2404.10774
+- Wang, R., Durmuş, B., Orhon, A., Pacheco, E., & Orhon, A. (2026). Taming long-form text-to-speech. arXiv:2609.16989. https://arxiv.org/abs/2609.16989
+- Yang, J., Yoon, S., Chang, H., Kim, B., & Lee, H. (2025). Hallucinate at the last in long response generation: A case study on long document summarization. arXiv:2505.15291. https://arxiv.org/abs/2505.15291
+- Zhu, Y., Wang, W., Gao, Z., Li, X., & Chen, X. (2026). Agentic-GER: Terminology recovery in long-form speech using global context. arXiv:2609.29428. https://arxiv.org/abs/2609.29428
+- Zolkepli, H. (2026). How to reduce Whisper hallucination. arXiv:2609.32560. https://arxiv.org/abs/2609.32560
 
 ### Claude Code documentation
 
