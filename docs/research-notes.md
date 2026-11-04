@@ -431,7 +431,7 @@ Each idea comes with the source that suggests it and the reason it is not built.
 - Zhu, Y., Wang, W., Gao, Z., Li, X., & Chen, X. (2026). Agentic-GER: Terminology recovery in long-form speech using global context. arXiv:2609.29428. https://arxiv.org/abs/2609.29428
 - Zolkepli, H. (2026). How to reduce Whisper hallucination. arXiv:2609.32560. https://arxiv.org/abs/2609.32560
 
-### Graph engineering, added November 2026
+### Graph engineering and repair loops, added November 2026
 
 - Cho, S., Cardenoso Fernandez, F., Mohammed, U., Wu, Z., Da Costa, K., Wicaksono, I., & Koshiyama, A. (2026). Automata from agent traces: Failure and next-step prediction. Workshop on Agents in the Wild, ICML 2026. arXiv:2608.23670. https://arxiv.org/abs/2608.23670
 - Feng, Y., Xiang, Z., Yang, C., et al. (2026). Graph engineering in the era of LLM agents: From individual intelligence to system intelligence. arXiv:2608.21156. https://arxiv.org/abs/2608.21156
