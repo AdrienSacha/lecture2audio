@@ -73,6 +73,19 @@ class Stages(unittest.TestCase):
                                                        "missing_cards"])
         self.assertEqual([r["idea_id"] for r in ledger.open_rows(rows, True)], ["T2", "T3"])
 
+    def test_a_judge_and_code_that_disagree_give_a_disputed_idea(self):
+        rows = ledger.seed(outline(), LEDGER)
+        ledger.apply_script(rows, [{"part": "1", "ideas": [
+            {"idea": "T1", "status": "taught", "lost": ["64"]},
+            {"idea": "T2", "status": "taught", "lost": []}]}])
+        self.assertEqual([r["status"] for r in rows[:2]], ["disputed", "scripted"])
+        self.assertEqual([r["idea_id"] for r in ledger.open_rows(rows, False)], ["T1", "T3"])
+        ledger.apply_cards(rows, course({"idea": "T1", "status": "taught", "cards": ["1.1"]},
+                                        {"idea": "T2", "status": "taught", "cards": ["1.2"],
+                                         "lost": ["5"]}))
+        self.assertEqual([r["status"] for r in rows[:2]], ["verified", "disputed"])
+        self.assertEqual(rows[1]["covered_in_card"], "1.2")
+
     def test_an_idea_split_over_two_parts_is_scripted_when_one_part_teaches_it(self):
         rows = ledger.seed(outline(), LEDGER)
         records = [{"part": "1", "ideas": [{"idea": "T3", "status": "missing"}]},
@@ -94,6 +107,32 @@ class Stages(unittest.TestCase):
         self.assertNotIn("- T1 ", text)
         empty = "\n".join(ledger_lines({"rows": [], "course": True}))
         self.assertIn("listed no atomic idea", empty)
+
+
+class Live(unittest.TestCase):
+    def test_the_file_follows_each_part_in_any_order_and_matches_a_full_rebuild(self):
+        records = [{"part": "1", "ideas": [{"idea": "T1", "status": "taught"},
+                                           {"idea": "T2", "status": "taught"}]},
+                   {"part": "2", "ideas": [{"idea": "T3", "status": "missing"}]}]
+        cards = course({"idea": "T1", "status": "taught", "cards": ["1.1"]},
+                       {"idea": "T2", "status": "missing", "cards": []})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "ideas.csv"
+            book = ledger.Ledger(path, outline(), LEDGER)
+            rows = book.rows
+            self.assertEqual({r["status"] for r in ledger.read(path)}, {"pending"})
+            book.script_done(records[1])  # part 2 finishes first
+            self.assertEqual([r["status"] for r in ledger.read(path)],
+                             ["pending", "pending", "missing_script"])
+            book.script_done(records[0])
+            book.cards_done(cards["parts"][0])
+            self.assertIs(book.rows, rows)  # callers holding the list see every update
+            expected = ledger.apply_cards(ledger.apply_script(ledger.seed(outline(), LEDGER),
+                                                              records), {"parts": cards["parts"][:1]})
+            self.assertEqual(ledger.read(path), expected)
+            self.assertEqual([r["status"] for r in rows],
+                             ["verified", "missing_cards", "missing_script"])
+            self.assertEqual(sorted(p.name for p in pathlib.Path(tmp).iterdir()), ["ideas.csv"])
 
 
 class Gate(unittest.TestCase):

@@ -631,7 +631,7 @@ def _between(text: str, heading: str) -> str:
 
 
 def _dry_ideas(transcript: str) -> list[dict]:
-    """One idea per node that has units: the text of its first unit."""
+    """Pass-through: one idea per unit, the unit's own text."""
     ideas, current = [], None
     for line in transcript.splitlines():
         heading = re.match(r"^#{3,5} (\d+(?:\.\d+)*) ", line)
@@ -642,7 +642,6 @@ def _dry_ideas(transcript: str) -> list[dict]:
         if unit and current:
             ideas.append({"kind": "claim", "idea": unit.group(2), "nodes": [current],
                           "units": [int(unit.group(1))]})
-            current = None
     return ideas
 
 

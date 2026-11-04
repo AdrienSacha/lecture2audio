@@ -29,7 +29,7 @@ PROMPT_DIR = Path(__file__).parent / "prompts"
 LANGUAGE_NAMES = {"en": "English", "fr": "French"}
 ORIGINS = {"lecture", "added", "external"}
 STATUSES = {"complete", "incomplete", "misplaced"}
-SOFT_ISSUES = {"long", "filler", "plan", "marker"}
+SOFT_ISSUES = {"long", "filler", "plan", "marker", "idea_numbers"}
 
 
 class PipelineError(RuntimeError):
@@ -191,27 +191,66 @@ def _canon(token: str) -> str:
     return token.replace(",", "")
 
 
+class NumberIndex:
+    """The numbers a text holds, as digits or as words, for repeated look-ups."""
+
+    def __init__(self, text: str, language: str):
+        self.digits = {_canon(t) for t in _NUMBER.findall(text)}
+        self.words = re.sub(r"[\s\-]+", " ", text.lower())
+        self.language = language
+
+    def __contains__(self, token: str) -> bool:
+        canon = _canon(token)
+        if canon in self.digits:
+            return True
+        if canon.isdigit() and len(canon) <= 12:
+            words = re.sub(r"[\s\-]+", " ", number_to_words(int(canon), self.language).lower())
+            return words in self.words
+        return False
+
+    def absent(self, text: str) -> list[str]:
+        """The numbers of `text` that this text does not hold."""
+        return [t for t in _NUMBER.findall(text) if t not in self]
+
+
 def unsupported_numbers(script: list[dict], source: str, slides: str, language: str) -> list[dict]:
     """Numbers in sentences tagged 'lecture' that appear in neither source (as digits or words)."""
-    known_digits = {_canon(t) for t in _NUMBER.findall(source + " " + slides)}
-    known_words = re.sub(r"[\s\-]+", " ", (source + " " + slides).lower())
+    known = NumberIndex(source + " " + slides, language)
     issues = []
     for index, sentence in enumerate(script, 1):
         if sentence["origin"] != "lecture":
             continue
-        for token in _NUMBER.findall(sentence["text"]):
-            canon = _canon(token)
-            if canon in known_digits:
-                continue
-            if canon.isdigit() and len(canon) <= 12:
-                words = re.sub(r"[\s\-]+", " ", number_to_words(int(canon), language).lower())
-                if words in known_words:
-                    continue
+        for token in known.absent(sentence["text"]):
             issues.append({
                 "type": "unsupported", "sentence": index, "unit": None,
                 "detail": (f"The number {token} appears in neither the transcript nor the slides. "
                            'If it is a result you computed, tag the sentence "added".')})
     return issues
+
+
+# An exponent or an index ("n^2", "10^6", "x_1") is usually said in words ("n squared", "a
+# million"), so it is not looked for.
+_SCRIPTED = re.compile(r"[\^_]\s*\{?\s*$")
+
+
+def _and(items: list[str]) -> str:
+    """"64", "64 and 5", "64, 5 and 9"."""
+    items = [str(i) for i in items]
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def numbers_lost(statement: str, source: NumberIndex, text: NumberIndex) -> list[str]:
+    """Numbers of an idea that its source holds and the text that says it teaches the idea
+    does not. A number the source lacks (an extractor's slip) is not held against the text."""
+    lost = []
+    for match in _NUMBER.finditer(statement):
+        token, before = match.group(0), statement[:match.start()]
+        after = statement[match.end():match.end() + 1]
+        if _SCRIPTED.search(before) or after == "^":
+            continue
+        if token in source and token not in text and token not in lost:
+            lost.append(token)
+    return lost
 
 
 def external_numbers(script: list[dict], supplements: dict[str, str], language: str) -> list[dict]:
@@ -220,13 +259,23 @@ def external_numbers(script: list[dict], supplements: dict[str, str], language: 
     for index, sentence in enumerate(script, 1):
         if sentence["origin"] != "external":
             continue
-        source = supplements.get(sentence.get("source"), "")
-        for issue in unsupported_numbers([dict(sentence, origin="lecture")], source, "", language):
-            number = issue["detail"].split()[2]
-            issues.append(dict(issue, sentence=index, detail=(
+        known = NumberIndex(supplements.get(sentence.get("source"), ""), language)
+        for number in known.absent(sentence["text"]):
+            issues.append(dict(type="unsupported", sentence=index, unit=None, detail=(
                 f"The number {number} is not in supplement {sentence.get('source')}. "
                 "Use the supplement's own numbers.")))
     return issues
+
+
+# A fact planted in a copy of one part to test the idea listing (audit_ideas). It is written to
+# be unmistakable: an extractor that lists everything lists it.
+PLANTED_IDEA = {
+    "en": "For the exam, remember that the reference threshold used in this course is exactly "
+          "7919 units, and that this threshold never changes.",
+    "fr": "Pour l'examen, retenez que le seuil de référence utilisé dans ce cours vaut "
+          "exactement 7919 unités, et que ce seuil ne change jamais.",
+}
+PLANTED_NUMBER = "7919"
 
 
 # --------------------------------------------------------- spoken structure
@@ -433,11 +482,19 @@ class TextPipeline:
                     + "\nReturn only the JSON object, in exactly the required format.")
         raise PipelineError(f"{what}: no valid answer after {tries} tries ({problem}).")
 
-    def _map(self, function, items):
+    def _map(self, function, items, on_done: Callable[[object], None] | None = None):
+        """function(item) for every item, in parallel, results in order. `on_done(result)` is
+        called as each item finishes (from its worker thread)."""
+        def one(item):
+            result = function(item)
+            if on_done:
+                on_done(result)
+            return result
+
         if self.workers == 1 or len(items) < 2:
-            return [function(item) for item in items]
+            return [one(item) for item in items]
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            return list(pool.map(function, items))
+            return list(pool.map(one, items))
 
     # -- stage 1: outline ----------------------------------------------------------
     def run_outline(self, units: list[str]) -> Outline:
@@ -513,12 +570,8 @@ class TextPipeline:
                 return json.loads(cache.read_text(encoding="utf-8"))
             if not part.all_units():
                 return []
-            source = part_source(outline, part, noise[part.id])
-            user = (f"## LANGUAGE\n{self.language_name}\n\n"
-                    + _section("OUTLINE", render_outline(outline, part.id))
-                    + _section("GLOSSARY", self.glossary)
-                    + _section("SLIDES", select_slides(self.slides, source) if self.slides else "")
-                    + "## TRANSCRIPT OF THIS PART\n" + render_part_transcript(outline, part, []))
+            user = self._ideas_request(outline, part, render_part_transcript(outline, part, []),
+                                       noise[part.id])
             try:
                 data = self._ask_json(self.rewrite_llm, self.prompts.ideas, user,
                                       lambda d: enrich.validate_idea_list(d, part),
@@ -537,6 +590,51 @@ class TextPipeline:
         ideas = [i for part_ideas in self._map(one, outline.parts) for i in part_ideas]
         self.coverage["transcript_ideas"] = ideas
         return ideas
+
+    def _ideas_request(self, outline: Outline, part: Node, transcript: str, noise: list[int]) -> str:
+        source = part_source(outline, part, noise)
+        return (f"## LANGUAGE\n{self.language_name}\n\n"
+                + _section("OUTLINE", render_outline(outline, part.id))
+                + _section("GLOSSARY", self.glossary)
+                + _section("SLIDES", select_slides(self.slides, source) if self.slides else "")
+                + "## TRANSCRIPT OF THIS PART\n" + transcript)
+
+    def audit_ideas(self, outline: Outline) -> dict:
+        """Plant one unmistakable fact in a copy of a part and list that part's ideas again: an
+        extractor that does not list it may be dropping ideas, and the ledger only proves that
+        the ideas it lists arrive."""
+        cache = self.work_dir / "ideas_audit.json"
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        listed = {i["nodes"][0].split(".")[0] for i in self.coverage.get("transcript_ideas", [])}
+        candidates = [n for part in outline.parts if part.id in listed
+                      for n in part.walk() if n.own_units()]
+        result = {"skipped": "no part has a list of ideas"}
+        if candidates:
+            node = max(candidates, key=lambda n: len(n.own_units()))
+            part = outline.node(node.id.split(".")[0])
+            planted = len(outline.units) + 1
+            fact = PLANTED_IDEA.get(self.language, PLANTED_IDEA["en"])
+            last = f"[{node.own_units()[-1]}] "
+            lines = render_part_transcript(outline, part, []).splitlines()
+            at = next(k for k, line in enumerate(lines) if line.startswith(last)) + 1
+            lines.insert(at, f"[{planted}] {fact}")
+            self.log(f"[audit] planting a fact in node {node.id} to test the idea listing")
+            user = self._ideas_request(outline, part, "\n".join(lines),
+                                       noise_by_part(outline)[part.id])
+            try:
+                data = self._ask_json(
+                    self.rewrite_llm, self.prompts.ideas, user,
+                    lambda d: enrich.validate_idea_list(d, part, extra_units={planted}),
+                    "idea listing audit")
+            except (PipelineError, LLMError) as exc:  # retried next run: not cached
+                self.log(f"[audit] idea listing: {exc}")
+                return {"skipped": f"the test failed ({exc}); it runs again next time"}
+            caught = any(planted in (i.get("units") or []) or PLANTED_NUMBER in str(i["idea"])
+                         for i in data["ideas"])
+            result = {"part": part.id, "node": node.id, "title": node.title, "caught": caught}
+        cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
 
     def audit_coverage(self, outline: Outline) -> dict:
         """Plant a hole in the lecture and see whether the gap search notices it, because a
@@ -571,8 +669,9 @@ class TextPipeline:
                        if (str(g["node"]), g["kind"], str(g.get("term", "")).lower()) not in known]
                 result = {"node": node.id, "title": node.title, "unit": unit,
                           "caught": any(str(g["node"]) in region for g in new)}
-            except PipelineError as exc:
-                result = {"skipped": str(exc)}
+            except (PipelineError, LLMError) as exc:  # retried next run: not cached
+                self.log(f"[audit] gap search: {exc}")
+                return {"skipped": f"the test failed ({exc}); it runs again next time"}
         cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         return result
 
@@ -741,18 +840,28 @@ class TextPipeline:
                            "sentence": sentence if isinstance(sentence, int) else None,
                            "unit": unit if isinstance(unit, int) else None})
         ideas, by_id = [], {str(i["id"]): i for i in ctx.get("ideas", [])}
+        source = NumberIndex(ctx["source"], self.language)
+        said = NumberIndex(" ".join(x["text"] for x in sentences_of(result)), self.language)
         for item in data.get("ideas", []) if idea_ids else []:
             idea = by_id.get(str(item.get("idea"))) if isinstance(item, dict) else None
             if idea is None:
                 continue
-            ideas.append({"idea": idea["id"], "status": item["status"],
-                          "detail": str(item.get("detail") or "")})
-            if item["status"] == "missing":
+            status, detail = item["status"], str(item.get("detail") or "")
+            lost = numbers_lost(idea["idea"], source, said) if status == "taught" else []
+            ideas.append({"idea": idea["id"], "status": status, "judged": status,
+                          "detail": detail, "lost": lost})
+            if status == "missing":
                 issues.append({"type": "idea_missing", "node": str(idea["nodes"][0]),
                                "sentence": None, "unit": None,
                                "detail": (f'The lecture idea {idea["id"]} ({idea["kind"]}: '
-                                          f'{idea["idea"]}) is not in the script. '
-                                          + str(item.get("detail") or "")).strip()})
+                                          f'{idea["idea"]}) is not in the script. {detail}').strip()})
+            elif lost:  # the judge and code disagree: reported, not blocking
+                issues.append({"type": "idea_numbers", "node": str(idea["nodes"][0]),
+                               "sentence": None, "unit": None,
+                               "detail": (f'The verifier finds the lecture idea {idea["id"]} '
+                                          f'({idea["idea"]}) in the script, but the script does '
+                                          f'not contain {_and(lost)}, which the transcript '
+                                          "gives. State the number as the teacher did.")})
         return issues, ideas
 
     def _code_issues(self, ctx: dict, result: dict) -> list[dict]:
@@ -847,7 +956,9 @@ class TextPipeline:
                 "flagged": best["blocking"] > 0, "moves": moves(part),
                 "supplements": ctx["supplements"], "ideas": best["ideas"]}
 
-    def run_parts(self, outline: Outline) -> list[dict]:
+    def run_parts(self, outline: Outline, on_done: Callable[[dict], None] | None = None) -> list[dict]:
+        """Rewrite and verify every part. `on_done(record)` is called as each part finishes
+        (from a worker thread), so that the idea ledger stays current during the run."""
         directory = self._dir("rewrite")
 
         def one(part: Node) -> dict:
@@ -860,7 +971,7 @@ class TextPipeline:
             cache.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
             return record
 
-        return self._map(one, outline.parts)
+        return self._map(one, outline.parts, on_done)
 
     # -- checks on the whole lecture ---------------------------------------------------
     def audit_verifier(self, outline: Outline, records: list[dict]) -> dict:
@@ -887,8 +998,10 @@ class TextPipeline:
                                              for s in record["sections"]])
             self.log(f"[audit] removing {removed} sentences from node {target['node']} "
                      "to test the verifier")
-            issues, _ = self._verify(outline, self._context(outline, part), mutated)
-            caught = any(i["type"] in ("missing", "misplaced", "idea_missing") for i in issues)
+            issues, ideas = self._verify(outline, self._context(outline, part), mutated)
+            # the model's own answers only: the code checks inside _verify must not score
+            caught = (any(i["type"] in ("missing", "misplaced") for i in issues)
+                      or any(i["judged"] == "missing" for i in ideas))
             result = {"part": part.id, "node": target["node"],
                       "title": outline.node(target["node"]).title, "removed": removed,
                       "caught": caught}

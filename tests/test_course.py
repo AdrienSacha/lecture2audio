@@ -383,6 +383,59 @@ class Ideas(unittest.TestCase):
         self.assertEqual(enrich.validate_coverage({"slide_ideas": [], "gaps": []}, ["1"], 0), [])
 
 
+class JudgeChecks(unittest.TestCase):
+    def test_a_card_without_the_ideas_number_is_reported_not_overruled(self):
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            for c in data["cards"]:
+                c["explanation"] = [p.replace("64", "many") for p in c["explanation"]]
+            return json.dumps(data)
+        outline, records, result, calls, tmp = stage(writer=writer, coverage=IDEAS)
+        self.addCleanup(tmp.cleanup)
+        part = result["parts"][0]
+        ideas = {i["idea"]: i for i in part["ideas"]}
+        self.assertEqual((ideas["T1"]["status"], ideas["T1"]["lost"]), ("taught", ["64"]))
+        self.assertEqual(ideas["T2"]["lost"], [])
+        self.assertEqual(part["attempts"], 1)  # not blocking
+        issue = next(i for i in part["issues"] if i["type"] == "idea_numbers")
+        self.assertIn("in card 1.1, but the card does not contain 64", issue["detail"])
+
+    def test_a_number_in_code_or_a_table_counts(self):
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            first = data["cards"][0]
+            first["explanation"] = [p.replace("64", "many") for p in first["explanation"]]
+            first["code"] = [{"language": "c", "code": "#define WINDOW 64", "caption": ""}]
+            return json.dumps(data)
+        outline, records, result, calls, tmp = stage(writer=writer, coverage=IDEAS)
+        self.addCleanup(tmp.cleanup)
+        ideas = {i["idea"]: i for i in result["parts"][0]["ideas"]}
+        self.assertEqual(ideas["T1"]["lost"], [])
+
+    def test_a_judge_that_passes_an_emptied_card_is_exposed(self):
+        outline, records, result, calls, tmp = stage(coverage=IDEAS)
+        self.addCleanup(tmp.cleanup)
+        audit = result["audit"]
+        self.assertEqual((audit["part"], audit["idea"]), ("1", "T1"))
+        self.assertFalse(audit["caught"])  # the dry judge passes everything
+        self.assertIn("emptied card", course.course_report(result, {"cards": 2, "diagrams": 0,
+                                                                     "notes": 0}))
+
+    def test_a_judge_that_reads_the_cards_catches_the_emptied_card(self):
+        def judge(user, n):
+            data = json.loads(dry_course_check(user))
+            shown = json.loads(user.split("## CARDS (JSON)\n", 1)[1])
+            empty = {c["card"] for c in shown if c["explanation"] == [c["title"]]}
+            for item in data["ideas"]:
+                if set(item["cards"]) & empty:
+                    item.update(status="missing", cards=[])
+            return json.dumps(data)
+        outline, records, result, calls, tmp = stage(judge=judge, coverage=IDEAS)
+        self.addCleanup(tmp.cleanup)
+        self.assertTrue(result["audit"]["caught"])
+        self.assertTrue((pathlib.Path(tmp.name) / "course" / "audit.json").exists())
+
+
 class ColdRead(unittest.TestCase):
     def test_loose_ends_are_reported_and_do_not_block(self):
         def cold(user):

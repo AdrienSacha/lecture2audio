@@ -230,7 +230,9 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
 
 LEDGER_STATUS = {"pending": "not checked", "scripted": "found in the script, not yet in a card",
                  "missing_script": "missing from the script",
-                 "missing_cards": "missing from the course cards", "verified": "verified"}
+                 "missing_cards": "missing from the course cards", "verified": "verified",
+                 "disputed": "called taught by the judge, but code did not find one of its "
+                             "numbers"}
 
 
 def ledger_lines(ideas: dict) -> list[str]:
@@ -263,6 +265,15 @@ def ledger_lines(ideas: dict) -> list[str]:
     else:
         lines.append("Every idea of the ledger reached the "
                      + ("course cards." if course else "script."))
+    audit = ideas.get("audit")
+    if audit and audit.get("skipped"):
+        lines += ["", f"The test of the idea listing was skipped: {audit['skipped']}."]
+    elif audit:
+        lines += ["", f"The test of the idea listing planted one fact in node {audit['node']} "
+                  f"\"{audit['title']}\" and listed the ideas of part {audit['part']} again; "
+                  + ("the fact was listed." if audit["caught"] else
+                     "**the fact was not listed**, so the ledger may be missing ideas of the "
+                     "lecture; consider a stronger writer model (--rewrite-model).")]
     if ideas.get("empty_parts"):
         lines += ["", f"Parts {', '.join(ideas['empty_parts'])} teach content but have no idea "
                   "in the ledger. The list of ideas may have been cut short (for example by the "

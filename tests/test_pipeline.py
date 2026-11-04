@@ -17,8 +17,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 from lecture2audio.cli import main
 from lecture2audio.llm import FakeLLM, _between, dry_run_handler
 from lecture2audio.outline import parse_outline
-from lecture2audio.pipeline import (TextPipeline, list_sentence, load_prompts, part_blocks,
-                                    unsupported_numbers, validate_verify)
+from lecture2audio.pipeline import (NumberIndex, TextPipeline, list_sentence, load_prompts,
+                                    numbers_lost, part_blocks, unsupported_numbers,
+                                    validate_verify)
 
 UNITS = ["The window holds 64 packets.", "um ok let me drink some water",
          "A timeout is 5 seconds.", "The sender waits for the timeout.",
@@ -301,7 +302,8 @@ class Ideas(unittest.TestCase):
             outline = pipeline.run_outline(UNITS)
             ideas = pipeline.run_ideas(outline)
             self.assertEqual(len(harness.prompts("ideas")), 2)  # one call per part
-            self.assertEqual([i["id"] for i in ideas], ["T1.1", "T1.2", "T2.1"])
+            self.assertEqual([i["id"] for i in ideas],
+                             ["T1.1", "T1.2", "T1.3", "T1.4", "T2.1", "T2.2"])
             self.assertEqual(ideas[1]["nodes"], ["1.2"])
             self.assertEqual(ideas[1]["units"], [3])
             self.assertIs(pipeline.coverage["transcript_ideas"], ideas)
@@ -326,7 +328,7 @@ class Ideas(unittest.TestCase):
             pipeline = harness.pipeline(tmp)
             found = pipeline.run_ideas(pipeline.run_outline(UNITS))
         self.assertIn("nodes ['1.2'] have units but no idea", answers[1])
-        self.assertEqual(len([i for i in found if i["id"].startswith("T1.")]), 2)
+        self.assertEqual(len([i for i in found if i["id"].startswith("T1.")]), 4)
 
     def test_a_part_that_keeps_failing_is_left_empty_and_tried_again_next_run(self):
         def ideas(system, user):
@@ -342,6 +344,62 @@ class Ideas(unittest.TestCase):
             self.assertEqual({i["id"][:3] for i in found}, {"T1."})
             self.assertFalse((pathlib.Path(tmp) / "ideas" / "part_002.json").exists())
             self.assertTrue((pathlib.Path(tmp) / "ideas" / "part_001.json").exists())
+
+
+class IdeaAudit(unittest.TestCase):
+    def audit(self, ideas=None):
+        harness = Harness(ideas=ideas)
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = harness.pipeline(tmp)
+            outline = pipeline.run_outline(UNITS)
+            pipeline.run_ideas(outline)
+            result = pipeline.audit_ideas(outline)
+            cached = pipeline.audit_ideas(outline)
+        return result, cached, harness
+
+    def test_an_extractor_that_lists_everything_lists_the_planted_fact(self):
+        result, cached, harness = self.audit()
+        self.assertTrue(result["caught"])
+        self.assertEqual(result["node"], "1.2")  # the node with the most units
+        self.assertIn("7919", harness.prompts("ideas")[-1])
+        self.assertEqual(cached, result)
+        self.assertEqual(len(harness.prompts("ideas")), 3)  # two parts, one audit, then cache
+
+    def test_an_extractor_that_skips_the_planted_fact_is_exposed(self):
+        def ideas(system, user):
+            data = json.loads(dry_run_handler(system, user))
+            data["ideas"] = [i for i in data["ideas"] if "7919" not in i["idea"]]
+            return json.dumps(data)
+        result, _, _ = self.audit(ideas)
+        self.assertFalse(result["caught"])
+
+
+class IdeaNumbers(unittest.TestCase):
+    def test_a_taught_idea_whose_number_is_not_in_the_script_is_disputed_not_overruled(self):
+        def rewrite(system, user):
+            return good_rewrite(user).replace("The window holds 64 packets.",
+                                              "The window holds packets.")
+        harness = Harness(rewrite)
+        _, records, _ = run_text(harness, coverage=LEDGER, max_retries=1)
+        first = records[0]["ideas"][0]
+        self.assertEqual((first["idea"], first["status"], first["lost"]), ("T1", "taught", ["64"]))
+        self.assertFalse(records[0]["flagged"])  # a code doubt reports, it does not block
+        issue = next(i for i in records[0]["issues"] if i["type"] == "idea_numbers")
+        self.assertIn("does not contain 64, which the transcript gives.", issue["detail"])
+
+    def test_numbers_said_in_words_and_exponents_are_not_held_against_the_text(self):
+        source = NumberIndex("The cost is O(n^2) for 10^6 items and 64 packets.", "en")
+        said = NumberIndex("The cost is n squared for a million items and sixty-four packets.",
+                           "en")
+        self.assertEqual(numbers_lost("O(n^2) for 10^6 items, 64 packets", source, said), [])
+        self.assertEqual(numbers_lost("64 packets", source, NumberIndex("many packets", "en")),
+                         ["64"])
+
+    def test_a_number_the_transcript_lacks_is_not_held_against_the_script(self):
+        coverage = {"transcript_ideas": [dict(LEDGER["transcript_ideas"][0],
+                                              idea="the window holds 99 packets")]}
+        _, records, _ = run_text(Harness(), coverage=coverage)
+        self.assertEqual(records[0]["ideas"][0]["status"], "taught")
 
 
 class Audit(unittest.TestCase):
@@ -364,6 +422,43 @@ class Audit(unittest.TestCase):
                                "issues": []})
 
         self.assertFalse(self.audit(always_pass)["caught"])
+
+
+class AuditScoresTheModel(unittest.TestCase):
+    def test_code_checks_inside_the_verifier_do_not_pass_its_audit(self):
+        # The planted omission keeps only the first sentence of node 1.2, which here is not
+        # "A timeout is 5 seconds."; code notices the lost 5, but the verifier model said
+        # complete and taught, so the audit must still fail.
+        def rewrite(system, user):
+            data = json.loads(good_rewrite(user))
+            for section in data["sections"]:
+                if section["node"] == "1.2":
+                    section["sentences"].reverse()
+            return json.dumps(data)
+
+        def always_pass(system, user):
+            data = json.loads(counting_verifier(system, user))
+            for point in data["points"]:
+                point["status"] = "complete"
+            return json.dumps(data)
+
+        harness = Harness(rewrite, verify=always_pass)
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = harness.pipeline(tmp, coverage=LEDGER)
+            outline = pipeline.run_outline(UNITS)
+            audit = pipeline.audit_verifier(outline, pipeline.run_parts(outline))
+        self.assertEqual(audit["node"], "1.2")
+        self.assertFalse(audit["caught"])
+
+    def test_a_failed_audit_is_not_cached(self):
+        harness = Harness(ideas=lambda s, u: (dry_run_handler(s, u) if "7919" not in u
+                                              else "no json"))
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = harness.pipeline(tmp)
+            outline = pipeline.run_outline(UNITS)
+            pipeline.run_ideas(outline)
+            self.assertIn("runs again next time", pipeline.audit_ideas(outline)["skipped"])
+            self.assertFalse((pathlib.Path(tmp) / "ideas_audit.json").exists())
 
 
 class Notes(unittest.TestCase):
@@ -485,7 +580,12 @@ class EndToEnd(unittest.TestCase):
             self.assertTrue(rows)
             self.assertEqual({r["status"] for r in rows}, {"verified"})
             self.assertTrue(all(r["covered_in_card"] and r["source_units"] for r in rows))
-            self.assertIn("## Idea ledger (ideas.csv)", (work / "report.md").read_text())
+            report = (work / "report.md").read_text()
+            self.assertIn("## Idea ledger (ideas.csv)", report)
+            self.assertIn("The test of the idea listing planted one fact", report)
+            self.assertIn("the fact was listed.", report)
+            self.assertIn("The test of the course judge", report)
+            self.assertFalse((work / "ideas.csv.tmp").exists())
             anki = (work / "anki.csv").read_text(encoding="utf-8")
             self.assertTrue(anki.startswith("#separator:Comma\n"))
             self.assertIn("#columns:Front,Back,Tags", anki)

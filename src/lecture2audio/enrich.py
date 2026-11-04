@@ -36,13 +36,14 @@ def part_of(node_id: str) -> int:
 
 # ------------------------------------------------------------------- coverage
 
-def validate_idea_list(data, part) -> list[str]:
+def validate_idea_list(data, part, extra_units=()) -> list[str]:
     """The gate on one part's list of atomic ideas: known kinds, nodes and units of this part,
-    and at least one idea for every node that has units (a node with none was skipped)."""
+    and at least one idea for every node that has units (a node with none was skipped).
+    `extra_units` are units added to the part for an audit."""
     if not isinstance(data, dict) or not isinstance(data.get("ideas"), list):
         return ['the answer must be {"ideas": [...]}']
     nodes = {node.id: set(node.own_units()) for node in part.walk()}
-    units = set(part.all_units())
+    units = set(part.all_units()) | set(extra_units)
     errors, named = [], set()
     for k, idea in enumerate(data["ideas"], 1):
         where = f"idea {k}"

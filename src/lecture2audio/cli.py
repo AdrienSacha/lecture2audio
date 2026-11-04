@@ -38,11 +38,12 @@ from .tts import TTSError, make_tts
 GAPS = ["coverage.json", "coverage_audit.json", "termbase.json", "research"]
 DERIVED = ["ideas.csv", "anki.csv"]
 VOICE = ["spoken", "audio", "parts"]
-LATER = {"transcribe": ["outline.json", *GAPS, "ideas", "rewrite", "audit.json", *VOICE,
+IDEAS = ["ideas", "ideas_audit.json"]
+LATER = {"transcribe": ["outline.json", *GAPS, *IDEAS, "rewrite", "audit.json", *VOICE,
                         "course", "vault", *DERIVED],
-         "outline": ["outline.json", *GAPS, "ideas", "rewrite", "audit.json", *VOICE, "course",
+         "outline": ["outline.json", *GAPS, *IDEAS, "rewrite", "audit.json", *VOICE, "course",
                      "vault", *DERIVED],
-         "ideas": ["ideas", "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
+         "ideas": [*IDEAS, "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
          "gaps": [*GAPS, "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
          "research": ["research", "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
          "rewrite": ["rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
@@ -139,8 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
         llm.add_argument("--workers", type=int, default=3,
                          help="parts processed at the same time (default 3)")
         llm.add_argument("--no-audit", action="store_true",
-                         help="skip the tests that plant a fault (an omission for the verifier, a hole "
-                              "for the gap search) to check that they notice it")
+                         help="skip the tests that plant a fault (an omission for the verifier, a "
+                              "hole for the gap search, a fact for the idea listing, an emptied "
+                              "card for the course judge) to check that they notice it")
         research = p.add_argument_group("web research (fills the gaps the lecture leaves)")
         research.add_argument("--research", choices=["auto", "native", "loop", "off"],
                               default="auto",
@@ -382,11 +384,12 @@ def run(args, series: dict | None = None) -> int:
         f"{sum(len(p.children) for p in outline.parts)} point(s)")
     coverage = pipeline.run_coverage(outline)
     pipeline.run_ideas(outline)  # fills coverage["transcript_ideas"], part by part
-    # the idea ledger: every atomic idea of the transcript, checked off by the later stages
-    ideas_path = work / "ideas.csv"
-    ideas = ledger.seed(outline, coverage)
-    ledger.write(ideas_path, ideas)
-    log(f"[ideas] {len(ideas)} atomic idea(s) in {ideas_path}")
+    # the idea ledger: every atomic idea of the transcript, checked off by the later stages as
+    # each part finishes; ideas.csv is rewritten after every part
+    book = ledger.Ledger(work / "ideas.csv", outline, coverage)
+    ideas = book.rows
+    log(f"[ideas] {len(ideas)} atomic idea(s) in {book.path}")
+    ideas_audit = None if args.no_audit else pipeline.audit_ideas(outline)
     terms = pipeline.run_termbase(outline)
     if series.get("stop_after") == "termbase":
         return 0
@@ -398,8 +401,7 @@ def run(args, series: dict | None = None) -> int:
     gaps = {"coverage": coverage, "terms": terms, "research": pipeline.research,
             "supplements": supplements, "note": research_note,
             "audit": None if args.no_audit else pipeline.audit_coverage(outline)}
-    records = pipeline.run_parts(outline)
-    ledger.write(ideas_path, ledger.apply_script(ideas, records))
+    records = pipeline.run_parts(outline, on_done=book.script_done)
     audit = None if args.no_audit else pipeline.audit_verifier(outline, records)
     notes = pipeline.global_notes(outline, records)
     spoken = pipeline.run_spoken(outline, records)
@@ -414,8 +416,8 @@ def run(args, series: dict | None = None) -> int:
         return stats
 
     if args.course:
-        course = CoursePipeline(pipeline, series.get("notation")).run(outline, records)
-        ledger.write(ideas_path, ledger.apply_cards(ideas, course))
+        course = CoursePipeline(pipeline, series.get("notation")).run(
+            outline, records, on_done=book.cards_done, audit=not args.no_audit)
         if series.get("skip_vault"):
             course_stats = {"cards": sum(len(p["cards"]) for p in course["parts"]),
                             "notes": 0, "diagrams": sum(bool(c["diagram"]) for p in course["parts"]
@@ -444,7 +446,8 @@ def run(args, series: dict | None = None) -> int:
         write_glossary(work / "glossary.md", name, outline, terms)
         write_report(work / "report.md", name, outline, records, spoken, notes, audit, usage,
                      roundtrip, gaps, {"rows": ideas, "course": bool(course),
-                                       "empty_parts": ledger.parts_without_ideas(outline, ideas)})
+                                       "empty_parts": ledger.parts_without_ideas(outline, ideas),
+                                       "audit": ideas_audit})
         if course:  # before the list of noise, which stays last
             report = (work / "report.md").read_text(encoding="utf-8")
             cut = report.find("\n## Removed as noise")
@@ -459,6 +462,10 @@ def run(args, series: dict | None = None) -> int:
             "(see report.md)")
     if audit and audit.get("caught") is False:
         log("[check] the verifier missed a planted omission (see report.md)")
+    if ideas_audit and ideas_audit.get("caught") is False:
+        log("[check] the idea listing missed a planted fact (see report.md)")
+    if course and (course.get("audit") or {}).get("caught") is False:
+        log("[check] the course judge passed an emptied card (see report.md)")
     if args.command == "text":
         log(f"Done. Read {work / 'script.md'} and {work / 'report.md'}.")
         if course_stats and not series:

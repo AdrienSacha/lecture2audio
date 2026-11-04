@@ -81,9 +81,12 @@ Obsidian trades a guided interface for a tool the owner already uses daily. The 
 
 - Easier: proving which card teaches which idea; finding the transcript units behind any line of the notes; rerunning one part; exporting review cards (`--export-anki`) tagged by idea.
 - Harder: every prompt change must change its gate, `dry_run_handler` and the tests together (`CLAUDE.md`); prompts are routed by a phrase, which a careless edit can break.
+- Addressed in November 2026:
+  - **The extractor is audited** (`audit_ideas`): one unmistakable fact is planted in a copy of a part, and the listing must list it. The ledger still proves only that listed ideas arrived; the audit measures how far the list can be trusted.
+  - **The course judge is audited** (`audit_judge`): the one card that teaches an idea is emptied (it keeps its claim), and the judge's own verdict must turn to "missing".
+  - **"Taught" is checked by code**: the idea's numbers that the transcript holds must appear in the script or in the cards named (`numbers_lost`). Code does not overrule the judge, because digits are often said in words ("n squared", "a million"); a disagreement makes the idea `disputed`, which is reported and not counted as arrived, and never blocks a part. Terms are not yet checked this way.
+  - **The ledger is live**: `ideas.csv` is rebuilt and atomically replaced as each part finishes.
 - To revisit:
-  - **The extractor is not audited.** The ledger proves only that listed ideas arrived. An idea that `run_ideas` never lists is caught only by the verifier's node-by-node check against the units. The verifier has a planted-omission test; the extractor and the course judge have none.
-  - **"Verified" is a model's claim confirmed by a second model.** The card claims the idea and the judge agrees. No code yet checks that a verified idea's numbers and terms appear in the text of its card.
   - **The gap search reads the whole lecture.** Its output is now small, but its input on a six-hour lecture is long, and recall falls with length.
   - **No real model has run the chain.** Every check so far used the dry model or test handlers.
 
@@ -91,7 +94,9 @@ Obsidian trades a guided interface for a tool the owner already uses daily. The 
 
 1. [x] List the ideas per part (`run_ideas`, `prompts/ideas.md`, `validate_idea_list`), with ids scoped to the part.
 2. [ ] Run one real lecture per provider (DeepSeek, Anthropic) and read `report.md`, `ideas.csv` and the vault; tune the prompts on what they show.
-3. [ ] Add a planted-idea test for the extractor: add one unit with a distinctive fact to a copy of a part, and check that `run_ideas` lists it; report the result as the verifier test is reported.
-4. [ ] Add a planted-omission test for the course judge: remove a claimed idea's sentences from its card, and check that the judge calls the idea missing.
-5. [ ] Add a code check for verified ideas: the numbers of the idea's statement must appear in the text of the card that claims it (reusing `unsupported_numbers`).
-6. [ ] Measure, on a long real lecture, whether the gap search misses gaps in late parts; if so, split it into a per-part search plus a whole-lecture pass over the termbase only.
+3. [x] Add a planted-idea test for the extractor (`audit_ideas`), reported in `report.md`.
+4. [x] Add a planted-omission test for the course judge (`audit_judge`), reported in `report.md`.
+5. [x] Check by code that a taught idea's numbers are in the script and in its cards (`numbers_lost`).
+6. [x] Keep `ideas.csv` current during the run (`ledger.Ledger`, atomic replacement after each part).
+7. [ ] Extend the code check of taught ideas to their terms (the termbase terms an idea names must appear in the cards that teach it).
+8. [ ] Measure, on a long real lecture, whether the gap search misses gaps in late parts; if so, split it into a per-part search plus a whole-lecture pass over the termbase only.

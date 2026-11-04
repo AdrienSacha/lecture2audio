@@ -5,16 +5,23 @@ twelfth idea of part 3). The ledger records each one with its node and its trans
 script checks it off ("scripted" or "missing_script"), the judge of the course material checks
 it off against the cards ("verified", with the cards that teach it, or "missing_cards"). The
 file is rebuilt from the cached stage results on every run, so it always matches them, and
-`report.md` lists every idea that did not reach the end. An idea only moves forward: a later
-stage never lowers a status that an earlier stage set, except "missing".
+`report.md` lists every idea that did not reach the end.
+
+`Ledger` keeps the file current during the run: it is rewritten each time a part finishes its
+script or its cards, always rebuilt from the seed and every result received so far (never edited
+in place), and replaced atomically, so a reader never sees a half-written file and the file never
+says more than the saved results do.
 
 The ledger also feeds `anki.csv` (`--export-anki`): the check questions of the cards, tagged with
 the ideas they test, and one recall card for each verified idea that no check question tests.
 """
 from __future__ import annotations
 
+import copy
 import csv
+import os
 import re
+import threading
 from pathlib import Path
 
 from .outline import Outline
@@ -22,7 +29,10 @@ from .outline import Outline
 COLUMNS = ["idea_id", "node_id", "kind", "statement", "source_units", "covered_in_card", "status"]
 PENDING, SCRIPTED, VERIFIED = "pending", "scripted", "verified"
 MISSING_SCRIPT, MISSING_CARDS = "missing_script", "missing_cards"
-STATUSES = (PENDING, SCRIPTED, MISSING_SCRIPT, VERIFIED, MISSING_CARDS)
+# A judge says "taught", but code does not find a number of the idea in what was judged. Neither
+# is overruled: the idea is not counted as arrived, and report.md shows it for a human to decide.
+DISPUTED = "disputed"
+STATUSES = (PENDING, SCRIPTED, MISSING_SCRIPT, VERIFIED, MISSING_CARDS, DISPUTED)
 
 KIND_WORDS = {
     "en": {"definition": "definition", "claim": "claim", "step": "step", "formula": "formula",
@@ -78,12 +88,16 @@ def apply_script(rows: list[dict], records: list[dict]) -> list[dict]:
     verdicts: dict[str, set[str]] = {}
     for record in records:
         for item in record.get("ideas", []):
-            verdicts.setdefault(str(item.get("idea")), set()).add(item.get("status"))
+            verdict = item.get("status")
+            if verdict == "taught" and item.get("lost"):
+                verdict = DISPUTED
+            verdicts.setdefault(str(item.get("idea")), set()).add(verdict)
     for row in rows:
         seen = verdicts.get(row["idea_id"])
         if not seen or row["status"] == VERIFIED:
             continue
-        row["status"] = SCRIPTED if "taught" in seen else MISSING_SCRIPT
+        row["status"] = (SCRIPTED if "taught" in seen else DISPUTED if DISPUTED in seen
+                         else MISSING_SCRIPT)
     return rows
 
 
@@ -91,6 +105,7 @@ def apply_cards(rows: list[dict], course: dict) -> list[dict]:
     """The judge's check of each idea against the cards: the cards that teach it, and the
     status "verified". A taught idea with no card named stays at its earlier status."""
     taught: dict[str, list[str]] = {}
+    disputed: set[str] = set()
     missing: set[str] = set()
     for part in course.get("parts", []):
         for item in part.get("ideas", []):
@@ -98,12 +113,14 @@ def apply_cards(rows: list[dict], course: dict) -> list[dict]:
             if item.get("status") == "taught" and item.get("cards"):
                 taught.setdefault(idea, [])
                 taught[idea] += [c for c in item["cards"] if c not in taught[idea]]
+                if item.get("lost"):
+                    disputed.add(idea)
             elif item.get("status") == "missing":
                 missing.add(idea)
     for row in rows:
         if row["idea_id"] in taught:
             row["covered_in_card"] = ";".join(taught[row["idea_id"]])
-            row["status"] = VERIFIED
+            row["status"] = DISPUTED if row["idea_id"] in disputed else VERIFIED
         elif row["idea_id"] in missing:
             row["covered_in_card"] = ""
             row["status"] = MISSING_CARDS
@@ -111,10 +128,54 @@ def apply_cards(rows: list[dict], course: dict) -> list[dict]:
 
 
 def write(path: Path, rows: list[dict]) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as handle:
+    """Write the ledger through a temporary file and an atomic rename."""
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    with open(temporary, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=COLUMNS, lineterminator="\n")
         writer.writeheader()
         writer.writerows({k: row.get(k, "") for k in COLUMNS} for row in rows)
+    os.replace(temporary, path)
+
+
+class Ledger:
+    """ideas.csv, kept current while the parts run in parallel.
+
+    Every update rebuilds all rows from the seed and the results received so far, in part
+    order, then writes the file; the rows are therefore a pure function of the saved stage
+    results, whatever order the parts finish in."""
+
+    def __init__(self, path: Path, outline: Outline, coverage: dict):
+        self.path = Path(path)
+        self._seed = seed(outline, coverage)
+        self._records: dict[str, dict] = {}
+        self._cards: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self.rows: list[dict] = []
+        self._rebuild()
+
+    @staticmethod
+    def _ordered(results: dict[str, dict]) -> list[dict]:
+        return [results[k] for k in sorted(results, key=int)]
+
+    def _rebuild(self) -> None:
+        rows = copy.deepcopy(self._seed)
+        apply_script(rows, self._ordered(self._records))
+        apply_cards(rows, {"parts": self._ordered(self._cards)})
+        self.rows[:] = rows  # same list object: callers that hold it see the update
+        write(self.path, self.rows)
+
+    def script_done(self, record: dict) -> None:
+        """A part's script was verified (called from a worker thread)."""
+        with self._lock:
+            self._records[str(record["part"])] = record
+            self._rebuild()
+
+    def cards_done(self, part: dict) -> None:
+        """A part's cards were judged (called from a worker thread)."""
+        with self._lock:
+            self._cards[str(part["part"])] = part
+            self._rebuild()
 
 
 def read(path: Path) -> list[dict]:

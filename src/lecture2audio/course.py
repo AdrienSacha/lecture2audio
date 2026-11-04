@@ -20,8 +20,8 @@ from pydantic import ValidationError
 from . import enrich
 from .course_schema import Card, Cards, describe
 from .outline import Node, Outline, render_outline
-from .pipeline import (_NUMBER, SOFT_ISSUES, TextPipeline, _section, blocking, format_feedback,
-                       sentences_of, unsupported_numbers)
+from .pipeline import (_NUMBER, SOFT_ISSUES, NumberIndex, TextPipeline, _and, _section, blocking,
+                       format_feedback, numbers_lost, sentences_of, unsupported_numbers)
 
 REVIEW_PER_PART = 3
 LOOSE_KINDS = {"undefined_term", "missing_prerequisite", "skipped_step", "forward_reference",
@@ -40,8 +40,9 @@ ANALOGY = {
 
 # ---------------------------------------------------------------- the schema
 
-def _texts(card: dict) -> list[str]:
-    """The prose of a card, for the checks on wording."""
+def _texts(card: dict, everything: bool = False) -> list[str]:
+    """The prose of a card, for the checks on wording; with `everything`, also its tables,
+    figures, code and notation, for the checks on what the card holds."""
     texts = [card["title"], card["definition"], card["instance"], *card["explanation"],
              *card["formulas"]]
     if card.get("example"):
@@ -50,6 +51,13 @@ def _texts(card: dict) -> list[str]:
         texts += [check["question"], check["answer"]]
     if card.get("diagram"):
         texts += [card["diagram"]["title"], *(f["caption"] for f in card["diagram"]["frames"])]
+    if everything:
+        if card.get("table"):
+            texts += [*card["table"]["columns"], *(c for row in card["table"]["rows"] for c in row)]
+        if card.get("diagram"):
+            texts += [f.get("mermaid") or f.get("ascii") or "" for f in card["diagram"]["frames"]]
+        texts += [snippet["code"] for snippet in card.get("code", [])]
+        texts += [f"{n['symbol']} {n['meaning']}" for n in card.get("notation", [])]
     return [t for t in texts if t]
 
 
@@ -378,8 +386,10 @@ class CoursePipeline:
                   "definition": c["definition"], "explanation": c["explanation"],
                   "formulas": c["formulas"], "instance": c["instance"], "example": c["example"],
                   "diagram": c["diagram"], "table": c["table"], "checks": c["checks"],
-                  "covers": c["covers"], "ideas": c["ideas"]} for k, c in enumerate(cards, 1)]
+                  "covers": c["covers"], "ideas": c.get("ideas", [])}
+                 for k, c in enumerate(cards, 1)]
         idea_ids = [i["id"] for i in ctx["ideas"]]
+        source = NumberIndex(" ".join(s["text"] for s in ctx["script"]), self.p.language)
         user = (f"## LANGUAGE\n{self.p.language_name}\n\n## SCRIPT\n"
                 + self._numbered(outline, record) + "\n\n"
                 + _section("IDEAS (JSON)", json.dumps(
@@ -402,12 +412,28 @@ class CoursePipeline:
             if idea is None:
                 continue
             numbers = [n for n in item.get("cards") or [] if 1 <= n <= len(cards)] or \
-                [k for k, c in enumerate(cards, 1) if str(idea["id"]) in c["ideas"]]
-            ideas.append({"idea": idea["id"], "status": item["status"],
-                          "cards": numbers if item["status"] == "taught" else []})
-            if item["status"] == "missing":
-                issues.append(_issue("idea_missing", f'the lecture idea {idea["id"]} ({idea["kind"]}: '
-                                                     f'{idea["idea"]}) is not taught in any card.',
+                [k for k, c in enumerate(cards, 1) if str(idea["id"]) in c.get("ideas", [])]
+            status, lost = item["status"], []
+            why = "is not taught in any card."
+            names = _and([f"{part.id}.{n}" for n in numbers]) if numbers else ""
+            if status == "taught" and not numbers:  # a claim without a card is no evidence
+                status, why = "missing", "is said to be taught, but no card is named or claims it."
+            elif status == "taught":
+                held = NumberIndex("\n".join(t for n in numbers for t in _texts(cards[n - 1], True)),
+                                   self.p.language)
+                lost = numbers_lost(idea["idea"], source, held)
+            ideas.append({"idea": idea["id"], "status": status, "judged": item["status"],
+                          "cards": numbers if status == "taught" else [], "lost": lost})
+            if status == "missing":
+                issues.append(_issue("idea_missing", f'The lecture idea {idea["id"]} ({idea["kind"]}: '
+                                                     f'{idea["idea"]}) {why}',
+                                     None, str(idea["nodes"][0])))
+            elif lost:  # the judge and code disagree: reported, not blocking
+                issues.append(_issue("idea_numbers", f'The judge finds the lecture idea {idea["id"]} '
+                                                     f'({idea["idea"]}) in card {names}, but the '
+                                                     f'card does not contain {_and(lost)}, which '
+                                                     "the script gives. State the number as the "
+                                                     "script does.",
                                      None, str(idea["nodes"][0])))
         return issues, ideas
 
@@ -469,7 +495,10 @@ class CoursePipeline:
 
         return self.p._map(one, parts)
 
-    def run(self, outline: Outline, records: list[dict]) -> dict:
+    def run(self, outline: Outline, records: list[dict], on_done=None, audit: bool = True) -> dict:
+        """Cards for every part. `on_done(part result)` is called as each part finishes (from a
+        worker thread), so that the idea ledger stays current; `audit` runs the planted test of
+        the judge."""
         directory = self.p._dir("course")
         by_part = {r["part"]: r for r in records}
 
@@ -482,12 +511,53 @@ class CoursePipeline:
             cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
             return result
 
-        parts = self.p._map(one, outline.parts)
+        parts = self.p._map(one, outline.parts, on_done)
         notation, clashes = collect_notation(parts)
         (directory / "notation.json").write_text(json.dumps(notation, ensure_ascii=False,
                                                             indent=2), encoding="utf-8")
         return {"parts": parts, "notation": notation, "clashes": clashes,
-                "review": build_review(parts), "cold": self.cold_read(parts)}
+                "review": build_review(parts), "cold": self.cold_read(parts),
+                "audit": self.audit_judge(outline, parts, by_part) if audit else None}
+
+    def audit_judge(self, outline: Outline, parts: list[dict], by_part: dict) -> dict:
+        """Empty, in an accepted part, the one card that teaches an idea (it keeps its title
+        and its claim to the idea), and ask the judge again. The judge's own verdict is scored,
+        not the code checks after it: a judge that still calls the idea taught is passing what
+        it should refuse."""
+        cache = self.p._dir("course") / "audit.json"
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        result = {"skipped": "no accepted part has an idea taught by a single card"}
+        for part in parts:
+            if part["flagged"]:
+                continue
+            claims = {}
+            for card in part["cards"]:
+                for idea in card.get("ideas", []):
+                    claims.setdefault(idea, []).append(card["id"])
+            target = next((i for i in part.get("ideas", []) if i["status"] == "taught"
+                           and len(i["cards"]) == 1 and claims.get(i["idea"]) == i["cards"]), None)
+            if target is None:
+                continue
+            node = outline.node(part["part"])
+            ctx = self._context(outline, node, by_part[part["part"]])
+            ctx["slides"] = " ".join(self.p.slides) if self.p.slides else ""
+            hollow = [c if c["id"] != target["cards"][0] else dict(
+                c, definition="", instance="", explanation=[c["title"]], formulas=[],
+                notation=[], example=None, diagram=None, code=[], table=None, checks=[])
+                for c in part["cards"]]
+            self.p.log(f"[audit] emptying card {target['cards'][0]} to test the course judge")
+            try:
+                _, ideas = self._judge(ctx, by_part[part["part"]], outline, hollow)
+            except Exception as exc:  # a failed audit must not stop the build; retried next run
+                self.p.log(f"[audit] course judge: {exc}")
+                return {"skipped": f"the test failed ({exc}); it runs again next time"}
+            verdict = next((i["judged"] for i in ideas if i["idea"] == target["idea"]), None)
+            result = {"part": part["part"], "card": target["cards"][0], "idea": target["idea"],
+                      "caught": verdict == "missing"}
+            break
+        cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
 
 
 # --------------------------------------------------------------------- dry run
@@ -577,6 +647,16 @@ def course_report(course: dict, stats: dict, language: str = "en") -> str:
     elif course.get("cold"):
         lines.append("A cold read of the notes, by a reader who knows only the earlier parts, "
                      "found no loose end.")
+    audit = course.get("audit")
+    if audit and audit.get("skipped"):
+        lines.append(f"The test of the course judge was skipped: {audit['skipped']}.")
+    elif audit:
+        lines.append(f"The test of the course judge emptied card {audit['card']}, the only card "
+                     f"that teaches idea {audit['idea']}, and asked the judge again; "
+                     + ("it reported the idea as missing." if audit["caught"] else
+                        "**it still called the idea taught**, so its verdicts on ideas are less "
+                        "trustworthy; consider a stronger or a different checker model "
+                        "(--verify-model, --verify-llm)."))
     for clash in course["clashes"]:
         lines.append(f"Notation clash: {clash}")
     flagged = [p for p in parts if p["flagged"]]
