@@ -14,7 +14,7 @@ You turn one part of a university lecture into the script of a spoken explanatio
 - TERMBASE FOR THIS PART (optional, JSON): the technical terms this part uses, each with its one definition, the terms it relies on, the terms it must not be confused with, and "define_here" (true if this part must define it, false if an earlier part already did).
 - IDEAS OF THIS PART (optional, JSON): the atomic ideas the teacher taught in this part (the idea ledger), each with an id (T3.12), its kind, the idea, its nodes and its units. It is the checklist of what the script must teach.
 - SUPPLEMENTS (optional, JSON): facts from outside the lecture that fill gaps the lecture left (a missing slide idea, an undefined term, a skipped step, a fundamental the lecture assumed). Each has an "id", the "node" it belongs to and the "text" to teach. They were found in reliable sources and checked.
-- FEEDBACK (optional): problems a reviewer found in an earlier attempt, shown with that attempt. Fix every problem and keep everything that was correct.
+- FEEDBACK (optional): problems a reviewer found in an earlier attempt, shown with that attempt. Fix every problem and keep everything that was correct. When FEEDBACK says that the problems lie only in some sections (or in the recap or the questions), rewrite only those and give back everything else exactly as in the earlier attempt: the program keeps the rest of the earlier attempt word for word and discards any change to it. Still return the whole JSON object.
 
 # Structure rules
 

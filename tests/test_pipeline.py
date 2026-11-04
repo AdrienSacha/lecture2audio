@@ -18,8 +18,8 @@ from lecture2audio.cli import main
 from lecture2audio.llm import FakeLLM, _between, dry_run_handler
 from lecture2audio.outline import parse_outline
 from lecture2audio.pipeline import (NumberIndex, TextPipeline, list_sentence, load_prompts,
-                                    numbers_lost, part_blocks, unsupported_numbers,
-                                    validate_verify)
+                                    numbers_lost, part_blocks, repair_plan, splice_repair,
+                                    unsupported_numbers, validate_verify)
 
 UNITS = ["The window holds 64 packets.", "um ok let me drink some water",
          "A timeout is 5 seconds.", "The sender waits for the timeout.",
@@ -252,7 +252,9 @@ class Loop(unittest.TestCase):
             points = json.loads(counting_verifier(system, user))
             found = re.search(r"Attempt (\w+) here", user)
             bad = {"one": 1, "two": 3, "three": 2}.get(found.group(1), 0) if found else 0
-            points["issues"] = [{"type": "wrong", "sentence": 1, "detail": f"problem {k}"}
+            # no sentence or unit: the problems cannot be placed, so each repair is a full
+            # rewrite, which can make the script worse
+            points["issues"] = [{"type": "wrong", "sentence": None, "detail": f"problem {k}"}
                                 for k in range(bad)]
             return json.dumps(points)
 
@@ -292,6 +294,100 @@ class Loop(unittest.TestCase):
             again = harness.pipeline(tmp)
             again.run_parts(again.run_outline(UNITS))
         self.assertEqual(len(harness.llm.calls), calls)
+
+
+class BoundedRepair(unittest.TestCase):
+    """A repair rewrites only the sections at fault; code keeps the rest word for word."""
+
+    @staticmethod
+    def part_one():
+        outline, errors = parse_outline(OUTLINE, UNITS, 1000)
+        assert not errors, errors
+        return outline.parts[0]
+
+    @staticmethod
+    def record():
+        return {"preview": {"intro": "p", "items": []},
+                "sections": [{"node": "1", "sentences": [{"origin": "added", "text": "a"}]},
+                             {"node": "1.1", "sentences": [{"origin": "lecture", "text": "b"}]},
+                             {"node": "1.2", "sentences": [{"origin": "lecture", "text": "c"},
+                                                           {"origin": "lecture", "text": "d"}]}],
+                "recap": ["r"], "questions": [{"question": "q", "answer": "a"}],
+                "terms_defined": ["window"], "reference": [{"label": "Code 1", "content": "x"}]}
+
+    def test_each_issue_is_placed_by_node_sentence_or_unit(self):
+        part, record = self.part_one(), self.record()
+        issues = [{"type": "unsupported", "node": None, "sentence": 4, "unit": None, "detail": ""},
+                  {"type": "wrong", "node": None, "sentence": None, "unit": 1, "detail": ""},
+                  {"type": "long", "node": None, "sentence": 1, "unit": None, "detail": ""}]
+        scope, shown = repair_plan(part, record, issues)
+        self.assertEqual(scope, ["1.1", "1.2"])  # in section order; the soft issue in 1 is not
+        self.assertEqual([i["type"] for i in shown], ["unsupported", "wrong"])
+        recap = [{"type": "recap", "node": None, "sentence": None, "unit": None, "detail": ""}]
+        self.assertEqual(repair_plan(part, record, recap)[0], ["recap"])
+
+    def test_an_issue_that_cannot_be_placed_or_faults_everywhere_rewrites_the_whole_part(self):
+        part, record = self.part_one(), self.record()
+        general = [{"type": "undefined_term", "node": None, "sentence": None, "unit": None,
+                    "detail": ""}]
+        self.assertEqual(repair_plan(part, record, general), (None, general))
+        everywhere = [{"type": "missing", "node": n, "sentence": None, "unit": None, "detail": ""}
+                      for n in ("1", "1.1", "1.2")]
+        self.assertIsNone(repair_plan(part, record, everywhere)[0])
+        noise = [{"type": "wrong", "node": None, "sentence": None, "unit": 2, "detail": ""}]
+        self.assertIsNone(repair_plan(part, record, noise)[0])  # unit 2 is noise
+
+    def test_the_splice_takes_only_the_scope_from_the_repair(self):
+        best, new = self.record(), self.record()
+        for section in new["sections"]:
+            section["sentences"] = [{"origin": "lecture", "text": "NEW " + section["node"]}]
+        new.update(recap=["new recap"], terms_defined=["timeout"],
+                   reference=[{"label": "Code 1", "content": "y"}, {"label": "Table 1", "content": "t"}])
+        out = splice_repair(best, new, ["1.2", "recap"])
+        self.assertEqual([s["sentences"][0]["text"] for s in out["sections"]], ["a", "b", "NEW 1.2"])
+        self.assertEqual(out["recap"], ["new recap"])
+        self.assertEqual(out["questions"], best["questions"])
+        self.assertEqual(out["terms_defined"], ["window", "timeout"])
+        self.assertEqual([r["content"] for r in out["reference"]], ["x", "t"])
+        self.assertEqual(best["sections"][2]["sentences"][0]["text"], "c")  # best is not changed
+
+    def test_a_repair_cannot_change_a_section_that_passed(self):
+        def rewrite(system, user):
+            if "## FEEDBACK" not in user:
+                return good_rewrite(user, "It retries 9999 times.")
+            data = json.loads(good_rewrite(user))
+            for section in data["sections"][:-1]:  # the repair also "improves" passing sections
+                section["sentences"][0]["text"] = "Damaged by the repair."
+            return json.dumps(data)
+
+        harness = Harness(rewrite)
+        _, records, _ = run_text(harness)
+        first, second = records
+        self.assertEqual((first["attempts"], first["flagged"]), (2, False))
+        texts = [s["text"] for section in first["sections"] for s in section["sentences"]]
+        self.assertNotIn("Damaged by the repair.", texts)
+        self.assertNotIn("It retries 9999 times.", texts)
+        self.assertEqual(first["repairs"], [{"attempt": 2, "scope": ["1.2"], "before": 1,
+                                             "after": 0, "kept": True}])
+        feedback = [u for u in harness.prompts("rewrite") if "## FEEDBACK" in u][0]
+        self.assertIn("only in section 1.2. Rewrite only that", feedback)
+        # part 2 has one section only: its repair is a full rewrite
+        self.assertEqual(second["repairs"][0]["scope"], "all")
+
+    def test_the_report_lists_each_repair(self):
+        from lecture2audio.report import repair_lines
+        text = "\n".join(repair_lines([
+            {"part": "1", "repairs": [{"attempt": 2, "scope": ["1.2", "recap"], "before": 2,
+                                       "after": 0, "kept": True}]},
+            {"part": "2", "repairs": [{"attempt": 2, "scope": "all", "before": 1, "after": 1,
+                                       "kept": False}]},
+            {"part": "3"}]))
+        self.assertIn("## Repairs", text)
+        self.assertIn("- Part 1, attempt 2: section 1.2 and the recap were rewritten; the blocking "
+                      "problems went from 2 to 0, so the repair was kept.", text)
+        self.assertIn("- Part 2, attempt 2: the whole part was rewritten; the blocking problems "
+                      "went from 1 to 1, so the earlier attempt was kept.", text)
+        self.assertEqual(repair_lines([{"part": "1", "repairs": []}]), [])
 
 
 class Ideas(unittest.TestCase):

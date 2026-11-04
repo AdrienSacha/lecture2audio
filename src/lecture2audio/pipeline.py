@@ -9,6 +9,7 @@ can be opened or edited by hand.
 """
 from __future__ import annotations
 
+import copy
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -442,9 +443,19 @@ def render_script(outline: Outline, part: Node, record: dict, language: str = "e
     return "\n".join(lines)
 
 
-def format_feedback(script_text: str, issues: list[dict]) -> str:
-    lines = ["A reviewer found problems in an earlier attempt. Fix every one and keep everything "
-             "that was correct.", "", "Earlier attempt:", script_text, "", "Problems:"]
+def format_feedback(script_text: str, issues: list[dict], scope: list[str] | None = None) -> str:
+    """The feedback for a repair. With `scope` (see repair_plan), only the sections and fields
+    named are rewritten: code keeps the rest of the earlier attempt word for word."""
+    if scope:
+        head = [f"A reviewer found problems in an earlier attempt, only in {scope_words(scope)}. "
+                f"Rewrite only {'that' if len(scope) == 1 else 'those'}, fix every problem "
+                "listed, and keep what was correct in them. Everything else passed the review: "
+                "the program keeps it word for word, so give it back unchanged; any change to it "
+                "is discarded."]
+    else:
+        head = ["A reviewer found problems in an earlier attempt. Fix every one and keep "
+                "everything that was correct."]
+    lines = head + ["", "Earlier attempt:", script_text, "", "Problems:"]
     for issue in issues:
         where = []
         if issue.get("node"):
@@ -455,6 +466,81 @@ def format_feedback(script_text: str, issues: list[dict]) -> str:
             where.append(f"unit {issue['unit']}")
         lines.append(f"- ({issue['type']}, {', '.join(where) or 'general'}) {issue['detail']}")
     return "\n".join(lines)
+
+
+# Fields of a part outside its sections that an issue can point at, with the word used in the
+# feedback. The preview is assembled by code from the sections' phrases and is never repaired
+# alone.
+PART_FIELDS = {"recap": "the recap", "questions": "the questions"}
+_FIELD_OF_ISSUE = {"recap": "recap", "question": "questions"}
+
+
+def scope_words(scope: list[str]) -> str:
+    """["1.2", "1.3", "recap"] -> "sections 1.2 and 1.3 and the recap"."""
+    sections = [s for s in scope if s not in PART_FIELDS]
+    named = [("section " if len(sections) == 1 else "sections ") + _and(sections)] if sections else []
+    fields = [PART_FIELDS[s] for s in scope if s in PART_FIELDS]
+    return " and ".join(named + ([_and(fields)] if fields else []))
+
+
+def _locate(issue: dict, record: dict, part: Node) -> str | None:
+    """Where an issue lies: the node of its section, a part field, or None when it cannot be
+    placed (a term the part never defines, a remark on the whole part)."""
+    if issue["type"] in _FIELD_OF_ISSUE:
+        return _FIELD_OF_ISSUE[issue["type"]]
+    sections = [s["node"] for s in record["sections"]]
+    node = issue.get("node")
+    if not node and issue.get("sentence"):
+        owner = [s["node"] for s in record["sections"] for _ in s["sentences"]]
+        k = issue["sentence"]
+        node = owner[k - 1] if isinstance(k, int) and 1 <= k <= len(owner) else None
+    if not node and issue.get("unit"):
+        node = next((n.id for n in part.walk() if issue["unit"] in n.own_units()), None)
+    return str(node) if node and str(node) in sections else None
+
+
+def repair_plan(part: Node, record: dict, issues: list[dict]) -> tuple[list[str] | None,
+                                                                      list[dict]]:
+    """What a repair rewrites, and the issues its feedback shows.
+
+    A repair that rewrites the whole part can damage sections that passed, in ways the count
+    of blocking problems does not show (Zhang, 2026); a repair pointed at the faulty span and
+    bounded to it recovers more and damages less (Guo et al., 2026). So when every blocking
+    issue can be placed in a section (or in the recap or the questions), only those are
+    rewritten and code keeps the rest word for word (`splice_repair`). The scope is None, a
+    full rewrite, when an issue cannot be placed or every section is at fault."""
+    scope: list[str] = []
+    for issue in blocking(issues):
+        where = _locate(issue, record, part)
+        if where is None:
+            return None, issues
+        if where not in scope:
+            scope.append(where)
+    sections = [s["node"] for s in record["sections"]]
+    if not scope or set(sections) <= set(scope):
+        return None, issues
+    scope = [s for s in sections if s in scope] + [f for f in PART_FIELDS if f in scope]
+    return scope, [i for i in issues if _locate(i, record, part) in scope]
+
+
+def splice_repair(best: dict, new: dict, scope: list[str]) -> dict:
+    """The best attempt with the sections and fields in `scope` taken from the repair. Every
+    other section, the preview and the other fields stay as they were, so a bounded repair
+    cannot change what passed. The terms defined and the reference entries are merged, since a
+    kept section still defines its terms and still needs its formulas."""
+    rewritten = {s["node"]: s for s in new["sections"]}
+    out = copy.deepcopy(best)
+    out["sections"] = [copy.deepcopy(rewritten[s["node"]]) if s["node"] in scope else s
+                       for s in out["sections"]]
+    for field in PART_FIELDS:
+        if field in scope:
+            out[field] = copy.deepcopy(new[field])
+    out["terms_defined"] = list(dict.fromkeys(list(best.get("terms_defined", []))
+                                              + list(new.get("terms_defined", []))))
+    labels = {r["label"] for r in best.get("reference", [])}
+    out["reference"] = list(best.get("reference", [])) + [
+        r for r in new.get("reference", []) if r["label"] not in labels]
+    return out
 
 
 def blocking(issues: list[dict]) -> list[dict]:
@@ -997,15 +1083,21 @@ class TextPipeline:
 
     def _process(self, outline: Outline, part: Node) -> dict:
         ctx = self._context(outline, part)
-        best, feedback, attempts = None, "", 0
+        best, feedback, attempts, scope, repairs = None, "", 0, None, []
         for _ in range(self.max_retries + 1):
             attempts += 1
             result = self._rewrite(outline, ctx, feedback)
+            if scope:  # a bounded repair: only the sections at fault come from the new text
+                result = splice_repair(best["result"], result, scope)
             issues = self._code_issues(ctx, result)
             found, ideas = self._verify(outline, ctx, result)
             issues += found
             issues += self._check_terms(outline, ctx, result)
             count = len(blocking(issues))
+            if best is not None:
+                repairs.append({"attempt": attempts, "scope": scope or "all",
+                                "before": best["blocking"], "after": count,
+                                "kept": count < best["blocking"]})
             # A repair can damage a script that was better: keep the best attempt so far
             # and replace it only by a strictly better one.
             if best is None or count < best["blocking"]:
@@ -1013,17 +1105,21 @@ class TextPipeline:
             if best["blocking"] == 0:
                 break
             more = attempts <= self.max_retries
+            scope, shown = repair_plan(part, best["result"], best["issues"])
             self.log(f"[verify] part {part.id}: {best['blocking']} problem(s), "
-                     + ("rewriting with feedback" if more else "keeping the best attempt"))
+                     + ("keeping the best attempt" if not more else
+                        f"rewriting {scope_words(scope)} with feedback, keeping the rest"
+                        if scope
+                        else "rewriting the part with feedback"))
             feedback = format_feedback(render_script(outline, part, best["result"], self.language),
-                                       best["issues"])
+                                       shown, scope)
         result = best["result"]
         return {"part": part.id, "title": part.title, "words": part_words(outline, part),
                 "source": ctx["source"], "preview": result["preview"],
                 "sections": result["sections"], "recap": result["recap"],
                 "questions": result["questions"], "terms_defined": result["terms_defined"],
                 "reference": result["reference"], "issues": best["issues"],
-                "blocking": best["blocking"], "attempts": attempts,
+                "blocking": best["blocking"], "attempts": attempts, "repairs": repairs,
                 "flagged": best["blocking"] > 0, "moves": moves(part),
                 "supplements": ctx["supplements"], "ideas": best["ideas"]}
 

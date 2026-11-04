@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .ledger import open_rows
 from .outline import Outline, ranges
-from .pipeline import SOFT_ISSUES, list_sentence
+from .pipeline import SOFT_ISSUES, list_sentence, scope_words
 
 
 def _clock(seconds: float) -> str:
@@ -145,6 +145,29 @@ def _issue_line(issue: dict) -> str:
     return f"- {issue['type']}{soft}{', ' + ', '.join(where) if where else ''}: {issue['detail']}"
 
 
+def repair_lines(records: list[dict]) -> list[str]:
+    """Every repair of a script: what it rewrote and whether it was kept."""
+    repaired = [r for r in records if r.get("repairs")]
+    if not repaired:
+        return []
+    lines = ["## Repairs", "",
+             "When every blocking problem of a part can be placed in a section, a repair rewrites "
+             "only those sections, and the program keeps the other sections word for word. A "
+             "repair is kept only if it has fewer blocking problems than the best attempt before "
+             "it.", ""]
+    for record in repaired:
+        for repair in record["repairs"]:
+            what = ("the whole part was" if repair["scope"] == "all"
+                    else scope_words(repair["scope"]) + (" was" if len(repair["scope"]) == 1
+                                                         else " were"))
+            outcome = ("so the repair was kept" if repair["kept"]
+                       else "so the earlier attempt was kept")
+            lines.append(f"- Part {record['part']}, attempt {repair['attempt']}: {what} "
+                         f"rewritten; the blocking problems went from {repair['before']} to "
+                         f"{repair['after']}, {outcome}.")
+    return lines + [""]
+
+
 def write_report(path: Path, name: str, outline: Outline, records: list[dict],
                  spoken: list[dict], notes: list[str], audit: dict | None,
                  usage: dict | None = None, roundtrip: list[dict] | None = None,
@@ -163,6 +186,7 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
         lines.append(f"| {record['part']} | {record['title']} | {record['words']} | "
                      f"{record['attempts']} | {record['blocking']} | {left} |")
     lines.append("")
+    lines += repair_lines(records)
 
     lines += ["## Checks on the whole lecture", ""]
     if audit and audit.get("skipped"):
