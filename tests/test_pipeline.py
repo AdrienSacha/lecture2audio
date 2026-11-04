@@ -85,9 +85,11 @@ LEDGER = {"slide_ideas": [], "gaps": [], "transcript_ideas": [
 class Harness:
     """Routes the four prompts to four small handlers."""
 
-    def __init__(self, rewrite=None, verify=counting_verifier, spoken=None, outline=None):
+    def __init__(self, rewrite=None, verify=counting_verifier, spoken=None, outline=None,
+                 ideas=None):
         self.handlers = {
             "outline": outline or (lambda s, u: json.dumps(OUTLINE)),
+            "ideas": ideas or dry_run_handler,
             "verify": verify,
             "spoken": spoken or (lambda s, u: json.dumps({"blocks": json.loads(u)["blocks"]})),
             "rewrite": rewrite or (lambda s, u: good_rewrite(u))}
@@ -101,6 +103,8 @@ class Harness:
             return "verify"
         if "exact words a voice should say" in system:
             return "spoken"
+        if "You list the atomic ideas" in system:
+            return "ideas"
         return "rewrite"
 
     def handle(self, system, user):
@@ -289,6 +293,57 @@ class Loop(unittest.TestCase):
         self.assertEqual(len(harness.llm.calls), calls)
 
 
+class Ideas(unittest.TestCase):
+    def test_ideas_are_listed_part_by_part_with_part_scoped_ids_and_cached(self):
+        harness = Harness()
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = harness.pipeline(tmp)
+            outline = pipeline.run_outline(UNITS)
+            ideas = pipeline.run_ideas(outline)
+            self.assertEqual(len(harness.prompts("ideas")), 2)  # one call per part
+            self.assertEqual([i["id"] for i in ideas], ["T1.1", "T1.2", "T2.1"])
+            self.assertEqual(ideas[1]["nodes"], ["1.2"])
+            self.assertEqual(ideas[1]["units"], [3])
+            self.assertIs(pipeline.coverage["transcript_ideas"], ideas)
+            self.assertNotIn("Acknowledgements", harness.prompts("ideas")[0].split(
+                "## TRANSCRIPT OF THIS PART\n", 1)[1])
+            again = harness.pipeline(tmp)
+            self.assertEqual(again.run_ideas(outline), ideas)
+            self.assertEqual(len(harness.prompts("ideas")), 2)  # from the cache
+
+    def test_a_node_with_units_but_no_idea_is_asked_again(self):
+        answers = []
+
+        def ideas(system, user):
+            data = json.loads(dry_run_handler(system, user))
+            answers.append(user)
+            if len(answers) == 1:
+                data["ideas"] = data["ideas"][:1]  # drops node 1.2
+            return json.dumps(data)
+
+        harness = Harness(ideas=ideas)
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = harness.pipeline(tmp)
+            found = pipeline.run_ideas(pipeline.run_outline(UNITS))
+        self.assertIn("nodes ['1.2'] have units but no idea", answers[1])
+        self.assertEqual(len([i for i in found if i["id"].startswith("T1.")]), 2)
+
+    def test_a_part_that_keeps_failing_is_left_empty_and_tried_again_next_run(self):
+        def ideas(system, user):
+            if "Acknowledgements" in user.split("## TRANSCRIPT OF THIS PART\n", 1)[1]:
+                return json.dumps({"ideas": [{"kind": "rumour", "idea": "x", "nodes": ["9"],
+                                              "units": [99]}]})
+            return dry_run_handler(system, user)
+
+        harness = Harness(ideas=ideas)
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = harness.pipeline(tmp)
+            found = pipeline.run_ideas(pipeline.run_outline(UNITS))
+            self.assertEqual({i["id"][:3] for i in found}, {"T1."})
+            self.assertFalse((pathlib.Path(tmp) / "ideas" / "part_002.json").exists())
+            self.assertTrue((pathlib.Path(tmp) / "ideas" / "part_001.json").exists())
+
+
 class Audit(unittest.TestCase):
     def audit(self, verify):
         harness = Harness(verify=verify)
@@ -434,7 +489,7 @@ class EndToEnd(unittest.TestCase):
             anki = (work / "anki.csv").read_text(encoding="utf-8")
             self.assertTrue(anki.startswith("#separator:Comma\n"))
             self.assertIn("#columns:Front,Back,Tags", anki)
-            self.assertIn("lecture::idea-T1", anki)
+            self.assertIn("lecture::idea-T1.1", anki)
 
     def test_the_vault_embeds_the_audio_and_reads_as_one_chapter(self):
         with tempfile.TemporaryDirectory() as tmp:

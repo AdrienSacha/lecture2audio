@@ -288,8 +288,9 @@ def _gap_lines(outline: Outline, gaps: dict) -> list[str]:
         lines += [f"Slides: {len(ideas)} ideas, of which {counts['covered']} are taught in the "
                   f"lecture, {counts['partial']} in part and {counts['missing']} not at all.", ""]
     if coverage.get("transcript_ideas"):
-        lines += [f"Transcript: {len(coverage['transcript_ideas'])} atomic ideas were listed; the "
-                  "course material is checked against this list.", ""]
+        lines += [f"Transcript: {len(coverage['transcript_ideas'])} atomic ideas were listed, part "
+                  "by part; the script and the course material are checked against this list "
+                  "(see the idea ledger below).", ""]
     audit = gaps.get("audit")
     if audit and audit.get("skipped"):
         lines += [f"Gap search test skipped: {audit['skipped']}.", ""]

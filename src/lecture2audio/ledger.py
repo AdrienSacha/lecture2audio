@@ -1,7 +1,7 @@
 """The idea ledger: `out/<name>/ideas.csv`, one row per atomic idea the teacher taught.
 
-The gap search lists the transcript's atomic ideas (T1, T2, ...). The ledger records each one
-with its node and its transcript units, then follows it through the build: the verifier of the
+`TextPipeline.run_ideas` lists the transcript's atomic ideas, one call per part (T3.12 is the
+twelfth idea of part 3). The ledger records each one with its node and its transcript units, then follows it through the build: the verifier of the
 script checks it off ("scripted" or "missing_script"), the judge of the course material checks
 it off against the cards ("verified", with the cards that teach it, or "missing_cards"). The
 file is rebuilt from the cached stage results on every run, so it always matches them, and
@@ -59,8 +59,8 @@ def seed(outline: Outline, coverage: dict) -> list[dict]:
     rows = []
     for idea in coverage.get("transcript_ideas", []):
         nodes = [str(n) for n in idea.get("nodes", [])]
-        units: list[int] = []
-        for node_id in nodes:
+        units: list[int] = [int(u) for u in idea.get("units") or []]
+        for node_id in nodes if not units else []:  # no units given: those of its nodes
             try:
                 node = outline.node(node_id)
             except (KeyError, ValueError, IndexError):

@@ -638,10 +638,10 @@ def _dry_ideas(transcript: str) -> list[dict]:
         if line.startswith("#"):
             current = heading.group(1) if heading else None
             continue
-        unit = re.match(r"^\[\d+\] (.+)$", line)
+        unit = re.match(r"^\[(\d+)\] (.+)$", line)
         if unit and current:
-            ideas.append({"id": f"T{len(ideas) + 1}", "kind": "claim", "idea": unit.group(1),
-                          "nodes": [current]})
+            ideas.append({"kind": "claim", "idea": unit.group(2), "nodes": [current],
+                          "units": [int(unit.group(1))]})
             current = None
     return ideas
 
@@ -725,8 +725,9 @@ def dry_run_handler(system: str, user: str) -> str:
         slides = sorted({int(n) for n in re.findall(r"^\[Slide (\d+)\]$", user, flags=re.M)})
         return json.dumps({"slide_ideas": [{"id": f"S{n}", "slide": n, "idea": f"slide {n}",
                                             "status": "covered", "nodes": [first]}
-                                           for n in slides], "gaps": [],
-                           "transcript_ideas": _dry_ideas(_between(user, "TRANSCRIPT"))})
+                                           for n in slides], "gaps": []})
+    if "You list the atomic ideas" in system:
+        return json.dumps({"ideas": _dry_ideas(_between(user, "TRANSCRIPT OF THIS PART"))})
     if "You build the termbase" in system:
         return json.dumps({"terms": []})
     if "You research one gap" in system:

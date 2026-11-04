@@ -17,8 +17,7 @@ You find the gaps in a lecture before it is turned into a spoken explanation for
    - "assumed_fundamental": a prerequisite the lecture takes for granted (a concept, a law, a notation) that a first-year student in this field may not know. Give the "term" that names it.
    - "skipped_step": a step missing from a derivation, a calculation, an algorithm or an argument, so that the next statement does not follow from the previous ones.
    Do not list matters of taste, and do not ask for content beyond what the lecture and slides set out to teach.
-3. Transcript ideas. Split the transcript itself into atomic ideas, in lecture order: one definition, claim, rule, step, formula, condition, example or warning each. Give each an id (T1, T2, ...), its "kind" ("definition", "claim", "step", "formula", "condition", "example" or "warning"), the idea in one sentence in your own words, and the node or nodes of the TRANSCRIPT where the teacher says it. Include every idea the teacher teaches, however small. Leave out filler and asides. This list is the checklist the course material is checked against, so it must be complete.
-4. For each gap, write a "query": a precise web search that would find an authoritative explanation (a textbook, a university course page, a standard, a reference work). Use the field's exact terms.
+3. For each gap, write a "query": a precise web search that would find an authoritative explanation (a textbook, a university course page, a standard, a reference work). Use the field's exact terms.
 
 # Output
 
@@ -26,8 +25,7 @@ Return one JSON object and nothing else. Write "idea", "detail" and "query" in {
 
 {
   "slide_ideas": [{"id": "S1", "slide": 1, "idea": "...", "status": "covered", "nodes": ["1.2"]}],
-  "transcript_ideas": [{"id": "T1", "kind": "definition", "idea": "...", "nodes": ["1.2"]}],
   "gaps": [{"id": "G1", "kind": "slide_missing", "node": "1.2", "idea": "S4", "term": "", "detail": "What exactly is missing, in one or two sentences.", "query": "..."}]
 }
 
-"slide_ideas" is an empty list when there are no slides. "transcript_ideas" is never empty for a lecture that teaches anything. "node" is an id from the TRANSCRIPT headings. Number ideas S1, S2, ... and gaps G1, G2, ... in lecture order.
+"slide_ideas" is an empty list when there are no slides. "node" is an id from the TRANSCRIPT headings. Number ideas S1, S2, ... and gaps G1, G2, ... in lecture order.

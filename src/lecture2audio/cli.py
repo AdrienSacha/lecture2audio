@@ -38,10 +38,11 @@ from .tts import TTSError, make_tts
 GAPS = ["coverage.json", "coverage_audit.json", "termbase.json", "research"]
 DERIVED = ["ideas.csv", "anki.csv"]
 VOICE = ["spoken", "audio", "parts"]
-LATER = {"transcribe": ["outline.json", *GAPS, "rewrite", "audit.json", *VOICE, "course",
-                        "vault", *DERIVED],
-         "outline": ["outline.json", *GAPS, "rewrite", "audit.json", *VOICE, "course", "vault",
-                     *DERIVED],
+LATER = {"transcribe": ["outline.json", *GAPS, "ideas", "rewrite", "audit.json", *VOICE,
+                        "course", "vault", *DERIVED],
+         "outline": ["outline.json", *GAPS, "ideas", "rewrite", "audit.json", *VOICE, "course",
+                     "vault", *DERIVED],
+         "ideas": ["ideas", "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
          "gaps": [*GAPS, "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
          "research": ["research", "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
          "rewrite": ["rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
@@ -160,7 +161,8 @@ def build_parser() -> argparse.ArgumentParser:
                                    "gap is researched; raise this for deeper research")
         llm.add_argument("--prompts-dir",
                          help="folder with your own prompts (outline.md, rewrite.md, verify.md, "
-                              "spoken.md, coverage.md, termbase.md, research.md, terms.md)")
+                              "spoken.md, coverage.md, ideas.md, termbase.md, research.md, "
+                              "terms.md, course.md, course_check.md, cold_read.md)")
         stt = p.add_argument_group("speech to text (recording input, round trip)")
         stt.add_argument("--stt", choices=["auto", "mlx", "faster"], default="auto")
         stt.add_argument("--stt-model", help="model name for the chosen backend")
@@ -379,6 +381,7 @@ def run(args, series: dict | None = None) -> int:
     log(f"[outline] {len(outline.parts)} part(s), "
         f"{sum(len(p.children) for p in outline.parts)} point(s)")
     coverage = pipeline.run_coverage(outline)
+    pipeline.run_ideas(outline)  # fills coverage["transcript_ideas"], part by part
     # the idea ledger: every atomic idea of the transcript, checked off by the later stages
     ideas_path = work / "ideas.csv"
     ideas = ledger.seed(outline, coverage)

@@ -36,6 +36,38 @@ def part_of(node_id: str) -> int:
 
 # ------------------------------------------------------------------- coverage
 
+def validate_idea_list(data, part) -> list[str]:
+    """The gate on one part's list of atomic ideas: known kinds, nodes and units of this part,
+    and at least one idea for every node that has units (a node with none was skipped)."""
+    if not isinstance(data, dict) or not isinstance(data.get("ideas"), list):
+        return ['the answer must be {"ideas": [...]}']
+    nodes = {node.id: set(node.own_units()) for node in part.walk()}
+    units = set(part.all_units())
+    errors, named = [], set()
+    for k, idea in enumerate(data["ideas"], 1):
+        where = f"idea {k}"
+        if not isinstance(idea, dict) or not str(idea.get("idea", "")).strip():
+            errors.append(f'{where} must be {{"kind", "idea", "nodes", "units"}}')
+            continue
+        if idea.get("kind") not in IDEA_KINDS:
+            errors.append(f'{where}: "kind" must be one of {sorted(IDEA_KINDS)}')
+        given = idea.get("nodes")
+        if not isinstance(given, list) or not given or any(str(n) not in nodes for n in given):
+            errors.append(f'{where}: "nodes" must list one or more node ids from {list(nodes)}')
+        else:
+            named.update(str(n) for n in given)
+        cited = idea.get("units")
+        if not isinstance(cited, list) or not cited or any(
+                not isinstance(u, int) or u not in units for u in cited):
+            errors.append(f'{where}: "units" must list one or more unit numbers of this part '
+                          f"({min(units)} to {max(units)})" if units else
+                          f'{where}: this part has no units')
+    empty = [n for n, own in nodes.items() if own and n not in named]
+    if empty and not errors:
+        errors.append(f"nodes {empty} have units but no idea: list the ideas their units teach")
+    return errors[:12]
+
+
 def validate_coverage(data, node_ids: list[str], slide_count: int) -> list[str]:
     if not isinstance(data, dict) or not isinstance(data.get("slide_ideas"), list) \
             or not isinstance(data.get("gaps"), list):

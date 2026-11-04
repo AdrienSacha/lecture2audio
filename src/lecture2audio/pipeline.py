@@ -49,6 +49,7 @@ class Prompts:
     course: str
     course_check: str
     cold_read: str
+    ideas: str
 
 
 def load_prompts(language: str, prompts_dir: str | Path | None = None) -> Prompts:
@@ -63,7 +64,7 @@ def load_prompts(language: str, prompts_dir: str | Path | None = None) -> Prompt
 
     return Prompts(*(read(s) for s in ("outline", "rewrite", "verify", "spoken", "coverage",
                                         "termbase", "research", "terms", "course",
-                                        "course_check", "cold_read")))
+                                        "course_check", "cold_read", "ideas")))
 
 
 # ------------------------------------------------------------------ code gates
@@ -497,6 +498,46 @@ class TextPipeline:
         self.coverage = result
         return result
 
+    def run_ideas(self, outline: Outline) -> list[dict]:
+        """The atomic ideas the teacher taught, listed part by part (in parallel), so that no
+        output limit cuts the list on a long lecture. Ids are scoped to the part (T3.12 is the
+        twelfth idea of part 3): redoing one part never renumbers the others. A part whose list
+        keeps failing the gate is logged, left empty (report.md names it) and not cached, so the
+        next run tries it again."""
+        directory = self._dir("ideas")
+        noise = noise_by_part(outline)
+
+        def one(part: Node) -> list[dict]:
+            cache = directory / f"part_{int(part.id):03d}.json"
+            if cache.exists():
+                return json.loads(cache.read_text(encoding="utf-8"))
+            if not part.all_units():
+                return []
+            source = part_source(outline, part, noise[part.id])
+            user = (f"## LANGUAGE\n{self.language_name}\n\n"
+                    + _section("OUTLINE", render_outline(outline, part.id))
+                    + _section("GLOSSARY", self.glossary)
+                    + _section("SLIDES", select_slides(self.slides, source) if self.slides else "")
+                    + "## TRANSCRIPT OF THIS PART\n" + render_part_transcript(outline, part, []))
+            try:
+                data = self._ask_json(self.rewrite_llm, self.prompts.ideas, user,
+                                      lambda d: enrich.validate_idea_list(d, part),
+                                      f"ideas of part {part.id}")
+            except PipelineError as exc:
+                self.log(f"[ideas] part {part.id}: {exc}")
+                return []
+            ideas = [{"id": f"T{part.id}.{k}", "kind": i["kind"], "idea": str(i["idea"]).strip(),
+                      "nodes": [str(n) for n in i["nodes"]],
+                      "units": sorted({int(u) for u in i["units"]})}
+                     for k, i in enumerate(data["ideas"], 1)]
+            cache.write_text(json.dumps(ideas, ensure_ascii=False, indent=2), encoding="utf-8")
+            return ideas
+
+        self.log(f"[ideas] listing the atomic ideas of {len(outline.parts)} part(s)")
+        ideas = [i for part_ideas in self._map(one, outline.parts) for i in part_ideas]
+        self.coverage["transcript_ideas"] = ideas
+        return ideas
+
     def audit_coverage(self, outline: Outline) -> dict:
         """Plant a hole in the lecture and see whether the gap search notices it, because a
         search that finds nothing might simply be blind."""
@@ -681,7 +722,8 @@ class TextPipeline:
                 + "## CHECKLIST (JSON)\n" + json.dumps({"nodes": ctx["checklist"]},
                                                        ensure_ascii=False) + "\n\n"
                 + _section("IDEAS (JSON)", json.dumps(
-                    [{k: i[k] for k in ("id", "kind", "idea", "nodes")} for i in ctx["ideas"]],
+                    [{k: i[k] for k in ("id", "kind", "idea", "nodes", "units") if k in i}
+                     for i in ctx["ideas"]],
                     ensure_ascii=False, indent=1) if idea_ids else "")
                 + "## SCRIPT\n" + render_script(outline, part, result, self.language))
         data = self._ask_json(self.verify_llm, self.prompts.verify, user,

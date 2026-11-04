@@ -38,6 +38,11 @@ class Seed(unittest.TestCase):
         self.assertEqual(rows[2]["source_units"], "6-7")
         self.assertEqual(rows[1]["node_id"], "1.2")
 
+    def test_units_cited_by_the_idea_win_over_the_units_of_its_node(self):
+        coverage = {"transcript_ideas": [{"id": "T1.2", "kind": "condition", "idea": "x",
+                                          "nodes": ["1.2"], "units": [4, 5]}]}
+        self.assertEqual(ledger.seed(outline(), coverage)[0]["source_units"], "4-5")
+
     def test_the_csv_has_the_ledger_columns_and_round_trips(self):
         rows = ledger.seed(outline(), LEDGER)
         with tempfile.TemporaryDirectory() as tmp:
@@ -89,6 +94,19 @@ class Stages(unittest.TestCase):
         self.assertNotIn("- T1 ", text)
         empty = "\n".join(ledger_lines({"rows": [], "course": True}))
         self.assertIn("listed no atomic idea", empty)
+
+
+class Gate(unittest.TestCase):
+    def test_the_idea_list_of_a_part_is_checked_by_code(self):
+        from lecture2audio.enrich import validate_idea_list
+        part = outline().parts[0]
+        good = {"ideas": [{"kind": "claim", "idea": "a", "nodes": ["1.1"], "units": [1]},
+                          {"kind": "condition", "idea": "b", "nodes": ["1.2"], "units": [3, 4]}]}
+        self.assertEqual(validate_idea_list(good, part), [])
+        self.assertTrue(validate_idea_list({"ideas": good["ideas"][:1]}, part))  # 1.2 skipped
+        bad = {"ideas": [dict(good["ideas"][0], units=[6]), dict(good["ideas"][1], kind="x")]}
+        self.assertEqual(len(validate_idea_list(bad, part)), 2)  # unit of part 2, unknown kind
+        self.assertTrue(validate_idea_list({"items": []}, part))
 
 
 class Anki(unittest.TestCase):
