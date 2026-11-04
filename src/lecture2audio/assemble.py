@@ -113,8 +113,10 @@ def synth_blocks(backend: TTS, parts: list[list[dict]], audio_dir: Path, chunk_c
 
 
 def join_parts(parts: list[list[dict]], audio_dir: Path, chunk_gap: float = 0.25,
-               block_gap: float = 0.7, part_gap: float = 1.5) -> tuple[Path, list[tuple[str, float]]]:
-    """Concatenate with pauses. Returns the WAV file and (chapter, seconds) in playing order."""
+               block_gap: float = 0.7, part_gap: float = 1.5,
+               stem: str = "joined") -> tuple[Path, list[tuple[str, float]]]:
+    """Concatenate with pauses. Returns the WAV file (`stem`.wav) and (chapter, seconds) in
+    playing order. One part alone gives the recording of that part."""
     gaps = {}
     for name, seconds in (("chunk", chunk_gap), ("block", block_gap), ("part", part_gap)):
         gaps[name] = (audio_dir / f"gap_{name}.wav", seconds)
@@ -140,10 +142,10 @@ def join_parts(parts: list[list[dict]], audio_dir: Path, chunk_gap: float = 0.25
                 continue
             files.append(gap[0])
             add(entry["chapter"], gap[1])
-    listing = audio_dir / "concat.txt"
+    listing = audio_dir / ("concat.txt" if stem == "joined" else f"{stem}.concat.txt")
     listing.write_text("".join("file '" + str(p.resolve()).replace("'", "'\\''") + "'\n"
                                for p in files), encoding="utf-8")
-    joined = audio_dir / "joined.wav"
+    joined = audio_dir / f"{stem}.wav"
     run_ffmpeg("-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(joined))
     return joined, [(c, s) for c, s in chapters]
 
@@ -181,3 +183,23 @@ def encode_final(joined: Path, out_path: Path, titles: list[str], durations: lis
                    str(out_path))
     else:
         raise RuntimeError(f"Unsupported output format: {extension}")
+
+
+def encode_part_files(voiced: list[list[dict]], part_ids: list[str], audio_dir: Path,
+                      out_dir: Path, name: str, extension: str, titles: dict[str, str],
+                      loudness: bool = True) -> dict[str, Path]:
+    """One recording per part, with its own chapters (preview, points, summary), for the
+    players of the part notes. Returns {part id: file}."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for part_id, entries in zip(part_ids, voiced):
+        if not entries:
+            continue
+        stem = f"part_{int(part_id):03d}"
+        joined, chapters = join_parts([entries], audio_dir, stem=stem)
+        target = out_dir / f"{name}-{int(part_id):02d}.{extension}"
+        encode_final(joined, target, [titles.get(c, c) for c, _ in chapters],
+                     [s for _, s in chapters], loudness=loudness)
+        joined.unlink(missing_ok=True)
+        files[part_id] = target
+    return files

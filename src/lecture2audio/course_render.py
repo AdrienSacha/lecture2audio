@@ -3,13 +3,17 @@
 One note per part, one note per term, and an index, a glossary, a notation table, the sources and
 a review note. Terms are linked to their notes on first use in every card, and every term note
 lists what it requires, what requires it, what it must not be confused with and where it is
-used, so the notes form a graph. Math is LaTeX between dollar signs, figures are Mermaid, answers
-to the check questions are collapsed callouts.
+used, so the notes form a graph. Math is LaTeX between dollar signs; figures are numbered still
+frames, each a Mermaid diagram or an ASCII drawing in a callout; answers to the check questions
+and prerequisite reminders are collapsed callouts. When the audio was made, each part note and
+the index embed their recording (copied into audio/), and a "Full Lecture" note transcludes the
+parts in order, so the lecture reads as one chapter.
 """
 from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -21,7 +25,8 @@ from .outline import Outline
 ASSETS = Path(__file__).parent / "assets"
 
 LABELS = {
-    "en": {"needs": "Needs", "external": "From outside the lecture",
+    "en": {"needs": "Prerequisites", "external": "From outside the lecture",
+           "read_all": "Read the whole lecture as one chapter", "book": "Full Lecture",
            "external_text": "The lecture does not state this. It is added from the sources:",
            "definition": "Definition", "concept": "Idea", "procedure": "Procedure",
            "remark": "Remark", "instance": "Instance", "example": "Worked example",
@@ -36,6 +41,7 @@ LABELS = {
            "lectures": "lectures", "lectures_title": "Lectures", "minutes": "min read", "glossary": "Glossary", "notation": "Notation",
            "sources": "Sources", "final": "Review", "card": "card"},
     "fr": {"needs": "Prérequis", "external": "Hors du cours",
+           "read_all": "Lire tout le cours comme un seul chapitre", "book": "Cours complet",
            "external_text": "Le cours ne le dit pas. C'est ajouté depuis les sources :",
            "definition": "Définition", "concept": "Idée", "procedure": "Procédure",
            "remark": "Remarque", "instance": "Cas concret", "example": "Exemple détaillé",
@@ -123,6 +129,18 @@ def render_card(card: dict, terms: list[dict], index: dict[str, int], source_lin
     return view
 
 
+def place_audio(source: Path, folder: Path, name: str) -> str:
+    """Copy a recording into the lecture's audio/ folder of the vault, so that Obsidian can play
+    it in a note; return its file name. An unchanged copy is not copied again."""
+    target = folder / "audio" / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stat = Path(source).stat()
+    if not (target.exists() and target.stat().st_size == stat.st_size
+            and target.stat().st_mtime >= stat.st_mtime):
+        shutil.copy2(source, target)
+    return name
+
+
 def merge_terms(lectures: list[dict]) -> list[dict]:
     """The terms of the whole course, one entry each: the entry of the lecture that defines the
     term (a later lecture only borrows it), in the order of the lectures."""
@@ -138,8 +156,10 @@ def merge_terms(lectures: list[dict]) -> list[dict]:
 def write_vault(root: Path, lectures: list[dict], language: str, title: str | None = None) -> dict:
     """Write the notes of one or several lectures into `root`; return counts for the report.
 
-    Each lecture is {"name", "outline", "course", "records", "terms"}. Notes are named with the
-    lecture's name so that several lectures, or a vault that holds other notes, do not clash."""
+    Each lecture is {"name", "outline", "course", "records", "terms"}, and optionally "audio":
+    {"full": path, "parts": {part id: path}}, the recordings to embed (copied into audio/ next
+    to the notes). Notes are named with the lecture's name so that several lectures, or a vault
+    that holds other notes, do not clash."""
     labels = LABELS.get(language, LABELS["en"])
     root = Path(root)
     (root / "Terms").mkdir(parents=True, exist_ok=True)
@@ -209,6 +229,14 @@ def write_vault(root: Path, lectures: list[dict], language: str, title: str | No
         outline, course, notes = lecture["outline"], lecture["course"], lecture["notes"]
         by_record = {r["part"]: r for r in lecture["records"]}
         parts = course["parts"]
+        audio = lecture.get("audio") or {}
+        part_audio = {pid: place_audio(path, lecture["folder"],
+                                       f"{lecture['prefix']} – {int(pid):02d}{Path(path).suffix}")
+                      for pid, path in (audio.get("parts") or {}).items() if Path(path).exists()}
+        full_audio = (place_audio(audio["full"], lecture["folder"],
+                                  f"{lecture['prefix']}{Path(audio['full']).suffix}")
+                      if audio.get("full") and Path(audio["full"]).exists() else "")
+        book = f"{lecture['prefix']} – {labels['book']}"
         for p, part_data in enumerate(parts):
             part = outline.node(part_data["part"])
             groups, order = [], []
@@ -237,15 +265,20 @@ def write_vault(root: Path, lectures: list[dict], language: str, title: str | No
                   prerequisites=[f"[[{clean(terms[i]['term'])}]]" for i in earlier],
                   groups=groups, prev=notes[parts[p - 1]["part"]] if p else "",
                   next=notes[parts[p + 1]["part"]] if p + 1 < len(parts) else "",
-                  review=review_items(lecture, course["review"].get(part.id, [])))
+                  review=review_items(lecture, course["review"].get(part.id, [])),
+                  part_audio_file=part_audio.get(part.id, ""))
         final = review_items(lecture, course["review"].get("final", []))
         lecture["final"] = final
         write(lecture["folder"] / f"{lecture['prefix']} – Index.md", "index.md.j2",
               title=clean(outline.title), stats=[], final_review=final,
+              full_audio_file=full_audio, book_note=book,
               review_note=f"{lecture['prefix']} – Review",
               sources_note=f"{lecture['prefix']} – Sources", parts=[
                   {"note": notes[p["part"]], "intro": (by_record.get(p["part"], {}).get("preview")
                                                        or {}).get("intro", "")} for p in parts])
+        # the continuous reading view: every part transcluded, in order
+        write(lecture["folder"] / f"{book}.md", "book.md.j2", title=clean(outline.title),
+              full_audio_file=full_audio, parts=[notes[p["part"]] for p in parts])
         sources = {}
         for record in lecture["records"]:
             for x in record.get("supplements", []):
@@ -302,5 +335,7 @@ def write_vault(root: Path, lectures: list[dict], language: str, title: str | No
           lectures=[{"index": f"{l['prefix']} – Index", "title": clean(l["outline"].title)}
                     for l in lectures],
           reference=[f"{prefix} – Glossary", f"{prefix} – Notation"])
+    entry = (lectures[0]["folder"] / f"{lectures[0]['prefix']} – Index.md" if len(lectures) == 1
+             else root / "00 Course.md")
     return {"cards": cards_total, "diagrams": diagrams, "notes": written, "words": words,
-            "terms": len(terms)}
+            "terms": len(terms), "entry": str(entry)}

@@ -7,7 +7,8 @@ Turns a lecture transcript into a clear spoken explanation for studying. It is n
 - All tests (no key, no model, needs ffmpeg): `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`
 - One test file: `PYTHONPATH=src python3 -m unittest tests.test_outline`
 - Whole pipeline without models: `PYTHONPATH=src python3 -m lecture2audio build examples/sample_transcript.txt --llm dry --tts fake --language en --max-part-words 60 --out /tmp/l2a`, then read `/tmp/l2a/sample-transcript/report.md` and `index.md`
-- GUI: `PYTHONPATH=src python3 -m lecture2audio gui --no-browser --port 8799 --out /tmp/l2a`, then open http://127.0.0.1:8799/
+- One folder, no flags: `PYTHONPATH=src python3 -m lecture2audio ./lecture_folder/ --llm dry --tts fake` (no command means `build`; the folder's recording or transcript, slides and glossary are found by `sources.discover_inputs`)
+- The vault and the ledger of a run: `/tmp/l2a/sample-transcript/vault/` (open it as an Obsidian vault) and `/tmp/l2a/sample-transcript/ideas.csv`
 - Chapters of the result: `ffprobe -v error -show_chapters <file>.m4a`
 - After any change: run the tests and the dry build above. The work is done when both pass.
 
@@ -18,8 +19,11 @@ Turns a lecture transcript into a clear spoken explanation for studying. It is n
 - Prompts live in `src/lecture2audio/prompts/*.md`. The JSON each prompt asks for is checked by a gate in `pipeline.py`, `outline.py` or `enrich.py` (`validate_part`, `validate_verify`, `validate_spoken`, `parse_outline`, `validate_coverage`, `validate_termbase`, `validate_research`, `validate_uses`). When a prompt's output format changes, change its gate, `dry_run_handler` in `llm.py`, and the tests in the same change.
 - `dry_run_handler` and the test harness recognise each prompt by a phrase in it: "You build the outline", "strict reviewer", "exact words a voice should say", "You find the gaps", "You build the termbase", "You research one gap", "You check terminology". `test_pipeline.Harness` sends any unknown prompt to the rewrite handler. Keep these phrases when editing prompts.
 - Languages: English and French. Any fixed wording spoken by the program (part titles, previews, quiz) is in `WORDING` in `pipeline.py`; add both languages together.
-- Every stage caches its result under `out/<name>/` (`outline.json`, `coverage.json`, `termbase.json`, `research/`, `rewrite/`, `audit.json`, `spoken/`, `audio/`). A new stage needs its own cache and an entry in `LATER` in `cli.py`.
-- Output files written for the user (`script.md`, `index.md`, `questions.md`, `glossary.md`, `report.md`) use full sentences in a formal register.
+- Every stage caches its result under `out/<name>/` (`outline.json`, `coverage.json`, `termbase.json`, `research/`, `rewrite/`, `audit.json`, `spoken/`, `audio/`, `parts/`, `course/`). A new stage needs its own cache and an entry in `LATER` in `cli.py`. `ideas.csv` and `anki.csv` are not caches: they are rebuilt from the stage results on every run (`ledger.py`).
+- The idea ledger (`ideas.csv`, columns `idea_id,node_id,kind,statement,source_units,covered_in_card,status`) is the thread through the stages: `ledger.seed` after `run_coverage`, `ledger.apply_script` from the verifier's `ideas` in each record, `ledger.apply_cards` from the course judge's `ideas` (with card ids). A stage that sees ideas must answer for every one of them (`validate_ideas`, `validate_judgement`); `report.md` lists every idea that did not arrive.
+- A figure frame has exactly one of `mermaid` and `ascii` (`course_schema.Frame`); the template wraps each frame in a `[!figure]` callout with a ```mermaid or ```text block.
+- Output files written for the user (`script.md`, `index.md`, `questions.md`, `glossary.md`, `report.md`, the vault notes) use full sentences in a formal register.
+- Obsidian is the only interface (the browser GUI was removed in November 2026). Vault templates are in `src/lecture2audio/assets/*.j2`; labels in both languages are in `LABELS` in `course_render.py`.
 
 # Design decisions (keep unless the user decides otherwise)
 
@@ -40,8 +44,9 @@ Full sources and the ideas not built yet: `docs/research-notes.md`. Update it wh
 # Gotchas
 
 - `.venv` was created on the user's Mac; it does not run in a Linux sandbox. Use the system `python3` for tests there.
-- Run everything with `.venv/bin/python` (`start.py` re-executes itself with it): the speech and voice packages live only there. The default voice is Ming-3.0-tts-0.5B (MIT) through mlx-audio (`--tts ming`, built-in voice `US_James`); its weights (about 3 GB) live in the Hugging Face cache, `~/.cache/huggingface/hub`. Fish Audio Drama 3 (best open voice) was tried and removed: its 4-bit build needs about 24 GB and swapped this 32 GB Mac.
+- Run everything with `.venv/bin/python` (or `uv run lecture2audio ...`): the speech and voice packages live only there. The default voice is Ming-3.0-tts-0.5B (MIT) through mlx-audio (`--tts ming`, built-in voice `US_James`); its weights (about 3 GB) live in the Hugging Face cache, `~/.cache/huggingface/hub`. Fish Audio Drama 3 (best open voice) was tried and removed: its 4-bit build needs about 24 GB and swapped this 32 GB Mac.
 - Defaults (user's choice, quality first): `--llm deepseek` with `deepseek-flash` (V4.1 Flash, thinking on) writing and `deepseek-v4-pro` checking, DeepSeek search for research, `--language en`, Whisper large-v3, `--tts ming`. For `--llm anthropic`, `claude-sonnet-5-5` and `claude-opus-5-5`; for `--llm openai`, `gpt-6.1-sol` and `gpt-6-astra`; kimi, openrouter, compat and local have no default. Real API calls have not been tested yet for any provider.
 - Each hosted provider reads only its own key variable (`PRESETS` in `llm.py`), and the local client never sends `OPENAI_API_KEY` (it uses `L2A_LOCAL_API_KEY`), so no key leaks to another host.
-- The GUI loads nothing from outside the page (strict CSP, API key fields on the page). Its Windows XP look is hand-written CSS in `gui.py`. A browser with forced dark mode repaints it dark despite `color-scheme: only light`.
-- `gui.py` builds its form from `cli.build_parser()`, so a new CLI option appears in the GUI without a change there. It reads argparse private attributes (`_actions`).
+- `--vault-dir` defaults to `L2A_VAULT_DIR`, and then `--open-obsidian` is on: the run ends with `open "obsidian://open?path=..."` (macOS only; elsewhere the link is printed). Tests remove `L2A_VAULT_DIR` from the environment so that they never write into a real vault.
+- `--course` is on by default (`--no-course` skips the vault); the audio of each part is encoded a second time into `parts/` and copied into the vault's `audio/`, which doubles the disk use of the audio.
+- The atomic ideas come from one gap-search call over the whole lecture. On a very long lecture its output limit can cut the list short; `ledger.parts_without_ideas` reports parts with no idea, but the list itself is not yet built part by part.

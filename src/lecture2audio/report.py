@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .ledger import open_rows
 from .outline import Outline, ranges
 from .pipeline import SOFT_ISSUES, list_sentence
 
@@ -147,7 +148,7 @@ def _issue_line(issue: dict) -> str:
 def write_report(path: Path, name: str, outline: Outline, records: list[dict],
                  spoken: list[dict], notes: list[str], audit: dict | None,
                  usage: dict | None = None, roundtrip: list[dict] | None = None,
-                 gaps: dict | None = None) -> None:
+                 gaps: dict | None = None, ideas: dict | None = None) -> None:
     lines = [f"# {name}: quality report", ""]
     flagged = [r for r in records if r["flagged"]]
     lines.append(f"**{len(flagged)} part(s) still have open problems after the retries.** Listen "
@@ -179,6 +180,8 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
 
     if gaps:
         lines += _gap_lines(outline, gaps)
+    if ideas is not None:
+        lines += ledger_lines(ideas)
 
     moved = [(r["part"], m) for r in records for m in r.get("moves", [])]
     if moved:
@@ -223,6 +226,50 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
         lines.append("No unit was marked as noise.")
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+LEDGER_STATUS = {"pending": "not checked", "scripted": "found in the script, not yet in a card",
+                 "missing_script": "missing from the script",
+                 "missing_cards": "missing from the course cards", "verified": "verified"}
+
+
+def ledger_lines(ideas: dict) -> list[str]:
+    """The section on ideas.csv. Every idea that did not reach the last stage is listed by
+    code, so that no idea of the lecture can be lost without a line in this report."""
+    rows, course = ideas["rows"], ideas["course"]
+    lines = ["## Idea ledger (ideas.csv)", ""]
+    if not rows:
+        lines += ["**The gap search listed no atomic idea**, so the ledger is empty and nothing "
+                  "checks idea by idea that the lecture is complete. Run the stage again with "
+                  "`--redo gaps`, or use a model with a larger output limit.", ""]
+        return lines
+    done = "verified" if course else "scripted"
+    counts = {k: sum(r["status"] == k for r in rows) for k in LEDGER_STATUS}
+    reached = counts["verified"] + (0 if course else counts["scripted"])
+    lines.append(f"The transcript holds {len(rows)} atomic ideas. {reached} of them "
+                 + ("are verified: a card teaches each of them and the judge confirmed it."
+                    if course else "were found in the script by the verifier."))
+    detail = [f"{n} {LEDGER_STATUS[k]}" for k, n in counts.items() if n and k != done]
+    if detail:
+        lines.append("The others are: " + "; ".join(detail) + ".")
+    left = open_rows(rows, course)
+    if left:
+        lines += ["", f"**{len(left)} idea(s) did not reach the {'cards' if course else 'script'}."
+                  "** Check each of them against the transcript units given:", ""]
+        for row in left:
+            lines.append(f"- {row['idea_id']} ({row['kind']}, node {row['node_id']}, units "
+                         f"{row['source_units'] or '?'}, {LEDGER_STATUS.get(row['status'], row['status'])}): "
+                         f"{row['statement']}")
+    else:
+        lines.append("Every idea of the ledger reached the "
+                     + ("course cards." if course else "script."))
+    if ideas.get("empty_parts"):
+        lines += ["", f"Parts {', '.join(ideas['empty_parts'])} teach content but have no idea "
+                  "in the ledger. The list of ideas may have been cut short (for example by the "
+                  "output limit of the gap search on a long lecture); these parts are checked "
+                  "node by node only."]
+    lines.append("")
+    return lines
 
 
 KIND_NAMES = {"slide_missing": "slide idea not taught", "undefined_term": "term never defined",

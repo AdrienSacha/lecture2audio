@@ -1,4 +1,8 @@
-"""Command line: lecture2audio build|text INPUT [options]."""
+"""Command line: lecture2audio [build|text|series] INPUT [options].
+
+INPUT is a transcript, a recording, or a folder that holds them (with slides and a glossary,
+found by name and extension). Without a command, `build` runs: the script, the Obsidian vault
+of course material, the audio, and the idea ledger `ideas.csv`."""
 from __future__ import annotations
 
 import argparse
@@ -9,9 +13,11 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
-from .assemble import encode_final, join_parts, synth_blocks
+from . import ledger
+from .assemble import encode_final, encode_part_files, join_parts, synth_blocks
 from .course import CoursePipeline, course_report
 from .course_render import write_vault
 from .series import load_lecture, merge_termbases, series_report
@@ -22,23 +28,26 @@ from .report import (write_glossary, write_index, write_questions, write_referen
                      write_report, write_script)
 from .roundtrip import check_chunks
 from .segment import split_units
-from .sources import (AUDIO_EXT, detect_language, load_glossary, load_slides, load_transcript,
-                      slugify)
+from .sources import (AUDIO_EXT, detect_language, discover_inputs, load_glossary, load_slides,
+                      load_transcript, slugify)
 from .transcribe import STTError, transcribe_audio
 from .tts import TTSError, make_tts
 
-# What --redo X discards: the results of stage X and of every stage after it.
+# What --redo X discards: the results of stage X and of every stage after it. The idea
+# ledger (ideas.csv) and anki.csv are rebuilt from the stage results on every run.
 GAPS = ["coverage.json", "coverage_audit.json", "termbase.json", "research"]
-LATER = {"transcribe": ["outline.json", *GAPS, "rewrite", "audit.json", "spoken", "audio",
-                        "course", "vault"],
-         "outline": ["outline.json", *GAPS, "rewrite", "audit.json", "spoken", "audio",
-                     "course", "vault"],
-         "gaps": [*GAPS, "rewrite", "audit.json", "spoken", "audio", "course", "vault"],
-         "research": ["research", "rewrite", "audit.json", "spoken", "audio", "course",
-                      "vault"],
-         "rewrite": ["rewrite", "audit.json", "spoken", "audio", "course", "vault"],
-         "spoken": ["spoken", "audio"], "audio": ["audio"],
-         "course": ["course", "vault"]}
+DERIVED = ["ideas.csv", "anki.csv"]
+VOICE = ["spoken", "audio", "parts"]
+LATER = {"transcribe": ["outline.json", *GAPS, "rewrite", "audit.json", *VOICE, "course",
+                        "vault", *DERIVED],
+         "outline": ["outline.json", *GAPS, "rewrite", "audit.json", *VOICE, "course", "vault",
+                     *DERIVED],
+         "gaps": [*GAPS, "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
+         "research": ["research", "rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
+         "rewrite": ["rewrite", "audit.json", *VOICE, "course", "vault", *DERIVED],
+         "spoken": VOICE, "audio": ["audio", "parts"],
+         "course": ["course", "vault", *DERIVED]}
+COMMANDS = ("build", "text", "series")
 # (rewrite, verifier) per provider. A local server has no default: its models are
 # whatever the user has pulled.
 DEFAULT_MODELS = {"anthropic": ("claude-sonnet-5-5", "claude-opus-5-5"),
@@ -51,8 +60,10 @@ NATIVE_SEARCH = ("anthropic", "openai")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lecture2audio",
-        description="Turn a lecture transcript (or recording) into a clear spoken explanation.",
-        epilog="'lecture2audio gui [--port N] [--no-browser]' opens the same options in the browser.")
+        description="Turn a lecture transcript (or recording) into a clear spoken explanation "
+                    "and an Obsidian vault of course material.",
+        epilog="Without a command, 'build' runs: 'lecture2audio ./lecture_folder/' finds the "
+               "recording or transcript, the slides and the glossary in the folder.")
     sub = parser.add_subparsers(dest="command", required=True)
     for command, text in (("build", "transcript or recording -> audio"),
                           ("text", "same, but stop before the voice: script and quality report only"),
@@ -61,24 +72,38 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(command, help=text, description=text)
         if command == "series":
             p.add_argument("inputs", nargs="+",
-                           help="the lectures in course order (transcripts or recordings)")
+                           help="the lectures in course order (transcripts, recordings, or one "
+                                "folder per lecture)")
             p.add_argument("--name", help="name of the course (default: first lecture's folder)")
         else:
-            p.add_argument("input", help="transcript (.txt .md .srt .vtt) or recording (.mp3 .m4a .wav ...)")
-            p.add_argument("--name", help="name of the lecture (default: the input file name)")
+            p.add_argument("input", help="transcript (.txt .md .srt .vtt), recording (.mp3 .m4a "
+                                         ".wav .mp4 ...), or a folder holding them: the slides "
+                                         "(.pdf .pptx, or slides.md) and a glossary file "
+                                         "(glossary.txt) in it are used without flags")
+            p.add_argument("--name", help="name of the lecture (default: the input file or folder "
+                                          "name)")
         p.add_argument("--out", default="out", help="output folder (default: ./out)")
-        p.add_argument("--slides", help="slides as PDF (needs pypdf) or text, optional")
+        p.add_argument("--slides", help="slides as PDF (needs pypdf), PowerPoint (needs "
+                                        "python-pptx) or text, optional")
         p.add_argument("--glossary", help="text file, one course term per line, optional")
         p.add_argument("--language", choices=["en", "fr", "auto"], default="en")
-        p.add_argument("--course", action="store_true",
-                       help="also write the course material: a Markdown vault (vault/, for "
-                            "Obsidian) with exact definitions, full explanations, worked "
-                            "examples, check questions, figures and linked terms, made from the "
-                            "verified script")
-        p.add_argument("--vault-dir",
-                       help="folder where the course vault is written (default: vault/ in the "
-                            "lecture's output folder). Point it at your Obsidian vault: the "
-                            "notes go in a sub-folder named after the lecture or the course")
+        p.add_argument("--course", action=argparse.BooleanOptionalAction, default=True,
+                       help="write the course material (default; --no-course skips it): a "
+                            "Markdown vault for Obsidian with exact definitions, full "
+                            "explanations, worked examples, check questions, figures, linked "
+                            "terms and the audio players, made from the verified script")
+        p.add_argument("--vault-dir", default=os.environ.get("L2A_VAULT_DIR"),
+                       help="folder where the course vault is written (default: env "
+                            "L2A_VAULT_DIR, else vault/ in the lecture's output folder). Point "
+                            "it at your Obsidian vault: the notes go in a sub-folder named "
+                            "after the lecture or the course")
+        p.add_argument("--open-obsidian", action=argparse.BooleanOptionalAction, default=None,
+                       help="open the lecture's index note in Obsidian when the run ends (macOS; "
+                            "on by default when --vault-dir or L2A_VAULT_DIR is set)")
+        p.add_argument("--export-anki", action="store_true",
+                       help="also write anki.csv (Front, Back, Tags) for spaced repetition: "
+                            "the check questions of the cards, tagged with the ideas of "
+                            "ideas.csv they test")
         p.add_argument("--redo", choices=sorted(LATER),
                        help="discard saved results from this stage onwards and run it again")
         llm = p.add_argument_group("language models")
@@ -268,6 +293,44 @@ def _discard(work: Path, names: list[str]) -> None:
             path.unlink()
 
 
+def _resolve_folder(args, log) -> None:
+    """A folder as INPUT: take its recording or transcript, and its slides and glossary when
+    no flag names them. The lecture is named after the folder."""
+    folder = Path(args.input)
+    if not folder.is_dir():
+        return
+    found = discover_inputs(folder)
+    if not found["input"]:
+        raise SystemExit(f"No transcript (.txt .srt .vtt .md) or recording (.m4a .mp3 .wav "
+                         f".mp4 ...) found in {folder}")
+    args.name = args.name or slugify(folder.resolve().name)
+    args.input = str(found["input"])
+    if not args.slides and found["slides"]:
+        args.slides = str(found["slides"])
+    if not args.glossary and found["glossary"]:
+        args.glossary = str(found["glossary"])
+    log(f"[inputs] {folder}: lecture {Path(args.input).name}"
+        + (f", slides {Path(args.slides).name}" if args.slides else "")
+        + (f", glossary {Path(args.glossary).name}" if args.glossary else ""))
+    if found["skipped"]:
+        log("[inputs] not used: " + ", ".join(f.name for f in found["skipped"])
+            + " (give --slides or --glossary, or the file itself as INPUT, to choose another)")
+
+
+def _open_obsidian(args, entry: str | None, log) -> None:
+    """Open a note in Obsidian through its URI scheme. The note must lie inside a vault that
+    Obsidian knows, which is why this is on by default only with --vault-dir."""
+    want = args.open_obsidian if args.open_obsidian is not None else bool(args.vault_dir)
+    if not want or not entry:
+        return
+    uri = "obsidian://open?path=" + urllib.parse.quote(str(Path(entry).resolve()), safe="")
+    if sys.platform == "darwin" and shutil.which("open"):
+        if subprocess.run(["open", uri], check=False).returncode == 0:
+            log(f"[obsidian] opened {entry}")
+            return
+    log(f"[obsidian] open this link to read the notes: {uri}")
+
+
 def run(args, series: dict | None = None) -> int:
     """One lecture. `series` (see run_series) stops the run after the termbase, supplies the
     notation of the earlier lectures, or keeps the run from writing the vault."""
@@ -279,6 +342,8 @@ def run(args, series: dict | None = None) -> int:
     source = Path(args.input)
     if not source.exists():
         raise SystemExit(f"Input not found: {source}")
+    _resolve_folder(args, log)
+    source = Path(args.input)
     name = args.name or slugify(source.stem)
     work = Path(args.out) / name
     work.mkdir(parents=True, exist_ok=True)
@@ -314,6 +379,11 @@ def run(args, series: dict | None = None) -> int:
     log(f"[outline] {len(outline.parts)} part(s), "
         f"{sum(len(p.children) for p in outline.parts)} point(s)")
     coverage = pipeline.run_coverage(outline)
+    # the idea ledger: every atomic idea of the transcript, checked off by the later stages
+    ideas_path = work / "ideas.csv"
+    ideas = ledger.seed(outline, coverage)
+    ledger.write(ideas_path, ideas)
+    log(f"[ideas] {len(ideas)} atomic idea(s) in {ideas_path}")
     terms = pipeline.run_termbase(outline)
     if series.get("stop_after") == "termbase":
         return 0
@@ -326,24 +396,39 @@ def run(args, series: dict | None = None) -> int:
             "supplements": supplements, "note": research_note,
             "audit": None if args.no_audit else pipeline.audit_coverage(outline)}
     records = pipeline.run_parts(outline)
+    ledger.write(ideas_path, ledger.apply_script(ideas, records))
     audit = None if args.no_audit else pipeline.audit_verifier(outline, records)
     notes = pipeline.global_notes(outline, records)
     spoken = pipeline.run_spoken(outline, records)
     course = course_stats = None
+    vault = Path(args.vault_dir) / name if args.vault_dir else work / "vault"
+
+    def write_course(audio: dict | None = None) -> dict:
+        stats = write_vault(vault, [{"name": name, "outline": outline, "course": course,
+                                     "records": records, "terms": terms, "audio": audio}],
+                            language, outline.title)
+        log(f"[course] {stats['cards']} card(s), {stats['notes']} note(s): {vault}")
+        return stats
+
     if args.course:
         course = CoursePipeline(pipeline, series.get("notation")).run(outline, records)
-        vault = Path(args.vault_dir) / name if args.vault_dir else work / "vault"
+        ledger.write(ideas_path, ledger.apply_cards(ideas, course))
         if series.get("skip_vault"):
             course_stats = {"cards": sum(len(p["cards"]) for p in course["parts"]),
                             "notes": 0, "diagrams": sum(bool(c["diagram"]) for p in course["parts"]
                                                         for c in p["cards"])}
             log(f"[course] {course_stats['cards']} card(s)")
         else:
-            course_stats = write_vault(vault, [{"name": name, "outline": outline,
-                                                "course": course, "records": records,
-                                                "terms": terms}], language, outline.title)
-            log(f"[course] {course_stats['cards']} card(s), {course_stats['notes']} note(s): "
-                f"{vault}")
+            course_stats = write_course()
+    unverified = ledger.open_rows(ideas, bool(course))
+    if unverified:
+        log(f"[ideas] {len(unverified)} of {len(ideas)} idea(s) not "
+            f"{'verified in the cards' if course else 'found in the script'}: "
+            + ", ".join(r["idea_id"] for r in unverified[:20])
+            + (" ..." if len(unverified) > 20 else "") + " (see report.md and ideas.csv)")
+    if args.export_anki:
+        count = ledger.write_anki(work / "anki.csv", name, ideas, course, records, language)
+        log(f"[anki] {count} note(s) in {work / 'anki.csv'} (Anki: File > Import)")
     usage = {rewrite_llm.name: rewrite_llm.usage}
     if verify_llm is not rewrite_llm:
         usage[verify_llm.name + " (verifier)"] = verify_llm.usage
@@ -355,7 +440,8 @@ def run(args, series: dict | None = None) -> int:
         write_reference(work / "reference.md", name, outline, records)
         write_glossary(work / "glossary.md", name, outline, terms)
         write_report(work / "report.md", name, outline, records, spoken, notes, audit, usage,
-                     roundtrip, gaps)
+                     roundtrip, gaps, {"rows": ideas, "course": bool(course),
+                                       "empty_parts": ledger.parts_without_ideas(outline, ideas)})
         if course:  # before the list of noise, which stays last
             report = (work / "report.md").read_text(encoding="utf-8")
             cut = report.find("\n## Removed as noise")
@@ -372,6 +458,8 @@ def run(args, series: dict | None = None) -> int:
         log("[check] the verifier missed a planted omission (see report.md)")
     if args.command == "text":
         log(f"Done. Read {work / 'script.md'} and {work / 'report.md'}.")
+        if course_stats and not series:
+            _open_obsidian(args, course_stats.get("entry"), log)
         return 0
 
     backend = make_tts(args.tts, language, args.voice, args.tts_command)
@@ -382,6 +470,13 @@ def run(args, series: dict | None = None) -> int:
     output = work / f"{name}.{args.format}"
     encode_final(joined, output, [titles[c] for c, _ in chapters], [s for _, s in chapters],
                  loudness=not args.no_loudnorm)
+    part_files = {}
+    if course_stats and not series.get("skip_vault"):
+        # one recording per part, for the player at the top of each part note
+        part_files = encode_part_files(voiced, [r["part"] for r in records], work / "audio",
+                                       work / "parts", name, args.format, titles,
+                                       loudness=not args.no_loudnorm)
+        course_stats = write_course({"full": output, "parts": part_files})
     roundtrip = None
     if args.roundtrip:
         log("[roundtrip] transcribing the audio again")
@@ -393,6 +488,8 @@ def run(args, series: dict | None = None) -> int:
         log(f"[roundtrip] {len(roundtrip)} of {len(results)} chunks below {args.roundtrip_threshold}")
     reports(chapters, roundtrip)
     log(f"Done. Audio: {output}")
+    if course_stats:
+        _open_obsidian(args, course_stats.get("entry"), log)
     return 0
 
 
@@ -406,6 +503,8 @@ def run_series(args) -> int:
         if not path.exists():
             raise SystemExit(f"Input not found: {path}")
     course_name = args.name or slugify(sources[0].resolve().parent.name or "course")
+    if args.open_obsidian is None:
+        args.open_obsidian = bool(args.vault_dir)
     names, seen = [], set()
     for path in sources:
         base = slugify(path.stem)
@@ -447,14 +546,14 @@ def run_series(args) -> int:
         {"lectures": names, "notation": registry, "conflicts": conflicts}, ensure_ascii=False,
         indent=2), encoding="utf-8")
     print(f"Done. Vault: {vault}. Read {root / 'series.md'}.", flush=True)
+    _open_obsidian(args, stats.get("entry"), lambda m: print(m, flush=True))
     return 0
 
 
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else list(argv)
-    if argv[:1] == ["gui"]:
-        from .gui import main as gui_main
-        return gui_main(argv[1:])
+    if argv and argv[0] not in (*COMMANDS, "-h", "--help"):
+        argv = ["build", *argv]  # zero friction: `lecture2audio ./lecture_folder/`
     args = build_parser().parse_args(argv)
     try:
         sys.exit(run_series(args) if args.command == "series" else run(args))

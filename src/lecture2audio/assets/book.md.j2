@@ -1,0 +1,18 @@
+---
+title: {{ fm(title) }}
+tags: [course, lecture, book]
+---
+# {{ title }}
+
+{% if full_audio_file %}
+![[audio/{{ full_audio_file }}]]
+
+{% endif %}
+{% for note in parts %}
+![[{{ note }}]]
+
+{% if not loop.last %}
+---
+
+{% endif %}
+{% endfor %}

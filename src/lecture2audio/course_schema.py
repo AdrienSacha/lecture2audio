@@ -25,6 +25,11 @@ MERMAID_KINDS = ("graph", "flowchart", "sequenceDiagram", "stateDiagram", "state
 MERMAID_FORBIDDEN = re.compile(r"<script|javascript:|^\s*click\s|\bcallback\b|<iframe|<img|"
                                r"https?:", re.I | re.M)
 HTML_TAG = re.compile(r"</?[A-Za-z][^>]*>")
+# Real HTML in an ASCII figure. Placeholders such as <src> or <data> are figure labels, not HTML.
+HTML_ELEMENT = re.compile(r"</?(?:a|abbr|b|br|button|code|details|div|em|embed|font|form|h[1-6]|"
+                          r"hr|i|iframe|img|input|li|link|meta|object|ol|p|pre|script|small|"
+                          r"span|strong|style|sub|summary|sup|svg|table|tbody|td|th|thead|tr|u|"
+                          r"ul|video|audio|html|body|head)\b[^>]*>|&[a-z]+;|&#\d+;", re.I)
 INLINE_MATH = re.compile(r"\$([^$\n]+)\$")
 
 
@@ -53,18 +58,47 @@ class Model(BaseModel):
 
 
 class Frame(Model):
+    """One still frame of a figure: EITHER a Mermaid diagram (structure, states, protocol
+    flows) OR an ASCII box drawing (bit layouts, memory, registers, pointer traces)."""
     caption: Text = Field(min_length=1)
-    mermaid: str = Field(min_length=1, max_length=4000)
+    mermaid: str = Field(default="", max_length=4000)
+    ascii: str = Field(default="", max_length=4000)
 
     @field_validator("mermaid")
     @classmethod
     def _well_formed(cls, value):
+        if not value.strip():
+            return ""
         code = "\n".join(l for l in value.strip().splitlines() if not l.strip().startswith("%%"))
         if not code.startswith(MERMAID_KINDS):
             raise ValueError(f"a Mermaid diagram starts with one of {list(MERMAID_KINDS)}")
         if MERMAID_FORBIDDEN.search(value):
             raise ValueError("Mermaid code may not hold scripts, callbacks or links")
+        if "```" in value:
+            raise ValueError("give the Mermaid code without the ``` fence")
         return value.strip()
+
+    @field_validator("ascii")
+    @classmethod
+    def _plain_drawing(cls, value):
+        if "```" in value or "~~~" in value:
+            raise ValueError("give the ASCII drawing without a ``` fence: the program adds it")
+        if HTML_ELEMENT.search(value):
+            raise ValueError("an ASCII drawing holds no HTML tags or entities")
+        # keep the leading spaces: they align the boxes
+        lines = [line.rstrip() for line in value.replace("\t", "    ").splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines)
+
+    @model_validator(mode="after")
+    def _one_kind(self):
+        if bool(self.mermaid) == bool(self.ascii):
+            raise ValueError('a frame has exactly one of "mermaid" and "ascii" (the other is '
+                             '"" or left out)')
+        return self
 
 
 class Diagram(Model):
@@ -137,6 +171,7 @@ class Card(Model):
     table: Table | None = None
     checks: list[Check] = Field(default=[], max_length=4)
     covers: list[int] = Field(min_length=1)
+    ideas: list[Text] = []  # ids of the ledger's ideas (T1, T2, ...) this card teaches
 
     @field_validator("explanation")
     @classmethod
@@ -170,6 +205,7 @@ class Card(Model):
         if errors:
             raise ValueError("inline math between $ $ is LaTeX: " + "; ".join(errors))
         self.covers = sorted(set(self.covers))
+        self.ideas = list(dict.fromkeys(i for i in self.ideas if i))
         return self
 
 

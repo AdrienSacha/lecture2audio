@@ -1,6 +1,6 @@
 # lecture2audio
 
-Turns the transcript (or the recording) of a lecture into a clear, well-ordered spoken explanation that you can listen to. It is not a podcast and not a summary: it keeps everything the teacher taught, removes the noise (pauses, sips of water, false starts, "as you can see on the board"), organises the lecture into parts, points and sub-points, announces each part's points before explaining them, defines each term before its first use, asks you questions at the end of each part, and prepares numbers, formulas and code so that a voice model reads them correctly.
+Turns the transcript (or the recording) of a lecture into a clear, well-ordered spoken explanation that you can listen to, and into an Obsidian vault of course material that embeds the audio. It is not a podcast and not a summary: it keeps everything the teacher taught, removes the noise (pauses, sips of water, false starts, "as you can see on the board"), organises the lecture into parts, points and sub-points, announces each part's points before explaining them, defines each term before its first use, asks you questions at the end of each part, and prepares numbers, formulas and code so that a voice model reads them correctly.
 
 ## How it works
 
@@ -18,7 +18,10 @@ transcript ────────────────┴─► 2 outline �
 3. **Rewrite** (`prompts/rewrite.md`), one part at a time. The model writes one section per node of the outline, a preview phrase for each point, a recap and two or three questions. Every sentence is tagged `lecture` (taught by the teacher) or `added` (a transition, a definition's purpose, a flag such as "the recording is unclear here"). Code assembles the spoken previews ("This part has three points. First, ... Second, ..."), so they always match the sections. Formulas and code go verbatim into `reference.md`.
 4. **Verify** (`prompts/verify.md`, a different model by default). Code checks first: the sections must match the outline exactly, and a number in a `lecture` sentence must appear in the transcript or the slides. The verifier then gives a status for every node (complete, incomplete, misplaced) and lists faithfulness, definition, recap, question and listening problems. A failing part is rewritten with the remarks, at most twice. The best attempt is kept, because a repair can make a correct script worse. A part that still fails is flagged in `report.md`.
 5. **Spoken form** (`prompts/spoken.md`, then `spoken.py`). The model writes numbers, symbols, formulas and code as words; then rule-based code guarantees that no digit or symbol is left (English and French).
-6. **Voice.** Each block is cut at sentence ends, synthesised, cached by its text, joined with pauses (longer between parts, a silence after each quiz question), loudness-normalised, and written as m4a with one chapter per part, per point, and per "summary and questions".
+6. **Voice.** Each block is cut at sentence ends, synthesised, cached by its text, joined with pauses (longer between parts, a silence after each quiz question), loudness-normalised, and written as m4a with one chapter per part, per point, and per "summary and questions". Each part is also written as its own recording (`parts/`), for the player at the top of its note in the vault.
+7. **Course material** (`prompts/course.md`, `course.py`, `course_render.py`). The verified script of each part becomes cards (one idea each: formal definition, concrete instance, full explanation, worked example, figure, check questions). Figures are one to eight still frames, each a Mermaid diagram (architecture, state machines, protocol exchanges) or an ASCII box drawing (bit layouts, memory, registers, pointer traces). Code checks the cards, a second model judges every card, figure and table against the sentences it covers, and the vault is written for Obsidian: one note per part with its audio player, collapsed prerequisite reminders and collapsed answers, one note per term, an index with the whole recording, and a "Full Lecture" note that transcludes the parts so the lecture reads as one chapter.
+
+**The idea ledger** (`ideas.csv`) links every stage. The gap search lists every atomic idea the teacher taught (T1, T2, ...). Each idea is written to `out/<name>/ideas.csv` with its node and its transcript units, status `pending`; the verifier checks it off against the script (`scripted` or `missing_script`); the course judge checks it off against the cards and names the card that teaches it (`covered_in_card`, `verified` or `missing_cards`). `report.md` lists every idea that did not reach the end, and every part that has no idea at all (a sign that the list was cut short). `--export-anki` turns the ledger and the check questions into `anki.csv` (Front, Back, Tags) for spaced repetition.
 
 Two checks cover the whole lecture. Once per run, an omission is planted in an accepted part and the verifier is asked again: if it does not notice, `report.md` says that its passes are less trustworthy. The report also notes terms that the outline planned but no part defined, and warns when more than 20% of the words were marked as noise; all noise is listed at the end of the report so that you can check it.
 
@@ -29,19 +32,20 @@ cd ~/code/lecture2audio
 uv venv .venv && uv pip install -e ".[voice,whisper-mac,pdf]"   # whisper instead of whisper-mac off a Mac
 brew install ffmpeg                   # needed for the audio
 export DEEPSEEK_API_KEY=...           # the default model, and the web search for the gaps
-python3 start.py                      # opens the interface; it always runs with .venv
+export L2A_VAULT_DIR=~/Obsidian/Courses   # optional: write the notes into your Obsidian vault
 ```
 
-Defaults, chosen for quality: DeepSeek V4.1 Flash writes (thinking mode on), DeepSeek V4 Pro checks, DeepSeek's search API researches the gaps; speech recognition (Whisper large-v3) and the voice (Chatterbox) run on your machine. The voice runs on a CUDA GPU, the Apple GPU or the CPU; on a Mac it takes several times the length of the audio.
+Defaults, chosen for quality: DeepSeek V4.1 Flash writes (thinking mode on), DeepSeek V4 Pro checks, DeepSeek's search API researches the gaps; speech recognition (Whisper large-v3) and the voice (Ming-3.0-tts-0.5B through mlx-audio, `mlx-community/Ming-3.0-tts-0.5B-bf16`) run on your Mac. Obsidian is the interface for reading, the graph of terms, and review.
 
 Optional parts:
 
 | Need | Install |
 |---|---|
-| Chatterbox voice (local, default) | `pip install -e ".[voice]"` |
+| Ming voice (local, default, Apple chips) | `uv pip install -e ".[voice]"` |
 | Transcribe recordings, Apple Silicon | `pip install -e ".[whisper-mac]"` |
 | Transcribe recordings, other machines | `pip install -e ".[whisper]"` |
-| Slides as PDF | `pip install -e ".[pdf]"` |
+| Slides as PDF | `uv pip install -e ".[pdf]"` |
+| Slides as PowerPoint | `uv pip install -e ".[pptx]"` |
 
 ## Use
 
@@ -51,10 +55,16 @@ Try the whole flow without any key or model (the "dry" model keeps the text as i
 lecture2audio build examples/sample_transcript.txt --llm dry --tts say --language en --max-part-words 60
 ```
 
-A real run:
+A real run, from one folder that holds the recording or the transcript, the slides and a glossary (found by extension and name: `.m4a .mp3 .wav .mp4`, `.txt .srt .vtt`, `.pdf .pptx` or `slides.md`, `glossary.txt`):
 
 ```bash
-lecture2audio build lecture.txt --slides slides.pdf --glossary glossary.txt
+lecture2audio ./week-03/
+```
+
+Without a command, `build` runs. With `L2A_VAULT_DIR` set (or `--vault-dir`), the notes go into your vault and Obsidian opens the lecture's index when the run ends (`--no-open-obsidian` to stop that). The same with explicit files:
+
+```bash
+lecture2audio build lecture.txt --slides slides.pdf --glossary glossary.txt --export-anki
 ```
 
 With OpenAI, or a local server such as Ollama:
@@ -64,8 +74,6 @@ lecture2audio build lecture.txt --llm openai
 lecture2audio build lecture.txt --llm local --rewrite-model qwen3:32b
 lecture2audio build lecture.txt --llm anthropic --verify-llm openai   # verifier from another family
 ```
-
-In the browser: `python3 start.py` (or `lecture2audio gui` once installed) opens a local page (127.0.0.1 only) with every option, a live log, the reports and an audio player with chapters. API keys typed there are used for that run only and are never saved.
 
 French lecture: `--language fr` (detected automatically by default). From a recording, correcting the transcript first:
 
@@ -85,7 +93,10 @@ Results are in `out/<name>/`:
 | `script.md` | The script, organised by the outline; added sentences in italics |
 | `questions.md` | The questions of every part, answers at the end, to test yourself on a later day |
 | `reference.md` | Formulas, code and tables, copied verbatim |
-| `report.md` | Open problems, retries, the verifier test, order changes, model use, everything removed as noise |
+| `report.md` | Open problems, retries, the verifier test, the ideas that did not reach the cards, order changes, model use, everything removed as noise |
+| `ideas.csv` | The idea ledger: `idea_id,node_id,kind,statement,source_units,covered_in_card,status` |
+| `anki.csv` | With `--export-anki`: Front, Back, Tags, for Anki's File > Import |
+| `vault/` | The course material for Obsidian (or in `--vault-dir`), with the recordings in `audio/`; `--no-course` skips it |
 
 Intermediate results are in `outline.json`, `rewrite/`, `spoken/` and `audio/`; a rerun reuses them. You can edit `outline.json` or `rewrite/part_003.json` by hand and run again with `--redo rewrite` or `--redo spoken`. `--redo transcribe|outline|rewrite|spoken|audio` discards that stage and the next ones. If the transcript or `--max-part-words` changes, old results are discarded automatically.
 
@@ -95,7 +106,7 @@ Intermediate results are in `outline.json`, `rewrite/`, `spoken/` and `audio/`; 
 - **Structure.** `--max-part-words` (default 2500) sets the longest part. `--workers` (default 3) sets how many parts are processed at the same time. `--max-retries` (default 2) sets how many repairs a part may get. `--no-audit` skips the planted-omission test.
 - **Gaps and terms.** Before the rewrite, the program lists what the lecture leaves out: slide ideas never taught, terms never defined, fundamentals taken for granted, and skipped steps. It then searches the web for every gap and keeps a fact only if its quote is found word for word in the page. With `--llm anthropic` or `openai` the provider's own web search is used. With any other model that can call tools (`--llm deepseek`, `kimi`, `openrouter`, `compat`, `local`), the program runs the searches and reads the pages itself, through a search engine of your choice (`--search deepseek`, `tavily`, `brave`, or a free self-hosted `searxng`). The audio teaches these facts and opens each such passage with a short spoken phrase; `script.md` and `reference.md` list the sources. Every technical term gets one definition (`glossary.md`), is defined at its first use, and is checked in every sentence, so that a near word never replaces it. `--research off` keeps the gap list but skips the web. Every gap is researched; `--research-depth` (default 30) sets how many searches and page reads each gap may use. `--redo gaps` or `--redo research` runs these stages again.
 - **Questions.** `--quiz-pause` (default 8 seconds) sets the silence after each question. `--no-quiz` leaves the questions out of the audio; they stay in `questions.md`.
-- **Voice.** `--tts chatterbox` (local, default; `--voice file.wav` imitates that voice), `say` (macOS built-in, lower quality), `openai` (`OPENAI_API_KEY`), `fake` (tones, for tests), or `command` for any other model:
+- **Voice.** `--tts ming` (Ming-3.0-tts, local, default; `--voice US_James`, `US_Emma`, `UK_George`, `UK_Charlotte`, `US_Stella`, or `file.wav` to imitate that voice), `say` (macOS built-in, lower quality), `openai` (`OPENAI_API_KEY`), `fake` (tones, for tests), or `command` for any other model:
   `--tts command --tts-command "python my_voice.py --text-file {text_file} --out {out} --language {language}"`. The script must write a WAV file to `{out}`.
 - **Prompts.** `src/lecture2audio/prompts/*.md` are plain files; edit them, or copy the folder and pass `--prompts-dir`.
 
@@ -107,6 +118,6 @@ The architecture follows 2026 work on language-model systems. It is a fixed chai
 
 ## Status
 
-Tested automatically (59 tests, no key or model needed, see `CLAUDE.md` for the command): the outline checks (coverage, order, depth, size, folding, moves, noise assignment, fallback), the structure gates, the verifier's per-node statuses, the retry loop that keeps the best attempt, the planted-omission test, parallel parts, caching, previews in English and French, the spoken blocks, number and symbol conversion, chunking, joining with pauses, chapters, and the whole command line with the dry model and the fake voice.
+Tested automatically (no key or model needed, see `CLAUDE.md` for the command): the outline checks (coverage, order, depth, size, folding, moves, noise assignment, fallback), the structure gates, the verifier's per-node statuses, the retry loop that keeps the best attempt, the planted-omission test, parallel parts, caching, previews in English and French, the spoken blocks, number and symbol conversion, chunking, joining with pauses, chapters, the idea ledger and the Anki export, the folder input, the vault (figures, audio embeds, the continuous reading note), and the whole command line with the dry model and the fake voice.
 
-Not tested yet, because they need keys, models or a Mac: the real calls to the Anthropic, OpenAI and local servers; the `say` and OpenAI voices; `mlx-whisper` and `faster-whisper`; the round trip; PDF slides. The prompts have not yet been tuned on real lectures: run one lecture, read `report.md` and `index.md`, listen, and adjust the prompts where the result is not what you want.
+Not tested yet, because they need keys, models or a Mac: the real calls to the Anthropic, OpenAI and local servers; the `say` and OpenAI voices; `mlx-whisper` and `faster-whisper`; the round trip; PDF and PowerPoint slides; opening Obsidian. The prompts have not yet been tuned on real lectures: run one lecture, read `report.md` and `index.md`, listen, and adjust the prompts where the result is not what you want.

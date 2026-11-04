@@ -11,12 +11,17 @@ next: {{ fm("[[" ~ next ~ "]]") }}
 ---
 # {{ part.id }}. {{ title }}
 
+{% if part_audio_file %}
+![[audio/{{ part_audio_file }}]]
+
+{% endif %}
 {% if intro %}
 {{ intro }}
 
 {% endif %}
 {% if prerequisites %}
-**{{ labels.needs }}:** {{ prerequisites|join(", ") }}
+> [!info]- {{ labels.needs }}
+> {{ prerequisites|join(", ") }}
 
 {% endif %}
 {% for group in groups %}
@@ -72,11 +77,14 @@ $$
 
 {% endif %}
 {% for frame in card.diagram.frames %}
-*{{ labels.step }} {{ loop.index }} / {{ loop.length }}.* {{ frame.caption }}
-
-```mermaid
-{{ frame.mermaid }}
-```
+> [!figure] {{ labels.step }} {{ loop.index }} / {{ loop.length }}
+> {{ frame.caption }}
+>
+{% if frame.mermaid %}
+{{ ("```mermaid\n" ~ frame.mermaid ~ "\n```")|quote }}
+{% else %}
+{{ ("```text\n" ~ frame.ascii ~ "\n```")|quote }}
+{% endif %}
 
 {% endfor %}
 {% endif %}

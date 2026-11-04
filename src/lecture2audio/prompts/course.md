@@ -36,6 +36,7 @@ Each card has these fields:
 - "table": a table of values or of cases, or null: {"columns": ["..."], "rows": [["...", "..."]], "caption": "..."}.
 - "checks": zero to four questions the reader answers from memory, each {"question": "...", "answer": "..."}. Required (at least one) for every card that defines a term or is a procedure. Ask for a definition in the reader's own words, a reason, a step, or a calculation. The answer is complete, in one to three sentences.
 - "covers": the numbers of the SCRIPT sentences this card teaches. Every script sentence is covered by at least one card. A transition sentence ("The second point is ...") is covered by the first card of its node.
+- "ideas": the ids of the IDEAS TO TEACH that this card teaches (for example ["T3", "T4"]). Every idea of IDEAS TO TEACH is listed by at least one card, the card that states it in full. Empty list when IDEAS TO TEACH is not given.
 
 # Rules of writing
 
@@ -51,11 +52,25 @@ Each card has these fields:
 
 # Diagrams
 
-Use a diagram when the idea is a structure, a process over time, or numbers in relation, and a picture says it better than words. Do not add one to a plain definition. A diagram is a list of frames, shown one after the other, one change per frame (one to eight), each with a caption that says what changes. Each frame is a complete Mermaid diagram that stands alone, so the reader sees the full state at every step.
+A figure is required whenever an idea involves topology (a network, a graph, a tree, a layered architecture), a state machine, a protocol handshake or message exchange, a memory or data layout (bits, bytes, fields, stack, heap, registers, arrays), or a change over time (an algorithm's state, a queue, a moving pointer). A figure is not added to a purely verbal definition. Draw it at the level of a good university textbook: every element the covered sentences name is drawn and labelled with the lecture's terms and values, and nothing the script does not contain is drawn.
 
-"diagram": {"title": "...", "frames": [{"caption": "The graph before the first step.", "mermaid": "graph LR\n  A --> B\n  A --> C"}, {"caption": "Vertex A is visited.", "mermaid": "graph LR\n  A:::seen --> B\n  A --> C\n  classDef seen fill:#cde"}]}
+A figure is a list of one to eight still frames, shown one after the other. Each frame shows exactly one atomic change (one message sent, one transition taken, one pointer moved, one field filled, one swap). Each frame is complete and stands alone: it shows the full state at that step, so the reader never has to remember the previous frame. Each frame has a caption of one sentence that says what changed in this frame. A process with more than eight changes is split into two cards, each with its own figure.
 
-Mermaid kinds allowed: graph, flowchart, sequenceDiagram, stateDiagram-v2, classDiagram, erDiagram, gantt, pie, mindmap, timeline, xychart-beta. No links, no click handlers, no scripts, no HTML.
+Each frame has exactly one of two forms:
+
+1. "mermaid": a complete Mermaid diagram, for system architecture and topology (flowchart), message exchanges and protocol handshakes (sequenceDiagram), state transitions (stateDiagram-v2) and grouped components (block-beta). Label every node and every arrow explicitly with the lecture's terms (for example "SYN, seq = x"). Signal the change of each frame (rule 14, signaling): give the element that changes the class "active" and declare it in the same frame with "classDef active fill:#ffe08a,stroke:#b07d00,stroke-width:2px"; in a sequenceDiagram, mark the new message with "rect rgb(255, 224, 138)" ... "end" or a "Note over" line. Allowed kinds: flowchart, graph, sequenceDiagram, stateDiagram-v2, block-beta, classDiagram, erDiagram, timeline, xychart-beta. No links, no click handlers, no scripts, no HTML.
+2. "ascii": a box drawing in plain text, for bit and byte layouts of packet headers, memory and stack layouts, register files, and traces of arrays with moving pointers. Use the box-drawing characters ┌ ─ ┬ ┐ │ ├ ┼ ┤ └ ┴ ┘ and the arrows ──► ◄── ▲ ▼. Put the bit or byte offsets above the boxes and the field names and values inside them, aligned in columns of equal width; mark the element that changes in the frame with an arrow and a short label ("◄── top"). Give the drawing without a ``` fence and without HTML; every line keeps its leading spaces.
+
+The unused form is the empty string "". Prefer "ascii" where the exact position of bits, bytes or cells is the point, and "mermaid" where the connections or the order of events are the point.
+
+"diagram": {"title": "...", "frames": [
+  {"caption": "The client sends SYN with sequence number x.", "mermaid": "sequenceDiagram\n  participant C as Client\n  participant S as Server\n  rect rgb(255, 224, 138)\n  C->>S: SYN, seq = x\n  end", "ascii": ""},
+  {"caption": "The server answers with SYN-ACK.", "mermaid": "sequenceDiagram\n  participant C as Client\n  participant S as Server\n  C->>S: SYN, seq = x\n  rect rgb(255, 224, 138)\n  S->>C: SYN-ACK, seq = y, ack = x + 1\n  end", "ascii": ""}]}
+
+"diagram": {"title": "...", "frames": [
+  {"caption": "The stack after the call pushes the return address.", "mermaid": "", "ascii": "        ┌──────────────────┐\n 0x7ffc │ return address   │ ◄── sp\n        ├──────────────────┤\n 0x8000 │ argument a = 3   │\n        └──────────────────┘"}]}
+
+A "table" lists values or cases in rows; every cell holds only what the covered sentences hold (or correct illustrative values, as for an "instance").
 
 # Output
 
@@ -63,6 +78,6 @@ Return one JSON object and nothing else. Write everything in LANGUAGE.
 
 {
   "cards": [
-    {"node": "1.1", "kind": "definition", "title": "...", "terms": ["..."], "definition": "...", "instance": "...", "explanation": ["...", "..."], "formulas": [], "notation": [], "example": null, "diagram": null, "code": [], "table": null, "checks": [{"question": "...", "answer": "..."}], "covers": [1, 2]}
+    {"node": "1.1", "kind": "definition", "title": "...", "terms": ["..."], "definition": "...", "instance": "...", "explanation": ["...", "..."], "formulas": [], "notation": [], "example": null, "diagram": null, "code": [], "table": null, "checks": [{"question": "...", "answer": "..."}], "covers": [1, 2], "ideas": ["T1"]}
   ]
 }

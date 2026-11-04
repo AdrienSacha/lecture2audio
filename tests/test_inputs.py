@@ -8,7 +8,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 from lecture2audio.assemble import chunk_text
 from lecture2audio.llm import dry_run_handler, extract_json
 from lecture2audio.segment import split_units
-from lecture2audio.sources import detect_language, load_glossary, load_transcript, select_slides
+from lecture2audio.sources import (detect_language, discover_inputs, load_glossary,
+                                   load_transcript, select_slides)
 
 
 def words(n, prefix="w"):
@@ -57,6 +58,41 @@ class Sources(unittest.TestCase):
     def test_language_detection(self):
         self.assertEqual(detect_language("Alors le paquet est envoyé dans le réseau et il passe par une passerelle"), "fr")
         self.assertEqual(detect_language("So the packet is sent into the network and it goes through a gateway"), "en")
+
+
+class Folder(unittest.TestCase):
+    def make(self, tmp, *names):
+        root = pathlib.Path(tmp)
+        for name in names:
+            (root / name).write_bytes(b"x" * (100 if name.endswith((".m4a", ".mp4")) else 10))
+        return root
+
+    def test_a_folder_gives_transcript_slides_and_glossary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make(tmp, "lecture.m4a", "lecture.srt", "slides.pdf", "glossary.txt",
+                             ".DS_Store", "notes.docx")
+            found = discover_inputs(root)
+        self.assertEqual(found["input"].name, "lecture.srt")  # a transcript needs no recognition
+        self.assertEqual(found["slides"].name, "slides.pdf")
+        self.assertEqual(found["glossary"].name, "glossary.txt")
+        self.assertEqual([f.name for f in found["skipped"]], ["lecture.m4a"])
+
+    def test_a_recording_alone_is_the_input_and_markdown_slides_are_recognised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make(tmp, "week3.mp4", "week3-slides.md", "terms.md")
+            found = discover_inputs(root)
+        self.assertEqual(found["input"].name, "week3.mp4")
+        self.assertEqual(found["slides"].name, "week3-slides.md")
+        self.assertEqual(found["glossary"].name, "terms.md")
+
+    def test_pptx_slides_win_over_text_slides_and_an_empty_folder_has_no_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.make(tmp, "talk.txt", "deck.pptx", "slides.txt")
+            found = discover_inputs(root)
+            self.assertEqual(found["input"].name, "talk.txt")
+            self.assertEqual(found["slides"].name, "deck.pptx")
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(discover_inputs(tmp)["input"])
 
 
 class JsonExtraction(unittest.TestCase):

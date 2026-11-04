@@ -630,6 +630,22 @@ def _between(text: str, heading: str) -> str:
     return re.split(r"\n## (?!#)", body, maxsplit=1)[0]
 
 
+def _dry_ideas(transcript: str) -> list[dict]:
+    """One idea per node that has units: the text of its first unit."""
+    ideas, current = [], None
+    for line in transcript.splitlines():
+        heading = re.match(r"^#{3,5} (\d+(?:\.\d+)*) ", line)
+        if line.startswith("#"):
+            current = heading.group(1) if heading else None
+            continue
+        unit = re.match(r"^\[\d+\] (.+)$", line)
+        if unit and current:
+            ideas.append({"id": f"T{len(ideas) + 1}", "kind": "claim", "idea": unit.group(1),
+                          "nodes": [current]})
+            current = None
+    return ideas
+
+
 def _dry_outline(user: str) -> str:
     limit = int(re.search(r"At most (\d+) words per part", user).group(1))
     units = re.findall(r"^\[(\d+)\] (.*)$", _between(user, "UNITS"), flags=re.M)
@@ -696,8 +712,12 @@ def dry_run_handler(system: str, user: str) -> str:
         return _dry_outline(user)
     if "strict reviewer" in system:
         nodes = json.loads(_between(user, "CHECKLIST (JSON)"))["nodes"]
+        ideas = (json.loads(_between(user, "IDEAS (JSON)")) if "## IDEAS (JSON)\n" in user
+                 else [])
         return json.dumps({"points": [{"node": n["node"], "status": "complete", "detail": ""}
-                                      for n in nodes], "issues": []})
+                                      for n in nodes], "issues": [],
+                           "ideas": [{"idea": i["id"], "status": "taught", "detail": ""}
+                                     for i in ideas]})
     if "exact words a voice should say" in system:
         return json.dumps({"blocks": json.loads(user)["blocks"]})
     if "You find the gaps" in system:
@@ -705,7 +725,8 @@ def dry_run_handler(system: str, user: str) -> str:
         slides = sorted({int(n) for n in re.findall(r"^\[Slide (\d+)\]$", user, flags=re.M)})
         return json.dumps({"slide_ideas": [{"id": f"S{n}", "slide": n, "idea": f"slide {n}",
                                             "status": "covered", "nodes": [first]}
-                                           for n in slides], "gaps": []})
+                                           for n in slides], "gaps": [],
+                           "transcript_ideas": _dry_ideas(_between(user, "TRANSCRIPT"))})
     if "You build the termbase" in system:
         return json.dumps({"terms": []})
     if "You research one gap" in system:

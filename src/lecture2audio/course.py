@@ -61,6 +61,7 @@ def validate_cards(data, ctx: dict) -> list[str]:
         return describe(exc)
     nodes, count = ctx["nodes"], ctx["count"]
     terms = {enrich._key(t["term"]) for t in ctx["termbase"]}
+    idea_ids = {str(i["id"]) for i in ctx.get("ideas", [])}
     errors, last = [], -1
     for k, card in enumerate(parsed.cards, 1):
         where = f"cards.{k}"
@@ -79,6 +80,10 @@ def validate_cards(data, ctx: dict) -> list[str]:
             errors.append(f'{where}: a card with "terms" needs a "definition"')
         if any(not 1 <= n <= count for n in card.covers):
             errors.append(f"{where}: sentence numbers in \"covers\" are between 1 and {count}")
+        unknown = [i for i in card.ideas if i not in idea_ids]
+        if unknown:
+            errors.append(f'{where}: "ideas" {unknown} are not in IDEAS TO TEACH; use the ids '
+                          f"{sorted(idea_ids)} or an empty list")
     return errors
 
 
@@ -101,6 +106,14 @@ def card_issues(cards: list[dict], ctx: dict, language: str) -> list[dict]:
         if number not in covered:
             issues.append(_issue("uncovered", f'script sentence {number} is not covered by any '
                                               f'card: "{script[number - 1]["text"][:90]}"'))
+    claimed = {i for c in cards for i in c.get("ideas", [])}
+    for idea in ctx.get("ideas", []):
+        if str(idea["id"]) not in claimed:
+            issues.append(_issue("idea_unassigned", f'the lecture idea {idea["id"]} '
+                                                    f'({idea["kind"]}: {idea["idea"]}) is in no '
+                                                    'card\'s "ideas"; teach it in a card and list '
+                                                    "its id there.", None,
+                                 str(idea["nodes"][0])))
     here = [t for t in ctx["termbase"] if t["define_here"]]
     defined: dict[str, list[int]] = {}
     for k, card in enumerate(cards, 1):
@@ -198,6 +211,12 @@ def validate_judgement(data, count: int, idea_ids=()) -> list[str]:
         if absent:
             errors.append('give {"idea": id, "status": "taught" or "missing"} for every idea '
                           f"of IDEAS; missing {absent}")
+        for item in data.get("ideas", []):
+            numbers = item.get("cards", []) if isinstance(item, dict) else []
+            if not isinstance(numbers, list) or any(
+                    not isinstance(n, int) or not 1 <= n <= count for n in numbers):
+                errors.append(f'idea {item.get("idea") if isinstance(item, dict) else item}: '
+                              f'"cards" lists card numbers between 1 and {count}')
     return errors
 
 
@@ -229,6 +248,9 @@ def reader_text(cards: list[dict]) -> str:
             out += [f"Example, {card['example']['title']}:"] + card["example"]["steps"]
         if card["diagram"]:
             out += [f"Figure: {f['caption']}" for f in card["diagram"]["frames"]]
+        if card.get("table"):
+            out.append("Table: " + " | ".join(card["table"]["columns"]))
+            out += [" | ".join(row) for row in card["table"]["rows"]]
         out.append("")
     return "\n".join(out).strip()
 
@@ -347,12 +369,16 @@ class CoursePipeline:
                                 lambda d: validate_cards(d, ctx), f"course of part {part.id}")
         return [normalise(c) for c in data["cards"]]
 
-    def _judge(self, ctx: dict, record: dict, outline: Outline, cards: list[dict]) -> list[dict]:
+    def _judge(self, ctx: dict, record: dict, outline: Outline,
+               cards: list[dict]) -> tuple[list[dict], list[dict]]:
+        """The issues, and for each idea of the part its status and the numbers of the cards
+        that teach it (the judge's, else the cards that claim the idea)."""
         part = ctx["part"]
         shown = [{"card": k, "title": c["title"], "terms": c["terms"],
                   "definition": c["definition"], "explanation": c["explanation"],
                   "formulas": c["formulas"], "instance": c["instance"], "example": c["example"],
-                  "checks": c["checks"], "covers": c["covers"]} for k, c in enumerate(cards, 1)]
+                  "diagram": c["diagram"], "table": c["table"], "checks": c["checks"],
+                  "covers": c["covers"], "ideas": c["ideas"]} for k, c in enumerate(cards, 1)]
         idea_ids = [i["id"] for i in ctx["ideas"]]
         user = (f"## LANGUAGE\n{self.p.language_name}\n\n## SCRIPT\n"
                 + self._numbered(outline, record) + "\n\n"
@@ -369,14 +395,21 @@ class CoursePipeline:
             if kind and 1 <= item["card"] <= len(cards):
                 issues.append(_issue(kind, str(item.get("detail") or item["status"]),
                                      item["card"], cards[item["card"] - 1]["node"]))
-        by_id = {i["id"]: i for i in ctx["ideas"]}
-        for item in data.get("ideas", []):
-            if item.get("status") == "missing" and item.get("idea") in by_id:
-                idea = by_id[item["idea"]]
+        by_id = {str(i["id"]): i for i in ctx["ideas"]}
+        ideas = []
+        for item in data.get("ideas", []) if idea_ids else []:
+            idea = by_id.get(str(item.get("idea"))) if isinstance(item, dict) else None
+            if idea is None:
+                continue
+            numbers = [n for n in item.get("cards") or [] if 1 <= n <= len(cards)] or \
+                [k for k, c in enumerate(cards, 1) if str(idea["id"]) in c["ideas"]]
+            ideas.append({"idea": idea["id"], "status": item["status"],
+                          "cards": numbers if item["status"] == "taught" else []})
+            if item["status"] == "missing":
                 issues.append(_issue("idea_missing", f'the lecture idea {idea["id"]} ({idea["kind"]}: '
                                                      f'{idea["idea"]}) is not taught in any card.',
                                      None, str(idea["nodes"][0])))
-        return issues
+        return issues, ideas
 
     def _process(self, outline: Outline, part: Node, record: dict) -> dict:
         ctx = self._context(outline, part, record)
@@ -386,10 +419,11 @@ class CoursePipeline:
         for _ in range(self.p.max_retries + 1):
             attempts += 1
             cards = self._write(outline, ctx, record, feedback)
-            issues = card_issues(cards, ctx, language) + self._judge(ctx, record, outline, cards)
+            judged, ideas = self._judge(ctx, record, outline, cards)
+            issues = card_issues(cards, ctx, language) + judged
             count = len([i for i in issues if i["type"] not in SOFT])
             if best is None or count < best["blocking"]:
-                best = {"cards": cards, "issues": issues, "blocking": count}
+                best = {"cards": cards, "issues": issues, "blocking": count, "ideas": ideas}
             if best["blocking"] == 0:
                 break
             more = attempts <= self.p.max_retries
@@ -400,9 +434,11 @@ class CoursePipeline:
         source = " ".join(s["text"] for s in ctx["script"])
         cards = [dict(derive(c, ctx["script"], source, ctx["slides"], language),
                       id=f"{part.id}.{k}") for k, c in enumerate(best["cards"], 1)]
+        # the ledger's view: which card (by id) teaches each idea of the part
+        ideas = [dict(i, cards=[cards[n - 1]["id"] for n in i["cards"]]) for i in best["ideas"]]
         return {"part": part.id, "title": part.title, "cards": cards, "issues": best["issues"],
                 "blocking": best["blocking"], "attempts": attempts,
-                "flagged": best["blocking"] > 0}
+                "flagged": best["blocking"] > 0, "ideas": ideas}
 
     def cold_read(self, parts: list[dict]) -> list[dict]:
         """A reader that knows only the earlier parts looks for loose ends, part by part."""
@@ -463,6 +499,10 @@ def dry_course(user: str) -> str:
     if marker in user:
         termbase = json.loads(user.split(marker, 1)[1].split("\n\n## ", 1)[0])
     owed = [t for t in termbase if t["define_here"]]
+    ideas = []
+    marker = "## IDEAS TO TEACH (JSON)\n"
+    if marker in user:
+        ideas = json.loads(user.split(marker, 1)[1].split("\n\n## ", 1)[0])
     script = user.split("## SCRIPT\n", 1)[1]
     sections, current = [], None
     for line in script.splitlines():
@@ -491,6 +531,10 @@ def dry_course(user: str) -> str:
         cards.append(card)
     for term in owed:  # terms of a part whose sections are empty
         cards[-1]["terms"].append(term["term"])
+    nodes = [c["node"] for c in cards]
+    for idea in ideas if cards else []:  # the card of the idea's node, else the first card
+        place = next((k for k, n in enumerate(nodes) if n in map(str, idea.get("nodes", []))), 0)
+        cards[place].setdefault("ideas", []).append(idea["id"])
     return json.dumps({"cards": cards})
 
 
@@ -498,8 +542,9 @@ def dry_course_check(user: str) -> str:
     cards = json.loads(user.split("## CARDS (JSON)\n", 1)[1])
     ideas = []
     if "## IDEAS (JSON)\n" in user:
-        ideas = [{"idea": i["id"], "status": "taught", "detail": ""} for i in
-                 json.loads(user.split("## IDEAS (JSON)\n", 1)[1].split("\n\n## ", 1)[0])]
+        ideas = [{"idea": i["id"], "status": "taught", "detail": "",
+                  "cards": [c["card"] for c in cards if i["id"] in c.get("ideas", [])]}
+                 for i in json.loads(user.split("## IDEAS (JSON)\n", 1)[1].split("\n\n## ", 1)[0])]
     return json.dumps({"cards": [{"card": c["card"], "status": "faithful", "detail": ""}
                                  for c in cards], "ideas": ideas})
 

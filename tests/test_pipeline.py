@@ -1,6 +1,8 @@
 import contextlib
+import csv
 import io
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
@@ -15,7 +18,7 @@ from lecture2audio.cli import main
 from lecture2audio.llm import FakeLLM, _between, dry_run_handler
 from lecture2audio.outline import parse_outline
 from lecture2audio.pipeline import (TextPipeline, list_sentence, load_prompts, part_blocks,
-                                    unsupported_numbers)
+                                    unsupported_numbers, validate_verify)
 
 UNITS = ["The window holds 64 packets.", "um ok let me drink some water",
          "A timeout is 5 seconds.", "The sender waits for the timeout.",
@@ -67,7 +70,16 @@ def counting_verifier(system, user):
     points = [{"node": n["node"], "detail": "",
                "status": "complete" if said.get(n["node"], 0) >= units.get(n["node"], 0)
                else "incomplete"} for n in nodes]
-    return json.dumps({"points": points, "issues": []})
+    ideas = json.loads(_between(user, "IDEAS (JSON)")) if "## IDEAS (JSON)\n" in user else []
+    return json.dumps({"points": points, "issues": [],
+                       "ideas": [{"idea": i["id"], "status": "taught", "detail": ""}
+                                 for i in ideas]})
+
+
+LEDGER = {"slide_ideas": [], "gaps": [], "transcript_ideas": [
+    {"id": "T1", "kind": "claim", "idea": "the window holds 64 packets", "nodes": ["1.1"]},
+    {"id": "T2", "kind": "condition", "idea": "a timeout is 5 seconds", "nodes": ["1.2"]},
+    {"id": "T3", "kind": "claim", "idea": "each packet is acknowledged", "nodes": ["2"]}]}
 
 
 class Harness:
@@ -94,10 +106,13 @@ class Harness:
     def handle(self, system, user):
         return self.handlers[self.kind(system)](system, user)
 
-    def pipeline(self, work, max_retries=2, workers=1, language="en"):
-        return TextPipeline(pathlib.Path(work), language, self.llm, self.llm,
-                            load_prompts(language), max_retries=max_retries, log=silent,
-                            max_part_words=1000, workers=workers)
+    def pipeline(self, work, max_retries=2, workers=1, language="en", coverage=None):
+        pipeline = TextPipeline(pathlib.Path(work), language, self.llm, self.llm,
+                                load_prompts(language), max_retries=max_retries, log=silent,
+                                max_part_words=1000, workers=workers)
+        if coverage:
+            pipeline.coverage = coverage
+        return pipeline
 
     def prompts(self, kind):
         return [u for s, u in self.llm.calls if self.kind(s) == kind]
@@ -151,6 +166,40 @@ class Gates(unittest.TestCase):
         harness = Harness(verify=verify)
         run_text(harness)
         self.assertIn('"points" must have exactly one entry', harness.prompts("verify")[1])
+
+    def test_verifier_must_check_off_every_idea_of_the_part(self):
+        points = [{"node": "1", "status": "complete"}]
+        data = {"points": points, "issues": []}
+        self.assertEqual(validate_verify(data, ["1"]), [])
+        self.assertTrue(validate_verify(data, ["1"], ["T1"]))
+        data["ideas"] = [{"idea": "T1", "status": "maybe"}]
+        self.assertTrue(validate_verify(data, ["1"], ["T1"]))
+        data["ideas"] = [{"idea": "T1", "status": "taught"}]
+        self.assertEqual(validate_verify(data, ["1"], ["T1"]), [])
+
+    def test_the_verifier_gets_the_ideas_of_its_part_and_records_them(self):
+        harness = Harness()
+        _, records, _ = run_text(harness, coverage=LEDGER)
+        first, second = harness.prompts("verify")[:2]
+        self.assertIn("## IDEAS (JSON)", first)
+        self.assertIn("T1", first)
+        self.assertNotIn("T3", first)
+        self.assertIn("T3", second)
+        self.assertEqual([i["idea"] for i in records[0]["ideas"]], ["T1", "T2"])
+        self.assertEqual(records[1]["ideas"][0]["status"], "taught")
+
+    def test_an_idea_the_verifier_calls_missing_triggers_a_rewrite(self):
+        def verify(system, user):
+            data = json.loads(counting_verifier(system, user))
+            if len(harness.prompts("verify")) == 1:
+                data["ideas"][0].update(status="missing", detail="the 64 is gone")
+            return json.dumps(data)
+
+        harness = Harness(verify=verify)
+        _, records, _ = run_text(harness, coverage=LEDGER)
+        self.assertEqual(records[0]["attempts"], 2)
+        self.assertIn("idea_missing", harness.prompts("rewrite")[1])
+        self.assertIn("T1", harness.prompts("rewrite")[1])
 
     def test_number_check(self):
         script = [{"origin": "lecture", "text": "The window is 64 KB and the timeout is 5 seconds."},
@@ -327,6 +376,13 @@ class EndToEnd(unittest.TestCase):
                   "of 1 or more, and the protocol adds the costs along a path.\n\n"
                   "The cheapest path wins. If two paths cost the same, the router may use both.")
 
+    def setUp(self):
+        # never write into the user's real vault, never open Obsidian
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("L2A_VAULT_DIR", None)
+
     def run_cli(self, *args):
         with contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit) as raised:
@@ -352,7 +408,7 @@ class EndToEnd(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             work = self.build(tmp)
             for name in ("script.md", "index.md", "questions.md", "reference.md", "report.md",
-                         "lecture.m4a", "transcript.txt", "outline.json"):
+                         "lecture.m4a", "transcript.txt", "outline.json", "ideas.csv"):
                 self.assertTrue((work / name).exists(), name)
             outline = json.loads((work / "outline.json").read_text())
             parts = len(outline["parts"])
@@ -363,6 +419,62 @@ class EndToEnd(unittest.TestCase):
                 info = self.probe(work / "lecture.m4a")
                 self.assertEqual(len(info["chapters"]), 2 * parts + points)
                 self.assertGreater(float(info["format"]["duration"]), 5)
+
+    def test_the_idea_ledger_follows_every_idea_to_a_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = self.build(tmp, "--export-anki")
+            with open(work / "ideas.csv", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(list(rows[0]), ["idea_id", "node_id", "kind", "statement",
+                                             "source_units", "covered_in_card", "status"])
+            self.assertTrue(rows)
+            self.assertEqual({r["status"] for r in rows}, {"verified"})
+            self.assertTrue(all(r["covered_in_card"] and r["source_units"] for r in rows))
+            self.assertIn("## Idea ledger (ideas.csv)", (work / "report.md").read_text())
+            anki = (work / "anki.csv").read_text(encoding="utf-8")
+            self.assertTrue(anki.startswith("#separator:Comma\n"))
+            self.assertIn("#columns:Front,Back,Tags", anki)
+            self.assertIn("lecture::idea-T1", anki)
+
+    def test_the_vault_embeds_the_audio_and_reads_as_one_chapter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = self.build(tmp)
+            vault = work / "vault"
+            self.assertTrue((vault / "audio" / "lecture.m4a").exists())
+            self.assertTrue((vault / "audio" / "lecture – 01.m4a").exists())
+            index = (vault / "lecture – Index.md").read_text(encoding="utf-8")
+            self.assertIn("![[audio/lecture.m4a]]", index)
+            self.assertIn("[[lecture – Full Lecture]]", index)
+            part = next(vault.glob("lecture – 01 *.md")).read_text(encoding="utf-8")
+            self.assertIn("![[audio/lecture – 01.m4a]]", part)
+            book = (vault / "lecture – Full Lecture.md").read_text(encoding="utf-8")
+            self.assertIn("![[lecture – 01 ", book)
+            self.assertIn("![[lecture – 02 ", book)
+
+    def test_a_folder_without_a_command_is_built(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp) / "Week 3"
+            folder.mkdir()
+            (folder / "transcript.txt").write_text(self.TRANSCRIPT, encoding="utf-8")
+            (folder / "glossary.txt").write_text("router\nrouting protocol\n", encoding="utf-8")
+            out = pathlib.Path(tmp) / "out"
+            code = self.run_cli(str(folder), "--llm", "dry", "--tts", "fake", "--out", str(out),
+                                "--language", "en", "--max-part-words", "25", "--quiz-pause", "1",
+                                "--no-open-obsidian")
+            self.assertEqual(code, 0)
+            self.assertTrue((out / "week-3" / "week-3.m4a").exists())
+            self.assertTrue((out / "week-3" / "vault" / "week-3 – Index.md").exists())
+
+    def test_no_course_writes_no_vault(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = pathlib.Path(tmp) / "lecture.txt"
+            source.write_text(self.TRANSCRIPT, encoding="utf-8")
+            out = pathlib.Path(tmp) / "out"
+            code = self.run_cli("text", str(source), "--llm", "dry", "--out", str(out),
+                                "--language", "en", "--no-course")
+            self.assertEqual(code, 0)
+            self.assertFalse((out / "lecture" / "vault").exists())
+            self.assertTrue((out / "lecture" / "ideas.csv").exists())
 
     def test_no_quiz_gives_a_shorter_audio(self):
         if not shutil.which("ffprobe"):

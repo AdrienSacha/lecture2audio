@@ -254,6 +254,18 @@ Zhang's study supports these choices. It also shows that counting blocking probl
 
 ---
 
+### 2.16 One idea ledger, Obsidian as the only interface (decision of November 2026)
+
+**Decision.** The user removed the browser interface (`gui.py`, `start.py`): the program is a command line that takes one folder, and Obsidian is the only place where the results are read, browsed as a graph and reviewed. The course material is on by default, and each part note embeds its own recording, so reading and listening happen in the same note.
+
+**The idea ledger.** The atomic ideas that the gap search lists (`transcript_ideas`) are written to `ideas.csv` and checked off twice: by the verifier against the script (`prompts/verify.md`, field `ideas`) and by the course judge against the cards (`prompts/course_check.md`, with the cards that teach each idea). The cards also claim their ideas (`Card.ideas`), and code refuses a set of cards in which an idea of the part is claimed by no card before any judge reads them, in line with section 2.4. This turns completeness, which section 2.12 shows a judge often misses when it is asked as one criterion among many (section 2.14), into a checklist that the model must answer item by item and that code counts. The ledger is rebuilt from the cached stage results on every run, so it cannot drift from them.
+
+**Figures.** A frame is either Mermaid or an ASCII box drawing (`course_schema.Frame`). Rules 11 to 16 of `docs/learning-science.md` set when a figure is required (structure, state, protocol, layout, change over time), that each frame shows one change and the full state, that the change is signalled (`classDef active`), and that a figure has at most eight frames. ASCII is used where exact positions matter (bit fields, stack layouts), since Mermaid cannot place cells at fixed offsets. The course judge now reads figures and tables as well as text.
+
+**Scaffolds.** Prerequisite reminders are a collapsed callout (rule 21, expertise reversal); definitions, instances, worked examples and figures stay open (rule 35); answers stay collapsed (rule 20).
+
+**What is not done.** The ideas still come from one call over the whole lecture. Building the list part by part, which would remove the output limit as a cause of loss on six-hour lectures, is idea 12 of section 4.
+
 ## 3. The CLAUDE.md file
 
 **Source.** Anthropic's Claude Code documentation (pages "Best practices for Claude Code" and "How Claude remembers your project", 2026):
@@ -284,6 +296,7 @@ Each idea comes with the source that suggests it and the reason it is not built.
 9. **Recording what each repair broke** (Zhang, September 2026; Wu et al., July 2026). For each repair, compare the issues of the new attempt with those of the best attempt, and record in `report.md` how many were fixed and how many were new. Across several lectures, this would show whether repairs cause net harm and whether the default of two repairs is right. It would touch `_process` in `pipeline.py` and `write_report` in `report.py`. Not built because it needs real runs to be useful.
 10. **An estimate of listening effort** (Hoffner et al., 2026; Ramonda et al., 2026). The round-trip check (`roundtrip.py`, `--roundtrip`) compares what the voice was given with what speech recognition hears. It shows that the words were pronounced, but Ramonda and colleagues found that recognition errors are almost unrelated to how hard a text is for people, so it says nothing about how easy the audio is to follow. Hoffner and colleagues predicted listeners' ratings of effort and intelligibility for synthetic speech with a correlation above 0.88. A model of this kind could flag chunks that are hard to listen to. It would touch `roundtrip.py` and `cli.py`, as an optional package imported inside the function. Not built because I have not confirmed that either model is available as an installable package.
 11. **Spoken emphasis on key terms** (Chen et al., 2026). Ask the voice to stress the name of each point and each newly defined term. Low priority: the only study found measured intention to engage, not learning, and only `OpenAITTS` in `tts.py` accepts instructions about delivery.
+12. **Ideas listed part by part.** The atomic ideas of `ideas.csv` come from the single gap-search call over the whole lecture, whose output limit can cut the list short on a six-hour lecture; `report.md` then names the parts with no idea. Listing the ideas in one call per part (in parallel, like the rewrite) would remove that cause of loss. It would touch `run_coverage` in `pipeline.py`, `prompts/coverage.md`, `validate_coverage` in `enrich.py`, `dry_run_handler`, `ledger.seed` and the tests. Not built yet because the gap search also needs the whole lecture to find terms used before they are defined.
 
 ---
 

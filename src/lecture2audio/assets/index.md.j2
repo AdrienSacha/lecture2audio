@@ -4,6 +4,14 @@ tags: [course, lecture]
 ---
 # {{ title }}
 
+{% if full_audio_file %}
+![[audio/{{ full_audio_file }}]]
+
+{% endif %}
+{% if book_note %}
+{{ labels.read_all }}: [[{{ book_note }}]]
+
+{% endif %}
 ## {{ labels.parts }}
 
 {% for part in parts %}

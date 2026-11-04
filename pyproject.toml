@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 pdf = ["pypdf"]
+pptx = ["python-pptx>=1.0.2"]  # PowerPoint slides
 voice = ["mlx-audio>=0.6.2"]  # Ming-3.0-tts on Apple chips
 whisper-mac = ["mlx-whisper"]
 whisper = ["faster-whisper"]

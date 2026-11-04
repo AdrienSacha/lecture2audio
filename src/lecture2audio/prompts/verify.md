@@ -10,6 +10,7 @@ You are a strict reviewer. A script written to be listened to was made from one 
 - SLIDES (optional) and GLOSSARY (optional): additional sources.
 - SUPPLEMENTS (optional): facts from outside the lecture, each with the passage of the page that supports it.
 - TERMBASE (optional): the definition of each term this part uses.
+- IDEAS (optional, JSON): the atomic ideas the teacher taught in this part, from the lecture's idea ledger, each with an id (T1, T2, ...), a kind, the idea and its nodes.
 
 # What to check, in this order
 
@@ -20,6 +21,7 @@ You are a strict reviewer. A script written to be listened to was made from one 
 4a. External sentences. A sentence tagged "external" must say what its supplement says, and nothing more; otherwise it is "unsupported". A supplement that the script never teaches is "missing" (give its id in "detail"). If a passage of external sentences starts without any phrase telling the listener it goes beyond the lecture, or if the same marker phrase is repeated, report "marker".
 5. Definitions. For each technical term the script uses, check that it is defined at its first use in this part (or in an earlier part, per the TERMBASE), with what it is for and an example, that the definition matches the TERMBASE, and that no sentence relies on a notion the listener has not heard defined. Type "definition". A wrong spelling of a glossary term is "term".
 6. Recap and questions. A recap sentence that states something absent from the script is "recap". A question that cannot be answered from this part, or an answer that is wrong or incomplete, is "question".
+1a. Ideas. When IDEAS is given, check off every idea against the SCRIPT. An idea is "taught" when the script states it with its conditions, qualifications and numbers, in a section of one of its nodes. A passing mention, or a statement that loses a condition or a number, is "missing"; say in "detail" what is absent. Judge only the share of an idea that belongs to the nodes of this CHECKLIST. Give one entry per idea, no more and no less.
 7. Listening. A sentence that refers to a board, a slide, "above" or "below" is "deictic". A sentence over about 35 words is "long". Filler, or a comment about the script itself, is "filler".
 
 Everything else passes. Do not flag matters of taste.
@@ -30,7 +32,8 @@ Return one JSON object and nothing else:
 
 {
   "points": [{"node": "1", "status": "complete", "detail": ""}, {"node": "1.1", "status": "incomplete", "detail": "Unit 14 says the value is printed with *p; the section never says how the value is read."}],
-  "issues": [{"type": "missing|wrong|unsupported|added_fact|definition|term|recap|question|marker|deictic|long|filler", "sentence": 3, "unit": null, "detail": "One precise sentence: what is wrong, and what the source says."}]
+  "issues": [{"type": "missing|wrong|unsupported|added_fact|definition|term|recap|question|marker|deictic|long|filler", "sentence": 3, "unit": null, "detail": "One precise sentence: what is wrong, and what the source says."}],
+  "ideas": [{"idea": "T1", "status": "taught", "detail": ""}, {"idea": "T2", "status": "missing", "detail": "The script never states that the timeout is 5 seconds."}]
 }
 
-"sentence" is the sentence number from the SCRIPT or null. "unit" is a unit number from the transcript or null. Do not repeat in "issues" what a node's status already reports.
+"sentence" is the sentence number from the SCRIPT or null. "unit" is a unit number from the transcript or null. Do not repeat in "issues" what a node's status already reports. "ideas" is an empty list when IDEAS is not given; do not repeat a missing idea in "issues".

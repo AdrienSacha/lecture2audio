@@ -1,4 +1,5 @@
-"""Reading the inputs: transcript, glossary, slides; language detection."""
+"""Reading the inputs: transcript, glossary, slides (PDF, PowerPoint, text), a folder that
+holds them; language detection."""
 from __future__ import annotations
 
 import math
@@ -6,11 +7,57 @@ import re
 from pathlib import Path
 
 AUDIO_EXT = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".webm", ".mp4", ".mov", ".mkv", ".aac"}
+TRANSCRIPT_EXT = (".srt", ".vtt", ".txt", ".md")  # in order of preference
+SLIDE_EXT = (".pdf", ".pptx", ".md", ".txt")  # in order of preference
+_GLOSSARY_NAME = re.compile(r"gloss|lexi|terms?\b|termin|vocab", re.I)
+_SLIDE_NAME = re.compile(r"slide|diapo|deck|present|cours[-_ ]?notes|handout", re.I)
+_TRANSCRIPT_NAME = re.compile(r"transcri|caption|subtit|sous[-_ ]?titre", re.I)
 
 
 def slugify(name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower()
     return slug or "lecture"
+
+
+def discover_inputs(folder: str | Path) -> dict:
+    """The inputs of a lecture found in one folder, by extension and name, so that
+    `lecture2audio ./course_folder/` needs no flag:
+
+    - glossary: a .txt, .md or .csv file whose name says glossary, terms, lexique, vocabulary;
+    - slides: a .pdf or .pptx file, or a .md/.txt file whose name says slides, deck, diapo;
+    - transcript: a .srt, .vtt, .txt or .md file (a name saying transcript wins, then the
+      largest); it is preferred to a recording, because it needs no speech recognition;
+    - recording: else the largest audio or video file (.m4a .mp3 .wav .mp4 ...).
+
+    Returns {"input", "slides", "glossary", "skipped"}: paths or None, and the candidates that
+    were not chosen, so the caller can say which file it used."""
+    root = Path(folder)
+    files = sorted(f for f in root.iterdir() if f.is_file() and not f.name.startswith((".", "~$")))
+    suffix = {f: f.suffix.lower() for f in files}
+    glossary = [f for f in files if suffix[f] in (".txt", ".md", ".csv")
+                and _GLOSSARY_NAME.search(f.stem)]
+    rest = [f for f in files if f not in glossary]
+    slides = [f for f in rest if suffix[f] in (".pdf", ".pptx")
+              or (suffix[f] in (".md", ".txt") and _SLIDE_NAME.search(f.stem))]
+    rest = [f for f in rest if f not in slides]
+    transcripts = [f for f in rest if suffix[f] in TRANSCRIPT_EXT]
+    audio = [f for f in rest if suffix[f] in AUDIO_EXT]
+
+    def best(candidates, order):
+        return sorted(candidates, key=lambda f: (order.index(suffix[f]) if suffix[f] in order
+                                                 else len(order),
+                                                 not _TRANSCRIPT_NAME.search(f.stem),
+                                                 -f.stat().st_size))
+
+    transcripts = best(transcripts, list(TRANSCRIPT_EXT))
+    audio = sorted(audio, key=lambda f: -f.stat().st_size)
+    slides = best(slides, list(SLIDE_EXT))
+    chosen = (transcripts or audio or [None])[0]
+    found = {"input": chosen, "slides": slides[0] if slides else None,
+             "glossary": glossary[0] if glossary else None}
+    found["skipped"] = [f for f in transcripts + audio + slides + glossary
+                        if f not in found.values()]
+    return found
 
 
 def _strip_subtitles(raw: str) -> str:
@@ -39,10 +86,27 @@ def load_glossary(path: str | Path | None) -> str:
 
 
 def load_slides(path: str | Path | None) -> list[str]:
-    """One string per slide. PDF needs pypdf; text/markdown files use '---' lines or form feeds."""
+    """One string per slide. PDF needs pypdf, PowerPoint needs python-pptx; text/markdown
+    files use '---' lines or form feeds."""
     if not path:
         return []
     p = Path(path)
+    if p.suffix.lower() == ".pptx":
+        try:
+            from pptx import Presentation
+        except ImportError as exc:
+            raise SystemExit("Reading a .pptx needs python-pptx (uv pip install "
+                             "'python-pptx>=1.0.2'), or export the slides as PDF.") from exc
+        slides = []
+        for slide in Presentation(str(p)).slides:
+            texts = [shape.text_frame.text.strip() for shape in slide.shapes
+                     if shape.has_text_frame and shape.text_frame.text.strip()]
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
+                notes = slide.notes_slide.notes_text_frame.text.strip()
+                if notes:
+                    texts.append(notes)
+            slides.append("\n".join(texts))
+        return slides
     if p.suffix.lower() == ".pdf":
         try:
             from pypdf import PdfReader

@@ -136,7 +136,26 @@ def validate_part(data, shape: dict) -> list[str]:
     return errors
 
 
-def validate_verify(data, node_ids: list[str]) -> list[str]:
+IDEA_STATUSES = ("taught", "missing")
+
+
+def validate_ideas(data, idea_ids) -> list[str]:
+    """One status, taught or missing, for every idea of IDEAS (the ledger's checklist)."""
+    if not idea_ids:
+        return []
+    items = data.get("ideas") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return ['give "ideas": [{"idea": id, "status": "taught" or "missing", "detail": "..."}] '
+                f"for every idea of IDEAS: {list(idea_ids)}"]
+    given = {str(i.get("idea")): i.get("status") for i in items if isinstance(i, dict)}
+    absent = [i for i in idea_ids if given.get(str(i)) not in IDEA_STATUSES]
+    if absent:
+        return ['give {"idea": id, "status": "taught" or "missing"} for every idea of IDEAS; '
+                f"missing {absent}"]
+    return []
+
+
+def validate_verify(data, node_ids: list[str], idea_ids=()) -> list[str]:
     """A verdict without one status per node is a superficial check: ask again."""
     if not isinstance(data, dict) or not isinstance(data.get("points"), list) \
             or not isinstance(data.get("issues"), list):
@@ -151,7 +170,7 @@ def validate_verify(data, node_ids: list[str]) -> list[str]:
     for k, item in enumerate(data["issues"], 1):
         if not isinstance(item, dict) or not item.get("type") or not item.get("detail"):
             return [f'issue {k} must have "type" and "detail"']
-    return []
+    return validate_ideas(data, idea_ids)
 
 
 def validate_spoken(data, count: int) -> list[str]:
@@ -612,13 +631,15 @@ class TextPipeline:
                                  "depends_on": term["depends_on"],
                                  "confusable": term["confusable"], "define_here": here})
         shape = dict(structure(part), sources=[s["id"] for s in supplements])
+        ideas = [i for i in self.coverage.get("transcript_ideas", [])
+                 if any(str(n) in nodes for n in i.get("nodes", []))]
         return {"part": part, "noise": noise, "source": source, "slides": slides,
                 "transcript": render_part_transcript(outline, part, noise),
                 "shape": shape, "checklist": checklist(part),
                 "terms_before": sorted(set(terms_before) | {t["term"] for t in self.terms
                                                             if t["part"] < int(part.id)}),
                 "terms_here": terms_here, "termbase": termbase, "supplements": supplements,
-                "sources_text": sources}
+                "sources_text": sources, "ideas": ideas}
 
     def _supplements_json(self, ctx: dict, quotes: bool) -> str:
         keys = ("id", "node", "text") + (("quote", "url") if quotes else ())
@@ -645,9 +666,11 @@ class TextPipeline:
         data.setdefault("reference", [])
         return data
 
-    def _verify(self, outline: Outline, ctx: dict, result: dict) -> list[dict]:
+    def _verify(self, outline: Outline, ctx: dict, result: dict) -> tuple[list[dict], list[dict]]:
+        """The issues, and the status of each idea of the ledger that this part teaches."""
         part = ctx["part"]
         ids = [c["node"] for c in ctx["checklist"]]
+        idea_ids = [i["id"] for i in ctx.get("ideas", [])]
         user = (f"## LANGUAGE\n{self.language_name}\n\n"
                 + _section("GLOSSARY", self.glossary) + _section("SLIDES", ctx["slides"])
                 + _section("SUPPLEMENTS", self._supplements_json(ctx, quotes=True))
@@ -657,9 +680,13 @@ class TextPipeline:
                 + "## TRANSCRIPT OF THIS PART\n" + ctx["transcript"] + "\n\n"
                 + "## CHECKLIST (JSON)\n" + json.dumps({"nodes": ctx["checklist"]},
                                                        ensure_ascii=False) + "\n\n"
+                + _section("IDEAS (JSON)", json.dumps(
+                    [{k: i[k] for k in ("id", "kind", "idea", "nodes")} for i in ctx["ideas"]],
+                    ensure_ascii=False, indent=1) if idea_ids else "")
                 + "## SCRIPT\n" + render_script(outline, part, result, self.language))
         data = self._ask_json(self.verify_llm, self.prompts.verify, user,
-                              lambda d: validate_verify(d, ids), f"verification of part {part.id}")
+                              lambda d: validate_verify(d, ids, idea_ids),
+                              f"verification of part {part.id}")
         issues = []
         for point in data["points"]:
             if point["status"] != "complete":
@@ -671,7 +698,20 @@ class TextPipeline:
             issues.append({"type": str(item["type"]), "detail": str(item["detail"]), "node": None,
                            "sentence": sentence if isinstance(sentence, int) else None,
                            "unit": unit if isinstance(unit, int) else None})
-        return issues
+        ideas, by_id = [], {str(i["id"]): i for i in ctx.get("ideas", [])}
+        for item in data.get("ideas", []) if idea_ids else []:
+            idea = by_id.get(str(item.get("idea"))) if isinstance(item, dict) else None
+            if idea is None:
+                continue
+            ideas.append({"idea": idea["id"], "status": item["status"],
+                          "detail": str(item.get("detail") or "")})
+            if item["status"] == "missing":
+                issues.append({"type": "idea_missing", "node": str(idea["nodes"][0]),
+                               "sentence": None, "unit": None,
+                               "detail": (f'The lecture idea {idea["id"]} ({idea["kind"]}: '
+                                          f'{idea["idea"]}) is not in the script. '
+                                          + str(item.get("detail") or "")).strip()})
+        return issues, ideas
 
     def _code_issues(self, ctx: dict, result: dict) -> list[dict]:
         script = sentences_of(result)
@@ -740,13 +780,14 @@ class TextPipeline:
             attempts += 1
             result = self._rewrite(outline, ctx, feedback)
             issues = self._code_issues(ctx, result)
-            issues += self._verify(outline, ctx, result)
+            found, ideas = self._verify(outline, ctx, result)
+            issues += found
             issues += self._check_terms(outline, ctx, result)
             count = len(blocking(issues))
             # A repair can damage a script that was better: keep the best attempt so far
             # and replace it only by a strictly better one.
             if best is None or count < best["blocking"]:
-                best = {"result": result, "issues": issues, "blocking": count}
+                best = {"result": result, "issues": issues, "blocking": count, "ideas": ideas}
             if best["blocking"] == 0:
                 break
             more = attempts <= self.max_retries
@@ -762,7 +803,7 @@ class TextPipeline:
                 "reference": result["reference"], "issues": best["issues"],
                 "blocking": best["blocking"], "attempts": attempts,
                 "flagged": best["blocking"] > 0, "moves": moves(part),
-                "supplements": ctx["supplements"]}
+                "supplements": ctx["supplements"], "ideas": best["ideas"]}
 
     def run_parts(self, outline: Outline) -> list[dict]:
         directory = self._dir("rewrite")
@@ -804,8 +845,8 @@ class TextPipeline:
                                              for s in record["sections"]])
             self.log(f"[audit] removing {removed} sentences from node {target['node']} "
                      "to test the verifier")
-            issues = self._verify(outline, self._context(outline, part), mutated)
-            caught = any(i["type"] in ("missing", "misplaced") for i in issues)
+            issues, _ = self._verify(outline, self._context(outline, part), mutated)
+            caught = any(i["type"] in ("missing", "misplaced", "idea_missing") for i in issues)
             result = {"part": part.id, "node": target["node"],
                       "title": outline.node(target["node"]).title, "removed": removed,
                       "caught": caught}

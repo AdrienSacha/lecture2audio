@@ -12,7 +12,7 @@ from lecture2audio import course
 from lecture2audio.course import (CoursePipeline, build_review, card_issues, dry_course,
                                   dry_course_check, normalise, validate_cards)
 from lecture2audio.course_render import clean, link_terms, merge_terms, quote, write_vault
-from lecture2audio.course_schema import Cards, Diagram
+from lecture2audio.course_schema import Cards, Diagram, Frame
 from lecture2audio.llm import FakeLLM, dry_run_handler
 from lecture2audio.pipeline import TextPipeline, load_prompts, sentences_of
 from test_pipeline import UNITS, Harness, silent
@@ -48,6 +48,23 @@ FRAMES = {"title": "Search", "frames": [
 class Figures(unittest.TestCase):
     def test_a_diagram_is_a_list_of_mermaid_frames(self):
         self.assertEqual(Diagram.model_validate(FRAMES).frames[0].caption, "Start.")
+
+    def test_a_frame_is_either_mermaid_or_ascii(self):
+        drawing = "   0      8     16\n  ┌──────┬──────┐\n  │ src  │ dst  │ ◄── <port>\n  └──────┴──────┘"
+        frame = Frame.model_validate({"caption": "The header.", "ascii": "\n" + drawing + "\n\n"})
+        self.assertEqual(frame.ascii, drawing)  # leading spaces kept, blank lines dropped
+        self.assertEqual(frame.mermaid, "")
+        for bad in ({"caption": "c"},
+                    {"caption": "c", "mermaid": "graph LR\n A-->B", "ascii": "┌─┐"},
+                    {"caption": "c", "ascii": "```\n┌─┐\n```"},
+                    {"caption": "c", "ascii": "┌─┐ <b>bold</b>"},
+                    {"caption": "c", "ascii": "a &nbsp; b"},
+                    {"caption": "c", "mermaid": "```mermaid\ngraph LR\n A-->B\n```"}):
+            with self.assertRaises(Exception, msg=str(bad)):
+                Frame.model_validate(bad)
+        self.assertEqual(Frame.model_validate({"caption": "c", "mermaid": "stateDiagram-v2\n"
+                                               "  [*] --> Open:::active\n  classDef active "
+                                               "fill:#ffe08a", "ascii": ""}).ascii, "")
 
     def test_frames_must_be_mermaid_without_scripts_links_or_html(self):
         for bad in ("plot this", "graph LR\n  A --> B\n  click A callback", "graph TD\n A-->B\n"
@@ -310,6 +327,51 @@ class Ideas(unittest.TestCase):
         self.assertTrue(course.validate_judgement(data, 1, ["T1"]))
         data["ideas"] = [{"idea": "T1", "status": "taught"}]
         self.assertEqual(course.validate_judgement(data, 1, ["T1"]), [])
+        data["ideas"] = [{"idea": "T1", "status": "taught", "cards": [1]}]
+        self.assertEqual(course.validate_judgement(data, 1, ["T1"]), [])
+        data["ideas"] = [{"idea": "T1", "status": "taught", "cards": [2]}]
+        self.assertTrue(course.validate_judgement(data, 1, ["T1"]))
+
+    def test_each_idea_is_linked_to_the_card_that_teaches_it(self):
+        outline, records, result, calls, tmp = stage(coverage=IDEAS)
+        self.addCleanup(tmp.cleanup)
+        ideas = {i["idea"]: i for i in result["parts"][0]["ideas"]}
+        self.assertEqual(ideas["T1"]["status"], "taught")
+        card = next(c for c in result["parts"][0]["cards"] if "T1" in c["ideas"])
+        self.assertEqual(ideas["T1"]["cards"], [card["id"]])
+        self.assertEqual(card["node"], "1.1")
+
+    def test_an_idea_no_card_claims_is_refused_by_code(self):
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            if n == 1:
+                for c in data["cards"]:
+                    c["ideas"] = []
+            return json.dumps(data)
+        outline, records, result, calls, tmp = stage(writer=writer, coverage=IDEAS)
+        self.addCleanup(tmp.cleanup)
+        self.assertEqual(result["parts"][0]["attempts"], 2)
+        self.assertIn("idea_unassigned", calls["write"][1])
+
+    def test_a_card_may_only_claim_ideas_of_its_part(self):
+        c = ctx()
+        c["ideas"] = IDEAS["transcript_ideas"][:1]
+        good = {"cards": [dict(card(), ideas=["T1"])]}
+        self.assertEqual(validate_cards(good, c), [])
+        bad = {"cards": [dict(card(), ideas=["T9"])]}
+        self.assertTrue(any("T9" in e for e in validate_cards(bad, c)))
+
+    def test_the_judge_sees_figures_and_tables(self):
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            data["cards"][0]["diagram"] = FRAMES
+            data["cards"][0]["table"] = {"columns": ["a", "b"], "rows": [["1", "2"]]}
+            return json.dumps(data)
+        outline, records, result, calls, tmp = stage(writer=writer)
+        self.addCleanup(tmp.cleanup)
+        shown = json.loads(calls["judge"][0].split("## CARDS (JSON)\n", 1)[1])
+        self.assertEqual(shown[0]["diagram"]["frames"][1]["mermaid"], FRAMES["frames"][1]["mermaid"])
+        self.assertEqual(shown[0]["table"]["rows"], [["1", "2"]])
 
     def test_the_gap_search_accepts_and_checks_transcript_ideas(self):
         from lecture2audio import enrich
@@ -446,15 +508,33 @@ class Vault(unittest.TestCase):
         self.assertEqual(out.count("[["), 1)
         self.assertTrue(out.endswith("but [[window]] is."))
 
-    def test_figures_become_numbered_mermaid_frames(self):
+    def test_figures_become_numbered_frames_in_callouts(self):
         def writer(user, n):
             data = json.loads(dry_course(user))
-            data["cards"][0]["diagram"] = FRAMES
+            data["cards"][0]["diagram"] = dict(FRAMES, frames=FRAMES["frames"] + [
+                {"caption": "The stack.", "ascii": "┌─────┐\n│ ret │ ◄── sp\n└─────┘"}])
             return json.dumps(data)
         folder, stats, _ = self.write(writer)
         part = next(folder.glob("flow – 01 *.md")).read_text()
-        self.assertEqual(part.count("```mermaid"), 2)
-        self.assertIn("*Figure, step 2 / 2.* Visit A.", part)
+        self.assertEqual(part.count("> ```mermaid"), 2)
+        self.assertEqual(part.count("> ```text"), 1)
+        self.assertIn("> [!figure] Figure, step 2 / 3\n> Visit A.", part)
+        self.assertIn("> │ ret │ ◄── sp", part)
+
+    def test_prerequisites_are_a_collapsed_callout(self):
+        folder, _, _ = self.write()
+        later = next(folder.glob("flow – 02 *.md")).read_text()
+        if "[!info]-" in later:
+            self.assertIn("> [!info]- Prerequisites\n> [[window]]", later)
+        for note in folder.glob("flow – 0*.md"):
+            self.assertNotIn("**Prerequisites:**", note.read_text())
+
+    def test_a_full_lecture_note_transcludes_every_part(self):
+        folder, _, _ = self.write()
+        book = (folder / "flow – Full Lecture.md").read_text()
+        self.assertEqual(len(re.findall(r"^!\[\[flow – \d\d ", book, flags=re.M)), 2)
+        self.assertIn("[[flow – Full Lecture]]", (folder / "flow – Index.md").read_text())
+        self.assertNotIn("![[audio/", book)  # no recording was made
 
     def test_names_and_callouts_are_safe(self):
         self.assertEqual(clean('a/b: c#d [e]|f'), "a b c d e f")
