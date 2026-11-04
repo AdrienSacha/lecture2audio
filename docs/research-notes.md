@@ -304,6 +304,16 @@ The owner asked whether "graph engineering", the 2026 name for designing an agen
 
 **Not adopted.** Graphs synthesised by a controller model for each query (Tieu et al., 2026) coordinate several agents that talk to one another; this task is sequential and section 2.2 found no gain from such agents. A graph database as a knowledge layer (Neo4j context graphs, 2026) suits thousands of linked records; a lecture has hundreds of ideas, which `ideas.csv`, `termbase.json` and the links of the vault already hold. LEDGER (2026) separates the links of a claim-to-evidence graph that code establishes from those a model infers; the idea ledger already makes that separation (citations are checked by code, verdicts by judges, and a disagreement is `disputed`).
 
+### 2.19 Repair loops, revisited (November 2026)
+
+Three papers from October and November 2026 test the repair loop of `_process` more directly than section 2.6.
+
+- **Showing the failed attempt invites copying.** Li and Li (2026) separated the parts of a repair prompt in Lean theorem proving. Showing the model its own failed proof lowered success and sharply increased verbatim copying of it, while the error message alone recovered part of the loss. No repair condition beat a fresh attempt from a well-written instruction at an equal budget.
+- **Repair should be pointed and bounded.** Guo et al. (2026) repair a draft only where a check points, and only as far as the check requires. Over all settings this recovered 14.6% of missed requirements while damaging 2.1% of correct ones; a generic check-and-revise pass recovered 8.1% and damaged 6.7%. In their ablation, letting the repair rewrite the whole answer instead of the pointed span lowered the score from 35.6 to 27.4, and removing the pointer lowered it to 28.9.
+- **A verifier that is searched against can be fooled over the rounds.** Hegazy, Jordan and Dieuleveut (2026) show that false acceptances accumulate when a generator adapts to a cheap verifier. Their stopping rule bounds the share of false acceptances, but it needs labelled past runs.
+
+**What it means for the build.** The best-attempt rule, the cap of two repairs and the planted audits remain right. One weakness remains: a repair rewrites the whole part from the best script and its issues, so sections that passed are exposed to damage that the count of blocking problems may not reveal (Zhang, 2026, section 2.6), and the model is shown its own failed text. Idea 17 would bound the repair. The calibrated stopping rule joins idea 13: both need labelled lectures.
+
 ## 3. The CLAUDE.md file
 
 **Source.** Anthropic's Claude Code documentation (pages "Best practices for Claude Code" and "How Claude remembers your project", 2026):
@@ -339,6 +349,7 @@ Each idea comes with the source that suggests it and the reason it is not built.
 14. **Terminology repair of transcripts** (Zhu et al., 2026). With the whole transcript, the glossary and the slides as context, propose minimal corrections of misrecognised terms, accept only those whose new term occurs in the glossary, the slides or elsewhere in the transcript, and log every edit. It would touch `cli._transcript`, a new prompt and gate, and the tests.
 15. **Harness lessons from real runs** (Wei et al., 2026). After each real lecture, collect the blocking issues and failed audits of `report.md` into a short list of lessons that a person reviews before any prompt changes. Only grounded signals (code gates, audits) would count, because guidance from the model's own judgement lowered results in that study. Not built: no real runs yet.
 16. **A trace of each part's attempts** (Cho et al., 2026). Record, for every part, the sequence of gates, verdicts and repairs, so that parts which cycle through the same failure can be counted across lectures. Not built: the retry loop is already bounded at two repairs, and the pattern needs many runs to be seen.
+17. **Bounded repair of a part** (Guo et al., 2026; Li and Li, 2026). On a repair, ask the writer for new versions of only the sections that carry a blocking issue. Show it each issue and its node, and do not show the failed text, only the issue. Code then splices those sections into the best attempt and keeps every other section byte for byte. This would make a repair unable to damage a section that passed. Part-level fields (preview, recap, questions) would be repaired only when an issue names them. It would touch `_process` and `format_feedback` in `pipeline.py`, `prompts/rewrite.md`, `validate_part`, `dry_run_handler` and the tests, in one change. Not built yet: no real run has yet shown how often repairs damage passing sections.
 
 ---
 
@@ -424,6 +435,9 @@ Each idea comes with the source that suggests it and the reason it is not built.
 
 - Cho, S., Cardenoso Fernandez, F., Mohammed, U., Wu, Z., Da Costa, K., Wicaksono, I., & Koshiyama, A. (2026). Automata from agent traces: Failure and next-step prediction. Workshop on Agents in the Wild, ICML 2026. arXiv:2608.23670. https://arxiv.org/abs/2608.23670
 - Feng, Y., Xiang, Z., Yang, C., et al. (2026). Graph engineering in the era of LLM agents: From individual intelligence to system intelligence. arXiv:2608.21156. https://arxiv.org/abs/2608.21156
+- Guo, C., Liang, W., Fu, Y., Dang, A., Jin, Y., Kawaguchi, K., & Wang, W. (2026). When self-verification hurts: Calibrated answer repair for financial question answering. arXiv:2611.05166. https://arxiv.org/abs/2611.05166
+- Hegazy, M., Jordan, M. I., & Dieuleveut, A. (2026). Valid stopping in adaptive generator–verifier loops. arXiv:2610.06432. https://arxiv.org/abs/2610.06432
+- Li, J., & Li, S. (2026). Repair, retry, and the cost of hindsight: Verifier feedback in formal theorem proving. NeurIPS 2026 Workshop on AI for Verifiable Coding. arXiv:2610.22698. https://arxiv.org/abs/2610.22698
 - LEDGER (2026). Claim-to-evidence trace graphs for agent workflows. arXiv:2608.18398. https://arxiv.org/abs/2608.18398 (authors not checked)
 - Lu, Chen, Wu, & Arık (2026). Procedural graphs for agents. arXiv:2609.09153. https://arxiv.org/abs/2609.09153 (first names and exact title not checked)
 - Luo, M., Chen, C., Cao, A., Dai, W., Huang, Z., Gao, S., Shu, R., Chen, J., & Wan, B. (2026). STAGE: Stateful translation to agentic graph execution with policy-scoped context and deterministic control. arXiv:2608.22538. https://arxiv.org/abs/2608.22538
