@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ from pathlib import Path
 from .assemble import encode_final, join_parts, synth_blocks
 from .course import CoursePipeline, course_report
 from .course_render import write_vault
+from .series import load_lecture, merge_termbases, series_report
 from .llm import PRESETS, FakeLLM, LLMError, dry_run_handler, make_llm, research_loop
 from .web import SEARCH_ENGINES, FetchError, make_search, pick_engine
 from .pipeline import PipelineError, TextPipeline, chapter_titles, load_prompts
@@ -53,10 +55,17 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="'lecture2audio gui [--port N] [--no-browser]' opens the same options in the browser.")
     sub = parser.add_subparsers(dest="command", required=True)
     for command, text in (("build", "transcript or recording -> audio"),
-                          ("text", "same, but stop before the voice: script and quality report only")):
+                          ("text", "same, but stop before the voice: script and quality report only"),
+                          ("series", "several lectures -> one course: shared terms and notation, "
+                                     "course material in one vault (no audio)")):
         p = sub.add_parser(command, help=text, description=text)
-        p.add_argument("input", help="transcript (.txt .md .srt .vtt) or recording (.mp3 .m4a .wav ...)")
-        p.add_argument("--name", help="name of the lecture (default: the input file name)")
+        if command == "series":
+            p.add_argument("inputs", nargs="+",
+                           help="the lectures in course order (transcripts or recordings)")
+            p.add_argument("--name", help="name of the course (default: first lecture's folder)")
+        else:
+            p.add_argument("input", help="transcript (.txt .md .srt .vtt) or recording (.mp3 .m4a .wav ...)")
+            p.add_argument("--name", help="name of the lecture (default: the input file name)")
         p.add_argument("--out", default="out", help="output folder (default: ./out)")
         p.add_argument("--slides", help="slides as PDF (needs pypdf) or text, optional")
         p.add_argument("--glossary", help="text file, one course term per line, optional")
@@ -66,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "Obsidian) with exact definitions, full explanations, worked "
                             "examples, check questions, figures and linked terms, made from the "
                             "verified script")
+        p.add_argument("--vault-dir",
+                       help="folder where the course vault is written (default: vault/ in the "
+                            "lecture's output folder). Point it at your Obsidian vault: the "
+                            "notes go in a sub-folder named after the lecture or the course")
         p.add_argument("--redo", choices=sorted(LATER),
                        help="discard saved results from this stage onwards and run it again")
         llm = p.add_argument_group("language models")
@@ -255,7 +268,11 @@ def _discard(work: Path, names: list[str]) -> None:
             path.unlink()
 
 
-def run(args) -> int:
+def run(args, series: dict | None = None) -> int:
+    """One lecture. `series` (see run_series) stops the run after the termbase, supplies the
+    notation of the earlier lectures, or keeps the run from writing the vault."""
+    series = series or {}
+
     def log(message: str) -> None:
         print(message, flush=True)
 
@@ -298,6 +315,8 @@ def run(args) -> int:
         f"{sum(len(p.children) for p in outline.parts)} point(s)")
     coverage = pipeline.run_coverage(outline)
     terms = pipeline.run_termbase(outline)
+    if series.get("stop_after") == "termbase":
+        return 0
     if research_note and coverage["gaps"]:
         log(f"[research] skipped: {research_note}")
     supplements = pipeline.run_research(outline)
@@ -312,11 +331,19 @@ def run(args) -> int:
     spoken = pipeline.run_spoken(outline, records)
     course = course_stats = None
     if args.course:
-        course = CoursePipeline(pipeline).run(outline, records)
-        course_stats = write_vault(work / "vault", name, outline, course, records, terms,
-                                   language)
-        log(f"[course] {course_stats['cards']} card(s), {course_stats['notes']} note(s): "
-            f"{work / 'vault'}")
+        course = CoursePipeline(pipeline, series.get("notation")).run(outline, records)
+        vault = Path(args.vault_dir) / name if args.vault_dir else work / "vault"
+        if series.get("skip_vault"):
+            course_stats = {"cards": sum(len(p["cards"]) for p in course["parts"]),
+                            "notes": 0, "diagrams": sum(bool(c["diagram"]) for p in course["parts"]
+                                                        for c in p["cards"])}
+            log(f"[course] {course_stats['cards']} card(s)")
+        else:
+            course_stats = write_vault(vault, [{"name": name, "outline": outline,
+                                                "course": course, "records": records,
+                                                "terms": terms}], language, outline.title)
+            log(f"[course] {course_stats['cards']} card(s), {course_stats['notes']} note(s): "
+                f"{vault}")
     usage = {rewrite_llm.name: rewrite_llm.usage}
     if verify_llm is not rewrite_llm:
         usage[verify_llm.name + " (verifier)"] = verify_llm.usage
@@ -369,6 +396,60 @@ def run(args) -> int:
     return 0
 
 
+def run_series(args) -> int:
+    """Several lectures as one course. Pass 1 prepares every lecture up to its termbase; the
+    termbases are merged (one definition per term, the first lecture that defines a term owns
+    it); pass 2 finishes the lectures in order, each starting from the notation of the earlier
+    ones; the vault is written once at the end, with shared term notes."""
+    sources = [Path(p) for p in args.inputs]
+    for path in sources:
+        if not path.exists():
+            raise SystemExit(f"Input not found: {path}")
+    course_name = args.name or slugify(sources[0].resolve().parent.name or "course")
+    names, seen = [], set()
+    for path in sources:
+        base = slugify(path.stem)
+        name, k = base, 2
+        while name in seen:
+            name, k = f"{base}-{k}", k + 1
+        seen.add(name)
+        names.append(name)
+    root = Path(args.out) / course_name
+    root.mkdir(parents=True, exist_ok=True)
+
+    def lecture_args(number: int, redo):
+        lecture = copy.copy(args)
+        lecture.input, lecture.name, lecture.out = str(sources[number]), names[number], str(root)
+        lecture.command, lecture.course, lecture.redo = "text", True, redo
+        return lecture
+
+    for number in range(len(sources)):
+        print(f"[series] lecture {number + 1}/{len(sources)}: preparing {names[number]}", flush=True)
+        run(lecture_args(number, args.redo), {"stop_after": "termbase"})
+    conflicts = merge_termbases([root / n for n in names], names)
+    print(f"[series] terms merged: {len(conflicts)} conflict(s)", flush=True)
+    registry: list[dict] = []
+    for number in range(len(sources)):
+        print(f"[series] lecture {number + 1}/{len(sources)}: writing {names[number]}", flush=True)
+        run(lecture_args(number, None), {"notation": registry, "skip_vault": True})
+        notation_file = root / names[number] / "course" / "notation.json"
+        if notation_file.exists():
+            known = {n["symbol"] for n in registry}
+            registry += [n for n in json.loads(notation_file.read_text(encoding="utf-8"))
+                         if n["symbol"] not in known]
+    lectures = [load_lecture(root / n, n) for n in names]
+    first = (root / names[0] / "transcript.txt").read_text(encoding="utf-8")
+    language = detect_language(first) if args.language == "auto" else args.language
+    vault = Path(args.vault_dir) / course_name if args.vault_dir else root / "vault"
+    stats = write_vault(vault, lectures, language, course_name)
+    series_report(root / "series.md", course_name, lectures, conflicts, stats)
+    (root / "series.json").write_text(json.dumps(
+        {"lectures": names, "notation": registry, "conflicts": conflicts}, ensure_ascii=False,
+        indent=2), encoding="utf-8")
+    print(f"Done. Vault: {vault}. Read {root / 'series.md'}.", flush=True)
+    return 0
+
+
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["gui"]:
@@ -376,7 +457,7 @@ def main(argv=None) -> None:
         return gui_main(argv[1:])
     args = build_parser().parse_args(argv)
     try:
-        sys.exit(run(args))
+        sys.exit(run_series(args) if args.command == "series" else run(args))
     except KeyboardInterrupt:
         print("Interrupted. Run the same command again to continue where it stopped.",
               file=sys.stderr)

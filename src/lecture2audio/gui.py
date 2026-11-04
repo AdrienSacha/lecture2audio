@@ -51,6 +51,8 @@ def option_spec() -> dict:
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     spec = {}
     for command, subparser in sub.choices.items():
+        if command not in ("build", "text"):  # e.g. `series` takes several inputs: CLI only
+            continue
         groups = []
         for group in subparser._action_groups:
             fields = []
@@ -168,15 +170,6 @@ def _cells(line: str) -> list[str]:
     if line.endswith("|"):
         line = line[:-1]
     return [c.strip() for c in line.split("|")]
-
-
-_WIKILINK = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]")
-
-
-def wikilinks(rendered: str) -> str:
-    """Obsidian [[note]] / [[note|label]] links in already-escaped HTML, made clickable."""
-    return _WIKILINK.sub(lambda m: f'<a href="#" class="wikilink" data-note="{m.group(1).strip()}">'
-                                   f'{(m.group(2) or m.group(1)).strip()}</a>', rendered)
 
 
 def render_markdown(text: str) -> str:
@@ -525,24 +518,20 @@ class Handler(BaseHTTPRequestHandler):
                                "html": render_markdown(file.read_text(encoding="utf-8",
                                                                       errors="replace"))})
         if path == "/api/vault":
-            run = self._run_dir(q)
-            if run is None:
-                return self._error(404, "No such run.")
-            vault = run / "vault"
-            notes = sorted((p.relative_to(vault).as_posix() for p in vault.rglob("*.md")),
-                           key=lambda n: (n.rsplit("/", 1)[-1] != "index.md", n.lower())) \
-                if vault.is_dir() else []
-            return self._json({"exists": bool(notes), "notes": notes, "path": str(vault)})
-        if path == "/api/note":
-            run = self._run_dir(q)
-            if run is None:
-                return self._error(404, "No such run.")
-            vault = (run / "vault").resolve()
-            note = (vault / str(q.get("path", ""))).resolve()
-            if not note.is_relative_to(vault) or note.suffix != ".md" or not note.is_file():
-                return self._error(404, "No such note.")
-            return self._json({"html": wikilinks(render_markdown(
-                note.read_text(encoding="utf-8", errors="replace")))})
+            given = str(q.get("path") or "").strip()
+            if given:
+                vault = Path(given).expanduser().resolve()
+            else:
+                run = self._run_dir(q)
+                if run is None:
+                    return self._error(404, "No such run.")
+                vault = run / "vault"
+            if not vault.is_dir():
+                return self._json({"exists": False})
+            index = next(iter(sorted(vault.glob("00 *.md"))), None) or next(iter(sorted(vault.glob("*.md"))), None)
+            return self._json({"exists": True, "path": str(vault),
+                               "index": str(index) if index else None,
+                               "notes": sum(1 for _ in vault.rglob("*.md"))})
         if path == "/api/chapters":
             run = self._run_dir(q)
             if run is None:
@@ -622,6 +611,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._run(data)
         if path == "/api/cancel":
             self.server.stop_job()
+            return self._json({"ok": True})
+        if path == "/api/reveal":
+            target = Path(str(data.get("path") or "")).expanduser().resolve()
+            if not target.exists():
+                return self._error(404, "This folder does not exist.")
+            if sys.platform == "darwin":  # a file is selected in its folder, a folder is opened
+                subprocess.Popen(["open", "-R", str(target)] if target.is_file()
+                                 else ["open", str(target)])
             return self._json({"ok": True})
         if path == "/api/open-out":
             raw = str(data.get("out") or "").strip()
@@ -890,14 +887,10 @@ audio { width: 100%; display: block; color-scheme: dark; }
 .tabs button:hover { color: var(--ink); }
 .tabs button[aria-selected=true] { color: var(--ink); border-bottom-color: var(--primary); }
 .doc { overflow-wrap: anywhere; font-size: 15px; line-height: 1.65; }
-.vault { display: grid; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr); gap: 16px; }
-@media (max-width: 700px) { .vault { grid-template-columns: 1fr; } }
-.notes { display: grid; gap: 2px; align-content: start; max-height: 70vh; overflow: auto; }
-.notes button { text-align: left; min-height: 34px; padding: 5px 10px; border: 0; border-radius: 6px;
-  background: transparent; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
-.notes button:hover { color: var(--ink); background: var(--primary-soft); }
-.notes button[aria-current=true] { color: var(--primary); background: var(--primary-soft); font-weight: 600; }
-a.wikilink { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
+.vault-card { display: grid; gap: 6px; }
+.vault-card .path { font: 13px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.btn.go-link { display: inline-flex; align-items: center; text-decoration: none; background: var(--primary);
+  color: var(--primary-ink); border-color: var(--primary); }
 .doc h1 { font-size: 22px; margin: 4px 0 12px; letter-spacing: -0.01em; }
 .doc h2 { font-size: 17px; margin: 24px 0 8px; } .doc h3 { font-size: 15px; margin: 18px 0 6px; }
 .doc p { margin: 8px 0; max-width: 75ch; }
@@ -1025,7 +1018,7 @@ const TAG_STAGE = {transcribe: "transcribe", outline: "outline", gaps: "gaps", t
 
 let spec = null, command = "build", values = {}, outRoot = "", since = 0, polling = null, current = null;
 let envKeys = {}, keyVals = {}, stageAt = -1, stageNote = "", stageSince = Date.now(), jobState = "idle";
-let stagePct = null, audioSeconds = 0;
+let stagePct = null, audioSeconds = 0, vaultFromLog = "", jobName = "";
 
 function el(tag, attrs, ...kids) {
   const e = document.createElement(tag);
@@ -1213,6 +1206,8 @@ function addLog(lines) {
   const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 8;
   for (const line of lines) {
     const tag = (line.match(/^\[(\w+)\]/) || [])[1];
+    const vault = line.match(/^\[course\] .*note\(s\): (.+)$/) || line.match(/^Done\. Vault: (.+)$/);
+    if (vault) vaultFromLog = vault[1].trim();
     const minutes = line.match(/^\[transcribe\] .*?, (\d+) min of audio/);
     if (minutes) audioSeconds = +minutes[1] * 60;
     const stamp = line.match(/^\[(?:(\d+):)?(\d+):(\d+(?:\.\d+)?) -->/);
@@ -1241,6 +1236,7 @@ function setStatus(state) {
 async function poll() {
   try {
     const j = await api("/api/job?" + q({since}));
+    if (j.name) jobName = j.name;
     addLog(j.lines || []); since = j.next || since; setStatus(j.state);
     if (j.state === "running") { polling = setTimeout(poll, 600); return; }
     polling = null;
@@ -1320,30 +1316,24 @@ async function showDoc(doc) {
   } catch (e) { box.replaceChildren(el("p", {class: "error", text: e.message})); }
 }
 
-async function showVault(box, note) {
-  const params = {out: current.out, run: current.name};
+async function showVault(box) {
+  // The vault path the run printed (it differs from <run>/vault when --vault-dir was used).
+  const fromLog = current && jobName === current.name ? vaultFromLog : "";
+  const params = fromLog ? {path: fromLog} : {out: current.out, run: current.name};
   const v = await api("/api/vault?" + q(params)).catch(() => ({exists: false}));
   if (!v.exists) {
     box.replaceChildren(el("p", {class: "muted", text: "No course notes for this run. Turn on Course in All settings (--course)."}));
     return;
   }
-  const open = async (path) => {
-    const n = await api("/api/note?" + q(Object.assign({path}, params)));
-    view.innerHTML = n.html;  // rendered and escaped by the server
-    list.querySelectorAll("button").forEach(b => b.setAttribute("aria-current", b.dataset.path === path));
-    view.querySelectorAll("a.wikilink").forEach(a => a.addEventListener("click", (e) => {
-      e.preventDefault();
-      const target = v.notes.find(p => p.replace(/\.md$/, "").split("/").pop() === a.dataset.note
-                                    || p.replace(/\.md$/, "") === a.dataset.note);
-      if (target) open(target);
-    }));
-  };
-  const list = el("nav", {class: "notes", "aria-label": "Course notes"},
-    ...v.notes.map(p => el("button", {type: "button", "data-path": p, text: p.replace(/\.md$/, ""),
-                                      onclick: () => open(p)})));
-  const view = el("div", {class: "note"});
-  box.replaceChildren(el("p", {class: "help", text: "Obsidian vault: " + v.path}), el("div", {class: "vault"}, list, view));
-  open(note || v.notes[0]);
+  const obsidian = "obsidian://open?path=" + encodeURIComponent(v.index || v.path);
+  box.replaceChildren(el("div", {class: "vault-card"},
+    el("p", {class: "label", text: v.notes + " notes, ready for Obsidian"}),
+    el("code", {class: "path", text: v.path}),
+    el("div", {class: "row mt"},
+      el("a", {class: "btn go-link", href: obsidian, text: "Open in Obsidian"}),
+      el("button", {type: "button", class: "btn", text: "Show in Finder",
+        onclick: () => post("/api/reveal", {path: v.index || v.path}).catch(e => $("form-error").textContent = e.message)})),
+    el("p", {class: "help", text: "The notes are rewritten on every run: link your own notes to them instead of editing them."})));
 }
 
 async function init() {
