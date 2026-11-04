@@ -290,6 +290,20 @@ The owner asked for the best material possible, checked as far as the evidence a
 
 **What this does not do.** Conformal risk control can bound the rate of missed omissions with about 100 labelled documents (Bedi et al., 2026); it needs labelled lectures this project does not have yet (idea 13). Transcript terminology repair (Zhu et al., 2026) is idea 14.
 
+### 2.18 Graph engineering (November 2026)
+
+The owner asked whether "graph engineering", the 2026 name for designing an agent system as an explicit graph of steps, state and checks (Feng et al., 2026, survey; Runkle and Chase, 2026, for LangGraph), should change the build. The primary sources read were nine 2026 papers and the Anthropic engineering post; the OpenAI, Google ADK and LangChain pages could not be opened from this session, so they are cited from search results only. `docs/adr/0003-declared-stage-graph.md` records the decision.
+
+**Code should own the control flow; the model should own local meaning.** STAGE (Luo et al., 2026) runs enterprise procedures as a reviewed, frozen graph of typed task nodes with a deterministic coordinator. Against one agent holding the whole policy, it raised the share of cases solved in all three repeated runs by 7.5 to 66 points in all 18 benchmark and model pairs. Its two ablations on a fixed graph are the strongest evidence found for this project's design: giving every node the whole policy instead of its own part cost 22.5 to 74 points, and letting the model choose the next node cost 12 to 56 points. ARTIC (Xu et al., 2026) compiles a natural-language workflow into steps that declare the artifacts they read and write, checks the result statically (every read is produced upstream) and then by local obligations and dry runs; this raised the resolve rate by 28 points, and removing the validation cost 16 points. Procedural graphs (Lu et al., 2026) give the model only the active node and its two-hop neighbourhood, and ranked first in 21 of 24 settings. *Consequence:* the fixed chain, the part-scoped context and the code gates of this project are what this work measures as best. *Change:* the chain is now declared as data (`stages.py`): each stage names its cache files and the stages it needs; code checks the graph, derives what `--redo` discards (identical to the table written by hand before, which a test proves), and reports in `report.md` which stages were reused, computed or not run.
+
+**A skeptical evaluator apart from the generator.** Anthropic's planner, generator and evaluator harness (Rajasekaran, 2026) found that a model praises its own work, that a separate evaluator is far easier to make skeptical, and that out of the box the evaluator talked itself into approving. Every component encodes an assumption about what the model cannot do alone, and should be removed one at a time when a new model makes it unnecessary. *No change:* the verifier and the judges are separate calls with code-computed verdicts and planted-fault audits; `--no-audit` and the stage section of `report.md` make such one-at-a-time removal measurable.
+
+**Compiling a written procedure into a graph.** SIGIL (2026) compiles a SKILL.md file into a validated intermediate graph and reaches complete skill adherence where the prose skill reached 26 to 54%, with 21 to 45% fewer tokens. *No change:* this project's procedure was compiled into Python from the start; its `SKILL.md` only calls the command line.
+
+**Learning from runs.** Evo-Harness (Wei et al., 2026) compiles each failed run into reusable guidance and gains up to 10 points, but guidance from the model's own judgement of success lowered results below no learning at all, while grounded signals (tests, verifiers) helped. Automata extracted from many agent traces (Cho et al., 2026) predict failures (AUROC up to 0.94), and failing runs show up as cycles through familiar states. *Not built (ideas 15 and 16):* both need many real runs; the grounded signals here would be the code gates and audits, never the judges' opinion of themselves.
+
+**Not adopted.** Graphs synthesised by a controller model for each query (Tieu et al., 2026) coordinate several agents that talk to one another; this task is sequential and section 2.2 found no gain from such agents. A graph database as a knowledge layer (Neo4j context graphs, 2026) suits thousands of linked records; a lecture has hundreds of ideas, which `ideas.csv`, `termbase.json` and the links of the vault already hold. LEDGER (2026) separates the links of a claim-to-evidence graph that code establishes from those a model infers; the idea ledger already makes that separation (citations are checked by code, verdicts by judges, and a disagreement is `disputed`).
+
 ## 3. The CLAUDE.md file
 
 **Source.** Anthropic's Claude Code documentation (pages "Best practices for Claude Code" and "How Claude remembers your project", 2026):
@@ -323,6 +337,8 @@ Each idea comes with the source that suggests it and the reason it is not built.
 12. **Ideas listed part by part.** Built in November 2026 (section 2.16).
 13. **Calibrated omission flags** (Bedi et al., 2026). Label the omissions of about 100 lecture parts, then calibrate the verifier's statuses with conformal risk control, so that report.md can state a bound on missed omissions. Not built: no labelled lectures yet.
 14. **Terminology repair of transcripts** (Zhu et al., 2026). With the whole transcript, the glossary and the slides as context, propose minimal corrections of misrecognised terms, accept only those whose new term occurs in the glossary, the slides or elsewhere in the transcript, and log every edit. It would touch `cli._transcript`, a new prompt and gate, and the tests.
+15. **Harness lessons from real runs** (Wei et al., 2026). After each real lecture, collect the blocking issues and failed audits of `report.md` into a short list of lessons that a person reviews before any prompt changes. Only grounded signals (code gates, audits) would count, because guidance from the model's own judgement lowered results in that study. Not built: no real runs yet.
+16. **A trace of each part's attempts** (Cho et al., 2026). Record, for every part, the sequence of gates, verdicts and repairs, so that parts which cycle through the same failure can be counted across lectures. Not built: the retry loop is already bounded at two repairs, and the pattern needs many runs to be seen.
 
 ---
 
@@ -403,6 +419,21 @@ Each idea comes with the source that suggests it and the reason it is not built.
 - Yang, J., Yoon, S., Chang, H., Kim, B., & Lee, H. (2025). Hallucinate at the last in long response generation: A case study on long document summarization. arXiv:2505.15291. https://arxiv.org/abs/2505.15291
 - Zhu, Y., Wang, W., Gao, Z., Li, X., & Chen, X. (2026). Agentic-GER: Terminology recovery in long-form speech using global context. arXiv:2609.29428. https://arxiv.org/abs/2609.29428
 - Zolkepli, H. (2026). How to reduce Whisper hallucination. arXiv:2609.32560. https://arxiv.org/abs/2609.32560
+
+### Graph engineering, added November 2026
+
+- Cho, S., Cardenoso Fernandez, F., Mohammed, U., Wu, Z., Da Costa, K., Wicaksono, I., & Koshiyama, A. (2026). Automata from agent traces: Failure and next-step prediction. Workshop on Agents in the Wild, ICML 2026. arXiv:2608.23670. https://arxiv.org/abs/2608.23670
+- Feng, Y., Xiang, Z., Yang, C., et al. (2026). Graph engineering in the era of LLM agents: From individual intelligence to system intelligence. arXiv:2608.21156. https://arxiv.org/abs/2608.21156
+- LEDGER (2026). Claim-to-evidence trace graphs for agent workflows. arXiv:2608.18398. https://arxiv.org/abs/2608.18398 (authors not checked)
+- Lu, Chen, Wu, & Arık (2026). Procedural graphs for agents. arXiv:2609.09153. https://arxiv.org/abs/2609.09153 (first names and exact title not checked)
+- Luo, M., Chen, C., Cao, A., Dai, W., Huang, Z., Gao, S., Shu, R., Chen, J., & Wan, B. (2026). STAGE: Stateful translation to agentic graph execution with policy-scoped context and deterministic control. arXiv:2608.22538. https://arxiv.org/abs/2608.22538
+- Rajasekaran, P. (2026, March 24). Harness design for long-running application development. Anthropic Engineering. https://www.anthropic.com/engineering/harness-design-long-running-apps
+- Runkle, S., & Chase, H. (2026, July). 3 years of graph engineering with LangGraph. LangChain Blog. https://www.langchain.com/blog/3-years-of-graph-engineering-with-langgraph (cited by Tieu et al.; not opened)
+- SIGIL (2026). Compiling agent skills into a validated graph intermediate representation. arXiv:2607.27309. https://arxiv.org/abs/2607.27309 (authors and exact title not checked)
+- Tieu, K., Fu, D., Xia, Y., Li, H., Yan, H., & He, J. (2026). Inference-time graph engineering for multi-agent LLM workflows. arXiv:2609.05774. https://arxiv.org/abs/2609.05774
+- Wei, T., Shi, Z., Lin, M., et al. (2026). Evo-Harness: Context-to-harness skill compilation for self-evolving agents. arXiv:2608.15071. https://arxiv.org/abs/2608.15071
+- Xu, X., Guo, H., Shen, G., Cheng, S., & Zhang, X. (2026). Natural-language workflows are not software yet: Artifact-driven compilation for reliable agent execution. arXiv:2608.21341. https://arxiv.org/abs/2608.21341
+- Not opened from this session (network policy): Lopopolo, R. (2026, February 11), "Harness engineering: leveraging Codex in an agent-first world", OpenAI; Google ADK 2.0 graph workflows (adk.dev, 2026); Neo4j talks and posts on context graphs (2026).
 
 ### Claude Code documentation
 

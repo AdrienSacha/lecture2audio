@@ -701,6 +701,11 @@ class EndToEnd(unittest.TestCase):
             self.assertIn("The test of the idea listing planted one fact", report)
             self.assertIn("the fact was listed.", report)
             self.assertIn("The test of the course judge", report)
+            self.assertIn("## Stages of this run", report)
+            self.assertIn("| transcribe | the input | read from the input file |", report)
+            self.assertIn("| course | rewrite, ideas | computed in this run |", report)
+            self.assertLess(report.index("## Stages of this run"),
+                            report.index("## Removed as noise"))
             self.assertFalse((work / "ideas.csv.tmp").exists())
             anki = (work / "anki.csv").read_text(encoding="utf-8")
             self.assertTrue(anki.startswith("#separator:Comma\n"))

@@ -16,7 +16,7 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from . import ledger
+from . import ledger, stages
 from .assemble import encode_final, encode_part_files, join_parts, repair_chunks, synth_blocks
 from .factcheck import run_factcheck
 from .course import CoursePipeline, course_report
@@ -33,24 +33,10 @@ from .sources import (AUDIO_EXT, detect_language, discover_inputs, load_glossary
 from .transcribe import STTError, available as stt_available, transcribe_audio
 from .tts import TTSError, make_tts
 
-# What --redo X discards: the results of stage X and of every stage after it. The idea
-# ledger (ideas.csv) and anki.csv are rebuilt from the stage results on every run.
-GAPS = ["coverage.json", "coverage_audit.json", "termbase.json", "research"]
-DERIVED = ["ideas.csv", "anki.csv"]
-VOICE = ["spoken", "audio", "parts"]
-IDEAS = ["ideas", "ideas_audit.json"]
-CHECKS = ["factcheck"]
-LATER = {"transcribe": ["outline.json", *GAPS, *IDEAS, "rewrite", "audit.json", *CHECKS, *VOICE,
-                        "course", "vault", *DERIVED],
-         "outline": ["outline.json", *GAPS, *IDEAS, "rewrite", "audit.json", *CHECKS, *VOICE, "course",
-                     "vault", *DERIVED],
-         "ideas": [*IDEAS, "rewrite", "audit.json", *CHECKS, *VOICE, "course", "vault",
-                   *DERIVED],
-         "gaps": [*GAPS, "rewrite", "audit.json", *CHECKS, *VOICE, "course", "vault", *DERIVED],
-         "research": ["research", "rewrite", "audit.json", *CHECKS, *VOICE, "course", "vault", *DERIVED],
-         "rewrite": ["rewrite", "audit.json", *CHECKS, *VOICE, "course", "vault", *DERIVED],
-         "spoken": VOICE, "audio": ["audio", "parts"],
-         "course": ["course", "vault", *DERIVED]}
+# What --redo X discards: the results of stage X and of every stage that depends on it,
+# computed from the declared stage graph (stages.py). The idea ledger (ideas.csv) and anki.csv
+# are rebuilt from the stage results on every run.
+LATER = stages.redo_table()
 COMMANDS = ("build", "text", "series")
 # (rewrite, verifier) per provider. A local server has no default: its models are
 # whatever the user has pulled.
@@ -389,6 +375,7 @@ def run(args, series: dict | None = None) -> int:
     slides = load_slides(args.slides)
     if args.redo:
         _discard(work, LATER[args.redo])
+    start = stages.present(work)
 
     text = _transcript(args, work, glossary, log)
     if args.transcribe_only:
@@ -405,6 +392,8 @@ def run(args, series: dict | None = None) -> int:
             "results discarded")
         _discard(work, LATER["outline"])
     marker.write_text(fingerprint)
+    # stages whose result was on disk when the run began and survived every discard
+    before = start & stages.present(work)
     log(f"{len(text.split())} words, {len(units)} units, language: {language}")
 
     rewrite_llm, verify_llm = _llms(args)
@@ -495,12 +484,18 @@ def run(args, series: dict | None = None) -> int:
                                                       for i in r["issues"]
                                                       if i["type"] == "unledgered"]},
                      factcheck, _asr_notes(work))
-        if course:  # before the list of noise, which stays last
-            report = (work / "report.md").read_text(encoding="utf-8")
-            cut = report.find("\n## Removed as noise")
-            section = course_report(course, course_stats, language)
-            report = report + section if cut < 0 else report[:cut] + section + report[cut:]
-            (work / "report.md").write_text(report, encoding="utf-8")
+        override = {}
+        if source.suffix.lower() not in AUDIO_EXT:
+            override["transcribe"] = "read from the input file"
+        if course_stats and args.vault_dir:
+            override["vault"] = f"written to {vault}"
+        # the course section and the stage section go before the list of noise, which stays last
+        section = (course_report(course, course_stats, language) if course else "") + "\n".join(
+            [""] + stages.report_lines(stages.statuses(work, before, override)))
+        report = (work / "report.md").read_text(encoding="utf-8")
+        cut = report.find("\n## Removed as noise")
+        report = report + section if cut < 0 else report[:cut] + section + report[cut:]
+        (work / "report.md").write_text(report, encoding="utf-8")
 
     reports()
     flagged = [r["part"] for r in records if r["flagged"]]
