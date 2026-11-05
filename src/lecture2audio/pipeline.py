@@ -469,9 +469,9 @@ def format_feedback(script_text: str, issues: list[dict], scope: list[str] | Non
 
 
 # Fields of a part outside its sections that an issue can point at, with the word used in the
-# feedback. The preview is assembled by code from the sections' phrases and is never repaired
-# alone.
-PART_FIELDS = {"recap": "the recap", "questions": "the questions"}
+# feedback: the recap and the questions of a script, the exercises of the course material. The
+# preview is assembled by code from the sections' phrases and is never repaired alone.
+PART_FIELDS = {"recap": "the recap", "questions": "the questions", "exercises": "the exercises"}
 _FIELD_OF_ISSUE = {"recap": "recap", "question": "questions"}
 
 
@@ -519,7 +519,8 @@ def repair_plan(part: Node, record: dict, issues: list[dict]) -> tuple[list[str]
     sections = [s["node"] for s in record["sections"]]
     if not scope or set(sections) <= set(scope):
         return None, issues
-    scope = [s for s in sections if s in scope] + [f for f in PART_FIELDS if f in scope]
+    scope = [s for s in sections if s in scope] + [f for f in ("recap", "questions")
+                                                   if f in scope]
     return scope, [i for i in issues if _locate(i, record, part) in scope]
 
 
@@ -532,7 +533,7 @@ def splice_repair(best: dict, new: dict, scope: list[str]) -> dict:
     out = copy.deepcopy(best)
     out["sections"] = [copy.deepcopy(rewritten[s["node"]]) if s["node"] in scope else s
                        for s in out["sections"]]
-    for field in PART_FIELDS:
+    for field in ("recap", "questions"):
         if field in scope:
             out[field] = copy.deepcopy(new[field])
     out["terms_defined"] = list(dict.fromkeys(list(best.get("terms_defined", []))

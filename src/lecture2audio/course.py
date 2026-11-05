@@ -11,6 +11,7 @@ writes the result as a Markdown vault.
 """
 from __future__ import annotations
 
+import copy
 import difflib
 import json
 import re
@@ -22,7 +23,8 @@ from . import enrich
 from .course_schema import Card, Cards, Exercise, describe
 from .outline import Node, Outline, render_outline
 from .pipeline import (_NUMBER, SOFT_ISSUES, NumberIndex, TextPipeline, _and, _section, blocking,
-                       format_feedback, numbers_lost, sentences_of, unsupported_numbers)
+                       format_feedback, numbers_lost, scope_words, sentences_of,
+                       unsupported_numbers)
 
 REVIEW_PER_PART = 3
 LOOSE_KINDS = {"undefined_term", "missing_prerequisite", "skipped_step", "forward_reference",
@@ -119,8 +121,9 @@ def card_issues(cards: list[dict], ctx: dict, language: str) -> list[dict]:
     covered = {n for c in cards for n in c["covers"]}
     for number in range(1, len(script) + 1):
         if number not in covered:
-            issues.append(_issue("uncovered", f'script sentence {number} is not covered by any '
-                                              f'card: "{script[number - 1]["text"][:90]}"'))
+            issues.append(dict(_issue("uncovered", f'script sentence {number} is not covered by '
+                                                   f'any card: "{script[number - 1]["text"][:90]}"'),
+                               sentence=number))
     claimed = {i for c in cards for i in c.get("ideas", [])}
     for idea in ctx.get("ideas", []):
         if str(idea["id"]) not in claimed:
@@ -363,6 +366,65 @@ def collect_notation(parts: list[dict]) -> tuple[list[dict], list[str]]:
 
 # -------------------------------------------------------------------- the stage
 
+def _place(issue: dict, record: dict) -> str | None:
+    """Where a course issue lies: the node of its card or sentence, "exercises", or None."""
+    if issue.get("field"):
+        return issue["field"]
+    nodes = [s["node"] for s in record["sections"]]
+    node, k = issue.get("node"), issue.get("sentence")
+    if not node and isinstance(k, int):
+        owner = [s["node"] for s in record["sections"] for _ in s["sentences"]]
+        node = owner[k - 1] if 1 <= k <= len(owner) else None
+    return str(node) if node and str(node) in nodes else None
+
+
+def card_scope(issues: list[dict], record: dict, cards: list[dict]) -> list[str] | None:
+    """The sections (nodes) whose cards a repair rewrites, and "exercises" when an exercise is
+    at fault, in order; None when an issue cannot be placed (a term no card defines) or every
+    section with cards is at fault, which calls for a full rewrite. The same bounded repair as
+    the script's (`pipeline.repair_plan`): what passed is kept word for word."""
+    scope: list[str] = []
+    for issue in blocking(issues):
+        where = _place(issue, record)
+        if where is None:
+            return None
+        if where not in scope:
+            scope.append(where)
+    if not scope or {c["node"] for c in cards} <= set(scope):
+        return None
+    nodes = [s["node"] for s in record["sections"]]
+    return [n for n in nodes if n in scope] + (["exercises"] if "exercises" in scope else [])
+
+
+def splice_cards(best: dict, cards: list[dict], exercises: list[dict], scope: list[str],
+                 nodes: list[str]) -> tuple[list[dict], list[dict]]:
+    """The best attempt's cards with those of the nodes in `scope` taken from the repair, in the
+    order of the nodes; the exercises from the repair only when they are in `scope`."""
+    out = []
+    for node in nodes:
+        source = cards if node in scope else best["cards"]
+        out += [copy.deepcopy(c) for c in source if c["node"] == node]
+    kept = exercises if "exercises" in scope else best["exercises"]
+    return out, copy.deepcopy(kept)
+
+
+def card_repair_lines(parts: list[dict]) -> list[str]:
+    """Every repair and revision of the course material: what it rewrote, whether it was kept."""
+    lines = []
+    for part in parts:
+        for repair in part.get("repairs", []):
+            what = ("all the cards were" if repair["scope"] == "all"
+                    else "the cards of " + scope_words(repair["scope"]) + " were"
+                    if any(s != "exercises" for s in repair["scope"]) else "the exercises were")
+            outcome = "so the repair was kept" if repair["kept"] else "so the earlier cards were kept"
+            lines.append(f"- Part {part['part']}, attempt {repair['attempt']}: {what} rewritten; "
+                         f"the blocking problems went from {repair['before']} to "
+                         f"{repair['after']}, {outcome}.")
+    return (["", "Repairs of the course material (a repair rewrites only the cards of the "
+                 "sections at fault when it can, and the program keeps the other cards word for "
+                 "word):", ""] + lines + [""]) if lines else []
+
+
 class CoursePipeline:
     """Runs after TextPipeline: reuses its models, prompts, caches and logging."""
 
@@ -464,8 +526,9 @@ class CoursePipeline:
         for item in data.get("exercises", []) if exercises else []:
             kind = EXERCISE_STATUSES.get(item.get("status"))
             if kind and isinstance(item.get("exercise"), int):
-                issues.append(_issue(kind, f'exercise {item["exercise"]}: '
-                                           + str(item.get("detail") or item["status"])))
+                issues.append(dict(_issue(kind, f'exercise {item["exercise"]}: '
+                                                + str(item.get("detail") or item["status"])),
+                                   field="exercises"))
         by_id = {str(i["id"]): i for i in ctx["ideas"]}
         ideas = []
         for item in data.get("ideas", []) if idea_ids else []:
@@ -499,14 +562,16 @@ class CoursePipeline:
         return issues, ideas
 
     def _process(self, outline: Outline, part: Node, record: dict, start: dict | None = None,
-                 feedback: str = "", tries: int | None = None) -> dict:
+                 feedback: str = "", tries: int | None = None,
+                 scope: list[str] | None = None) -> dict:
         """Write, check by code, judge, and keep the best attempt. `start` (a finished result)
         and `feedback` make a revision: the earlier result stays unless the new one has no more
-        blocking problems."""
+        blocking problems. With `scope` (see card_scope), the first attempt replaces only the
+        cards of those nodes; later repairs are bounded the same way when they can be."""
         ctx = self._context(outline, part, record)
         ctx["slides"] = " ".join(self.p.slides) if self.p.slides else ""
         language = self.p.language
-        best, attempts = None, 0
+        best, attempts, repairs = None, 0, []
         if start:
             best = {"cards": start["cards"], "exercises": start.get("exercises", []),
                     "issues": start["issues"], "blocking": start["blocking"],
@@ -515,23 +580,33 @@ class CoursePipeline:
         for _ in range(self.p.max_retries + 1 if tries is None else tries):
             attempts += 1
             cards, exercises = self._write(outline, ctx, record, feedback)
+            if scope and best is not None:  # a bounded repair keeps every card that passed
+                cards, exercises = splice_cards(best, cards, exercises, scope, ctx["nodes"])
             judged, ideas = self._judge(ctx, record, outline, cards, exercises)
             issues = card_issues(cards, ctx, language) + question_issues(cards, exercises) + judged
             count = len([i for i in issues if i["type"] not in SOFT])
             better = count <= best["blocking"] if (start and attempts == 1) else (
                 best is None or count < best["blocking"])
+            if best is not None:
+                repairs.append({"attempt": (start or {}).get("attempts", 0) + attempts,
+                                "scope": scope or "all", "before": best["blocking"],
+                                "after": count, "kept": better})
             if better:
                 best = {"cards": cards, "exercises": exercises, "issues": issues,
                         "blocking": count, "ideas": ideas, "revised": bool(start)}
             if best["blocking"] == 0:
                 break
-            more = attempts <= self.p.max_retries
+            more = attempts < (self.p.max_retries + 1 if tries is None else tries)
+            scope = card_scope(best["issues"], record, best["cards"])
             self.p.log(f"[course] part {part.id}: {best['blocking']} problem(s), "
-                       + ("rewriting with feedback" if more else "keeping the best attempt"))
+                       + ("keeping the best attempt" if not more else
+                          f"rewriting the cards of {scope_words(scope)} with feedback, keeping "
+                          "the rest" if scope else "rewriting with feedback"))
+            shown = [i for i in best["issues"] if i["type"] not in SOFT
+                     and (not scope or _place(i, record) in scope)]
             feedback = format_feedback(json.dumps({"cards": best["cards"],
                                                    "exercises": best["exercises"]},
-                                                  ensure_ascii=False),
-                                       [i for i in best["issues"] if i["type"] not in SOFT])
+                                                  ensure_ascii=False), shown, scope)
         source = " ".join(s["text"] for s in ctx["script"])
         cards = [dict(derive(c, ctx["script"], source, ctx["slides"], language),
                       id=f"{part.id}.{k}") for k, c in enumerate(best["cards"], 1)]
@@ -541,6 +616,7 @@ class CoursePipeline:
         return {"part": part.id, "title": part.title, "cards": cards, "exercises": exercises,
                 "issues": best["issues"], "blocking": best["blocking"],
                 "attempts": (start or {}).get("attempts", 0) + attempts,
+                "repairs": (start or {}).get("repairs", []) + repairs,
                 "flagged": best["blocking"] > 0, "ideas": ideas,
                 "revised": best.get("revised", False)}
 
@@ -620,12 +696,24 @@ class CoursePipeline:
             cache = directory / f"revised_{int(part['part']):03d}.json"
             if cache.exists():
                 return json.loads(cache.read_text(encoding="utf-8"))
+            # bounded like a repair: only the cards of the sections with loose ends are new
+            node_of = {c["id"]: c["node"] for c in part["cards"]}
+            record = by_part[part["part"]]
+            at = {node_of.get(str(i["card"])) for i in loose[part["part"]]}
+            scope = [s["node"] for s in record["sections"] if s["node"] in at] or None
+            if scope and {c["node"] for c in part["cards"]} <= set(scope):
+                scope = None
             self.p.log(f"[course] part {part['part']}: revising {len(loose[part['part']])} "
-                       "loose end(s) found by the cold read")
+                       "loose end(s) found by the cold read"
+                       + (f", in the cards of {scope_words(scope)} only" if scope else ""))
+            only = (f" Rewrite only the cards of {scope_words(scope)}: the program keeps every "
+                    "other card and the exercises word for word, so give them back unchanged."
+                    if scope else "")
             feedback = ("A first-year reader who knows only the earlier parts read these cards "
                         "and was lost at the places below. Fix each one in the card named (define "
                         "the term, add the missing step or context, rewrite the confusing "
-                        "sentence), using only the SCRIPT, and keep everything else as it is.\n\n"
+                        "sentence), using only the SCRIPT, and keep everything else as it is."
+                        + only + "\n\n"
                         + json.dumps({"cards": part["cards"], "exercises": part.get("exercises",
                                                                                     [])},
                                      ensure_ascii=False)
@@ -633,8 +721,8 @@ class CoursePipeline:
                             f"- card {i['card']} ({i['kind']}): {i['detail']}"
                             for i in loose[part["part"]]))
             try:
-                result = self._process(outline, outline.node(part["part"]), by_part[part["part"]],
-                                       start=part, feedback=feedback, tries=1)
+                result = self._process(outline, outline.node(part["part"]), record,
+                                       start=part, feedback=feedback, tries=1, scope=scope)
             except Exception as exc:  # a failed revision keeps the reviewed cards
                 self.p.log(f"[course] revision of part {part['part']}: {exc}")
                 return part
@@ -775,6 +863,7 @@ def course_report(course: dict, stats: dict, language: str = "en") -> str:
         lines.append(f"Parts {', '.join(revised)} were revised once from the loose ends of the "
                      "cold read; a revision is kept only when it has no more problems than the "
                      "cards it replaces.")
+    lines += card_repair_lines(parts)
     external = [c for c in cards if c["origin"] == "external"]
     lines.append(f"{len(external)} card(s) teach facts from outside the lecture and are marked "
                  "as such in the notes.")

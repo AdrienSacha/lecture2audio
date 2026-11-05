@@ -13,7 +13,7 @@ The reader is intelligent but knows nothing of the field. Write the way a good t
 - TERMBASE FOR THIS PART (JSON): the technical terms with their one definition, the terms each relies on, the terms not to be confused with it, and "define_here" (true if this part must define the term, false if an earlier part did).
 - IDEAS TO TEACH (optional, JSON): the atomic ideas the teacher taught in this part (definitions, claims, steps, formulas, conditions, examples, warnings). Each has the outline nodes where it is taught ("nodes"), so it belongs in a card of one of those nodes. Every one of them must be taught in some card. The SCRIPT is the source of the content; the ideas are the checklist.
 - NOTATION SO FAR (optional, JSON): symbols fixed by earlier parts or lectures. Keep each meaning exactly; never reuse a symbol for another meaning.
-- FEEDBACK (optional): problems a reviewer found in an earlier attempt, shown with that attempt. Fix every one and keep everything that was correct.
+- FEEDBACK (optional): problems a reviewer found in an earlier attempt, shown with that attempt. Fix every one and keep everything that was correct. When FEEDBACK says that the problems lie only in some sections (nodes) or in the exercises, rewrite only the cards of those nodes (or only the exercises) and give back every other card exactly as in the earlier attempt: the program keeps them word for word and discards any change to them. Still return the whole JSON object.
 
 # Cards
 

@@ -547,6 +547,93 @@ class Revision(unittest.TestCase):
         self.assertTrue(first["cards"][0]["plain"])
 
 
+class BoundedRepair(unittest.TestCase):
+    """A repair or a revision rewrites only the cards of the sections at fault."""
+
+    RECORD = {"sections": [{"node": "1", "sentences": [{"origin": "added", "text": "a"}]},
+                           {"node": "1.1", "sentences": [{"origin": "lecture", "text": "b"}]},
+                           {"node": "1.2", "sentences": [{"origin": "lecture", "text": "c"},
+                                                         {"origin": "lecture", "text": "d"}]}]}
+
+    def cards(self):
+        return [card(node="1", title="A", covers=[1]), card(node="1.1", title="B", covers=[2]),
+                card(node="1.2", title="C", covers=[3, 4])]
+
+    def test_issues_are_placed_by_card_node_sentence_or_exercise(self):
+        issues = [course._issue("changed", "x", 3, "1.2"),
+                  dict(course._issue("uncovered", "y"), sentence=2),
+                  dict(course._issue("exercise_wrong", "exercise 1: z"), field="exercises"),
+                  course._issue("plain_long", "soft", 1, "1")]
+        self.assertEqual(course.card_scope(issues, self.RECORD, self.cards()),
+                         ["1.1", "1.2", "exercises"])
+        general = [course._issue("undefined_term", "no card defines it")]
+        self.assertIsNone(course.card_scope(general, self.RECORD, self.cards()))
+        everywhere = [course._issue("changed", "x", k, n) for k, n in ((1, "1"), (2, "1.1"),
+                                                                         (3, "1.2"))]
+        self.assertIsNone(course.card_scope(everywhere, self.RECORD, self.cards()))
+
+    def test_the_splice_keeps_the_cards_outside_the_scope(self):
+        best = {"cards": self.cards(), "exercises": [{"question": "old"}]}
+        new = [card(node="1", title="NEW A", covers=[1]), card(node="1.2", title="NEW C1", covers=[3]),
+               card(node="1.2", title="NEW C2", covers=[4])]
+        cards, exercises = course.splice_cards(best, new, [{"question": "new"}], ["1.2"],
+                                               ["1", "1.1", "1.2"])
+        self.assertEqual([c["title"] for c in cards], ["A", "B", "NEW C1", "NEW C2"])
+        self.assertEqual(exercises, [{"question": "old"}])
+        _, exercises = course.splice_cards(best, new, [{"question": "new"}], ["exercises"],
+                                           ["1", "1.1", "1.2"])
+        self.assertEqual(exercises, [{"question": "new"}])
+
+    def test_a_repair_cannot_change_a_card_that_passed(self):
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            if n == 1:
+                data["cards"] = data["cards"][:-1]  # the cards of 1.2 are missing
+            elif n == 2:
+                data["cards"][0]["title"] = "Damaged by the repair"
+            return json.dumps(data)
+
+        outline, records, result, calls, tmp = stage(writer)
+        self.addCleanup(tmp.cleanup)
+        first = result["parts"][0]
+        self.assertEqual((first["attempts"], first["flagged"]), (2, False))
+        self.assertNotIn("Damaged by the repair", [c["title"] for c in first["cards"]])
+        self.assertEqual([c["node"] for c in first["cards"]], ["1", "1.1", "1.2"])
+        self.assertEqual(first["repairs"], [{"attempt": 2, "scope": ["1.2"], "before": 3,
+                                             "after": 0, "kept": True}])
+        self.assertIn("only in section 1.2. Rewrite only that", calls["write"][1])
+        report = course.course_report(result, {"cards": 5, "diagrams": 0, "notes": 1})
+        self.assertIn("- Part 1, attempt 2: the cards of section 1.2 were rewritten; the blocking "
+                      "problems went from 3 to 0, so the repair was kept.", report)
+
+    def test_a_revision_rewrites_only_the_cards_with_loose_ends(self):
+        reads = []
+
+        def cold(user):
+            reads.append(user)
+            if len(reads) == 1:
+                return json.dumps({"loose": [{"card": "1.3", "kind": "missing_context",
+                                              "detail": "why the sender waits is not said"}]})
+            return json.dumps({"loose": []})
+
+        def writer(user, n):
+            data = json.loads(dry_course(user))
+            if "first-year reader" in user:
+                data["cards"][0]["title"] = "Damaged by the revision"
+                data["cards"][-1]["title"] = "The timeout, revised"
+            return json.dumps(data)
+
+        outline, records, result, calls, tmp = stage(writer=writer, cold=cold)
+        self.addCleanup(tmp.cleanup)
+        first = result["parts"][0]
+        self.assertTrue(first["revised"])
+        titles = [c["title"] for c in first["cards"]]
+        self.assertNotIn("Damaged by the revision", titles)
+        self.assertEqual(titles[-1], "The timeout, revised")
+        self.assertIn("Rewrite only the cards of section 1.2", calls["write"][-1])
+        self.assertEqual(first["repairs"][-1]["scope"], ["1.2"])
+
+
 class ColdRead(unittest.TestCase):
     def test_loose_ends_are_reported_and_do_not_block(self):
         def cold(user):
