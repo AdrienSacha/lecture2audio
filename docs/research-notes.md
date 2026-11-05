@@ -325,7 +325,7 @@ Three papers from October and November 2026 test the repair loop of `_process` m
 - a rule that must never be broken belongs in a hook (a script that Claude Code runs automatically), not in the file;
 - personal preferences go in `CLAUDE.local.md`, which is not committed.
 
-**What it changes in the build.** `CLAUDE.md` has 38 lines in four sections: commands, conventions, design decisions, gotchas. `CLAUDE.local.md` is listed in `.gitignore`. No hook was added, because no rule here is absolute yet.
+**What it changes in the build.** `CLAUDE.md` has 57 lines in four sections: commands, conventions, design decisions, gotchas. `CLAUDE.local.md` is listed in `.gitignore`. No hook was added, because no rule here is absolute yet.
 
 ---
 

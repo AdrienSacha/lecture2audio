@@ -40,7 +40,7 @@ The default models are DeepSeek (`DEEPSEEK_API_KEY`); `--llm anthropic` needs `A
 
 Everything is in `out/<folder name>/`:
 
-1. `report.md`: open problems, the verifier test, and the section "Idea ledger", which lists every idea of the lecture that did not reach the cards. Report these to the user first.
+1. `report.md`: open problems, the repairs, the planted-fault tests, and the section "Idea ledger", which lists every idea of the lecture that did not reach the cards. Report these to the user first. The section "Stages of this run" says which stages were reused from the cache.
 2. `ideas.csv`: one row per atomic idea (`idea_id,node_id,kind,statement,source_units,covered_in_card,status`). Status `verified` means a card teaches it and a judge confirmed it; `missing_script`, `missing_cards` or `pending` need a look at the transcript units given.
 3. `vault/` (or the `--vault-dir` folder): the notes. `<name> – Index.md` embeds the full recording and links every part; `<name> – Full Lecture.md` reads the lecture as one chapter.
 4. `<name>.m4a`: the whole audio with chapters (`ffprobe -v error -show_chapters <file>.m4a`).
