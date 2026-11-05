@@ -438,7 +438,10 @@ def run(args, series: dict | None = None) -> int:
     course = course_stats = None
     vault = Path(args.vault_dir) / name if args.vault_dir else work / "vault"
 
+    fresh: set[str] = set()  # outputs written again in this run, not read from a cache
+
     def write_course(audio: dict | None = None) -> dict:
+        fresh.add("vault")
         stats = write_vault(vault, [{"name": name, "outline": outline, "course": course,
                                      "records": records, "terms": terms, "audio": audio}],
                             language, outline.title)
@@ -487,6 +490,7 @@ def run(args, series: dict | None = None) -> int:
         override = {}
         if source.suffix.lower() not in AUDIO_EXT:
             override["transcribe"] = "read from the input file"
+        override.update({stage: stages.REBUILT for stage in fresh})
         if course_stats and args.vault_dir:
             override["vault"] = f"written to {vault}"
         # the course section and the stage section go before the list of noise, which stays last
@@ -541,6 +545,7 @@ def run(args, series: dict | None = None) -> int:
         part_files = encode_part_files(voiced, [r["part"] for r in records], work / "audio",
                                        work / "parts", name, args.format, titles,
                                        loudness=not args.no_loudnorm)
+        fresh.add("parts")
         course_stats = write_course({"full": output, "parts": part_files})
     reports(chapters, roundtrip)
     log(f"Done. Audio: {output}")

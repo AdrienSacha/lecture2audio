@@ -417,7 +417,7 @@ class CoursePipeline:
                                        for s, m in ctx["notation"].items()], ensure_ascii=False)
                            if ctx["notation"] else "")
                 + _section("IDEAS TO TEACH (JSON)",
-                           json.dumps([{k: i[k] for k in ("id", "kind", "idea")}
+                           json.dumps([{k: i[k] for k in ("id", "kind", "idea", "nodes") if k in i}
                                        for i in ctx["ideas"]], ensure_ascii=False, indent=1)
                            if ctx["ideas"] else "")
                 + _section("FEEDBACK", feedback)

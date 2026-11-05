@@ -390,6 +390,7 @@ class JudgeChecks(unittest.TestCase):
             data = json.loads(dry_course(user))
             for c in data["cards"]:
                 c["explanation"] = [p.replace("64", "many") for p in c["explanation"]]
+                c["plain"] = c["plain"].replace("64", "many")
             return json.dumps(data)
         outline, records, result, calls, tmp = stage(writer=writer, coverage=IDEAS)
         self.addCleanup(tmp.cleanup)
@@ -399,7 +400,7 @@ class JudgeChecks(unittest.TestCase):
         self.assertEqual(ideas["T2"]["lost"], [])
         self.assertEqual(part["attempts"], 1)  # not blocking
         issue = next(i for i in part["issues"] if i["type"] == "idea_numbers")
-        self.assertIn("in card 1.1, but the card does not contain 64", issue["detail"])
+        self.assertIn("in card 1.2, but the card does not contain 64", issue["detail"])  # node 1.1
 
     def test_a_number_in_code_or_a_table_counts(self):
         def writer(user, n):

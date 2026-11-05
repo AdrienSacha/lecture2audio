@@ -11,7 +11,7 @@ The reader is intelligent but knows nothing of the field. Write the way a good t
 - REQUIRED STRUCTURE (JSON): the nodes of this part, in order.
 - SCRIPT: the verified script of this part, in numbered sentences grouped under the nodes. Each sentence carries a tag: "lecture" (taught by the teacher), "added" (a clarification already checked) or "external" (a fact from outside the lecture, with its source id). This is your only source of content.
 - TERMBASE FOR THIS PART (JSON): the technical terms with their one definition, the terms each relies on, the terms not to be confused with it, and "define_here" (true if this part must define the term, false if an earlier part did).
-- IDEAS TO TEACH (optional, JSON): the atomic ideas the teacher taught in this part (definitions, claims, steps, formulas, conditions, examples, warnings). Every one of them must be taught in some card. The SCRIPT is the source of the content; the ideas are the checklist.
+- IDEAS TO TEACH (optional, JSON): the atomic ideas the teacher taught in this part (definitions, claims, steps, formulas, conditions, examples, warnings). Each has the outline nodes where it is taught ("nodes"), so it belongs in a card of one of those nodes. Every one of them must be taught in some card. The SCRIPT is the source of the content; the ideas are the checklist.
 - NOTATION SO FAR (optional, JSON): symbols fixed by earlier parts or lectures. Keep each meaning exactly; never reuse a symbol for another meaning.
 - FEEDBACK (optional): problems a reviewer found in an earlier attempt, shown with that attempt. Fix every one and keep everything that was correct.
 
