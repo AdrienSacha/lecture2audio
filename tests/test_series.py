@@ -114,7 +114,7 @@ class Series(unittest.TestCase):
                 with self.assertRaises(SystemExit) as raised:
                     main(["series", str(src / "a.txt"), str(src / "b.txt"), "--llm", "dry",
                           "--name", "net", "--max-part-words", "60", "--out", str(out),
-                          "--vault-dir", str(vault)])
+                          "--vault-dir", str(vault), "--no-open-obsidian"])
             self.assertEqual(raised.exception.code, 0)
             self.assertTrue((vault / "net" / "00 Course.md").exists())
             self.assertTrue((vault / "net" / "a").is_dir() and (vault / "net" / "b").is_dir())
