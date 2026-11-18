@@ -20,7 +20,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from . import enrich
-from .course_schema import Card, Cards, Exercise, describe
+from .course_schema import MAX_PARAGRAPHS, Card, Cards, Exercise, describe
 from .outline import Node, Outline, render_outline
 from .pipeline import (_NUMBER, SOFT_ISSUES, NumberIndex, TextPipeline, _and, _section, blocking,
                        format_feedback, numbers_lost, scope_words, sentences_of,
@@ -782,6 +782,13 @@ class CoursePipeline:
 
 # --------------------------------------------------------------------- dry run
 
+def _paragraphs(sentences: list[str], limit: int = MAX_PARAGRAPHS) -> list[str]:
+    """The sentences as at most `limit` paragraphs (a long section of a real lecture has more
+    sentences than a card may have paragraphs)."""
+    size = -(-len(sentences) // limit)
+    return [" ".join(sentences[k:k + size]) for k in range(0, len(sentences), size)]
+
+
 def dry_course(user: str) -> str:
     """Stand-in for the course writer in smoke tests: one card per section, one sentence each."""
     termbase = []
@@ -810,7 +817,7 @@ def dry_course(user: str) -> str:
             continue
         card = {"node": section["node"], "kind": "concept", "title": f"Section {section['node']}",
                 "plain": section["lines"][0][1], "terms": [], "definition": "", "instance": "",
-                "explanation": [text for _, text in section["lines"]], "formulas": [],
+                "explanation": _paragraphs([text for _, text in section["lines"]]), "formulas": [],
                 "notation": [], "example": None, "diagram": None, "code": [], "table": None,
                 "checks": [], "covers": [n for n, _ in section["lines"]]}
         if owed:

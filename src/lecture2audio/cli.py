@@ -24,12 +24,14 @@ from .course_render import write_vault
 from .series import load_lecture, merge_termbases, series_report
 from .llm import PRESETS, FakeLLM, LLMError, dry_run_handler, make_llm, research_loop
 from .web import SEARCH_ENGINES, FetchError, make_search, pick_engine
+from . import latex, project as project_stage, recitation, slides as slides_stage
 from .pipeline import PipelineError, TextPipeline, chapter_titles, load_prompts
 from .report import (write_glossary, write_index, write_questions, write_reference,
                      write_report, write_script)
 from .segment import split_units
-from .sources import (AUDIO_EXT, detect_language, discover_inputs, load_glossary, load_slides,
-                      load_transcript, slugify)
+from .sources import (AUDIO_EXT, detect_language, discover_inputs, garbled_share, input_kind,
+                      load_glossary,
+                      load_slides, load_transcript, slide_units, slugify)
 from .transcribe import STTError, available as stt_available, transcribe_audio
 from .tts import TTSError, make_tts
 
@@ -76,12 +78,31 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--slides", help="slides as PDF (needs pypdf), PowerPoint (needs "
                                         "python-pptx) or text, optional")
         p.add_argument("--glossary", help="text file, one course term per line, optional")
+        p.add_argument("--read-slides", choices=["auto", "vision", "text"], default="auto",
+                       help="how a PDF of slides is read: 'vision' = each page is shown to the "
+                            "model, which writes the formulas as LaTeX and describes the "
+                            "figures (one call per slide); 'text' = the text of the file, "
+                            "which loses formulas and figures; 'auto' = vision when the model "
+                            "is known to read images (anthropic, openai), else text")
         p.add_argument("--language", choices=["en", "fr", "auto"], default="en")
         p.add_argument("--course", action=argparse.BooleanOptionalAction, default=True,
                        help="write the course material (default; --no-course skips it): a "
                             "Markdown vault for Obsidian with exact definitions, full "
                             "explanations, worked examples, check questions, figures, linked "
                             "terms and the audio players, made from the verified script")
+        p.add_argument("--recitation", action=argparse.BooleanOptionalAction, default=True,
+                       help="write the recitation notes (default): recitation.tex and "
+                            "recitation.pdf, the lecture re-taught as a handout with "
+                            "definitions, results, worked examples, figures, exercises with "
+                            "solutions, a glossary and clickable references")
+        p.add_argument("--project", action="store_true",
+                       help="also design a project (project.tex, project.pdf): one thing to "
+                            "build in about twenty steps, each with a check, that cannot be "
+                            "finished without understanding the lecture")
+        p.add_argument("--pdf", action=argparse.BooleanOptionalAction,
+                       default=os.environ.get("L2A_PDF", "1") != "0",
+                       help="build the PDFs with LaTeX (default; needs MacTeX, TeX Live or "
+                            "tectonic; --no-pdf or L2A_PDF=0 writes only the .tex files)")
         p.add_argument("--vault-dir", default=os.environ.get("L2A_VAULT_DIR"),
                        help="folder where the course vault is written (default: env "
                             "L2A_VAULT_DIR, else vault/ in the lecture's output folder). Point "
@@ -158,7 +179,8 @@ def build_parser() -> argparse.ArgumentParser:
         llm.add_argument("--prompts-dir",
                          help="folder with your own prompts (outline.md, rewrite.md, verify.md, "
                               "spoken.md, coverage.md, ideas.md, termbase.md, research.md, "
-                              "terms.md, course.md, course_check.md, cold_read.md)")
+                              "terms.md, course.md, course_check.md, cold_read.md, "
+                              "recitation.md, project.md)")
         stt = p.add_argument_group("speech to text (recording input, round trip)")
         stt.add_argument("--stt", choices=["auto", "mlx", "faster", "parakeet"], default="auto",
                          help="mlx = Whisper large-v3 on Apple chips; faster = faster-whisper; "
@@ -260,7 +282,7 @@ def _researcher(args, llm):
                                                args.research_depth)), None
 
 
-def _transcript(args, work: Path, glossary: str, log) -> str:
+def _transcript(args, work: Path, glossary: str, log, read=load_slides) -> str:
     source = Path(args.input)
     target = work / "transcript.txt"
     if source.suffix.lower() in AUDIO_EXT:
@@ -285,7 +307,22 @@ def _transcript(args, work: Path, glossary: str, log) -> str:
             log(f"[transcribe] saved {target}. Correct misheard technical terms there; "
                 "running the same command again reuses your corrected file.")
         return target.read_text(encoding="utf-8")
-    text = load_transcript(source)
+    if input_kind(source) == "slides":
+        # no recording and no transcript: the slides are the lecture, one unit per bullet
+        pages = read(source)
+        text = "\n\n".join(slide_units(pages))
+        if not text:
+            raise SystemExit(f"No text could be read from {source.name}: slides that are only "
+                             "pictures need a transcript or a recording beside them.")
+        log(f"[inputs] slides only: {len(pages)} slide(s) of {source.name} are the lecture; "
+            "what they state without explaining is researched as gaps")
+        garbled = garbled_share(pages)
+        if garbled > 0.02:
+            log(f"[inputs] about {garbled:.0%} of the words of {source.name} are garbled by "
+                "the fonts of the file (a letter pair read as one wrong letter); the original "
+                ".pptx, or a corrected transcript.txt, gives better notes")
+    else:
+        text = load_transcript(source)
     target.write_text(text, encoding="utf-8")
     return text
 
@@ -317,13 +354,17 @@ def _resolve_folder(args, log) -> None:
     if not folder.is_dir():
         return
     found = discover_inputs(folder)
-    if not found["input"]:
-        raise SystemExit(f"No transcript (.txt .srt .vtt .md) or recording (.m4a .mp3 .wav "
-                         f".mp4 ...) found in {folder}")
+    if not found["kind"]:
+        raise SystemExit(f"No transcript (.txt .srt .vtt .md), recording (.m4a .mp3 .wav "
+                         f".mp4 ...) or slides (.pdf .pptx) found in {folder}")
     args.name = args.name or slugify(folder.resolve().name)
-    args.input = str(found["input"])
-    if not args.slides and found["slides"]:
-        args.slides = str(found["slides"])
+    if found["kind"] == "slides":  # nothing spoken: the slides are the lecture
+        args.input = str(args.slides or found["slides"])
+        args.slides = None
+    else:
+        args.input = str(found["input"])
+        if not args.slides and found["slides"]:
+            args.slides = str(found["slides"])
     if not args.glossary and found["glossary"]:
         args.glossary = str(found["glossary"])
     log(f"[inputs] {folder}: lecture {Path(args.input).name}"
@@ -371,14 +412,40 @@ def run(args, series: dict | None = None) -> int:
     name = args.name or slugify(source.stem)
     work = Path(args.out) / name
     work.mkdir(parents=True, exist_ok=True)
+    kind = input_kind(source)
     glossary = load_glossary(args.glossary)
-    slides = load_slides(args.slides)
     if args.redo:
         _discard(work, LATER[args.redo])
     start = stages.present(work)
+    track = stages.Tracker(work)
+    rewrite_llm, verify_llm = (None, None) if args.transcribe_only else _llms(args)
+    slide_notes: dict = {}
 
-    text = _transcript(args, work, glossary, log)
+    def read(path) -> list[str]:
+        """The slides, one string per slide: read by sight when the file is a PDF and the
+        model reads images (--read-slides), else from the text of the file."""
+        if not path:
+            return []
+        sees = (rewrite_llm is not None and args.llm != "dry" and (
+            args.read_slides == "vision" or (args.read_slides == "auto" and rewrite_llm.vision)))
+        if Path(path).suffix.lower() != ".pdf":
+            return load_slides(path)
+        if not sees:
+            slide_notes.update(mode="text", why="", fallback=[])
+            return load_slides(path)
+        track("slides")
+        pages, notes = slides_stage.read_slides(path, work / "slides", rewrite_llm, log,
+                                                args.workers, args.prompts_dir)
+        slide_notes.update(notes)
+        return pages
+
+    # slides given twice (as the lecture and as its slides) are only the lecture
+    slides = [] if kind == "slides" and args.slides and (
+        Path(args.slides).resolve() == source.resolve()) else read(args.slides)
+    track("transcribe")
+    text = _transcript(args, work, glossary, log, read)
     if args.transcribe_only:
+        track.finish()
         return 0
     language = detect_language(text) if args.language == "auto" else args.language
     units = split_units(text)
@@ -396,16 +463,18 @@ def run(args, series: dict | None = None) -> int:
     before = start & stages.present(work)
     log(f"{len(text.split())} words, {len(units)} units, language: {language}")
 
-    rewrite_llm, verify_llm = _llms(args)
     researcher, research_note = _researcher(args, rewrite_llm)
     pipeline = TextPipeline(work, language, rewrite_llm, verify_llm,
                             load_prompts(language, args.prompts_dir), glossary, slides,
                             args.max_retries, log, args.max_part_words, args.workers,
-                            researcher)
+                            researcher, kind if kind == "slides" else "transcript")
+    track("outline")
     outline = pipeline.run_outline(units)
     log(f"[outline] {len(outline.parts)} part(s), "
         f"{sum(len(p.children) for p in outline.parts)} point(s)")
+    track("gaps")
     coverage = pipeline.run_coverage(outline)
+    track("ideas")
     pipeline.run_ideas(outline)  # fills coverage["transcript_ideas"], part by part
     # the idea ledger: every atomic idea of the transcript, checked off by the later stages as
     # each part finishes; ideas.csv is rewritten after every part
@@ -413,27 +482,35 @@ def run(args, series: dict | None = None) -> int:
     ideas = book.rows
     log(f"[ideas] {len(ideas)} atomic idea(s) in {book.path}")
     ideas_audit = None if args.no_audit else pipeline.audit_ideas(outline)
+    track("gaps")
     terms = pipeline.run_termbase(outline)
     if series.get("stop_after") == "termbase":
+        track.finish()
         return 0
+    track("research")
     if research_note and coverage["gaps"]:
         log(f"[research] skipped: {research_note}")
     supplements = pipeline.run_research(outline)
     log(f"[gaps] {len(coverage['gaps'])} gap(s), {len(terms)} term(s), "
         f"{len(supplements)} checked fact(s) from outside the lecture")
+    track("gaps")
     gaps = {"coverage": coverage, "terms": terms, "research": pipeline.research,
             "supplements": supplements, "note": research_note,
             "audit": None if args.no_audit else pipeline.audit_coverage(outline)}
+    track("rewrite")
     records = pipeline.run_parts(outline, on_done=book.script_done)
     factcheck = None
     if args.factcheck != "off":
+        track("factcheck")
         factcheck = run_factcheck(work, outline, records, coverage.get("transcript_ideas", []),
                                   log)
         if factcheck is None and args.factcheck == "minicheck":
             raise SystemExit("--factcheck minicheck needs MiniCheck: uv pip install -e "
                              "'.[factcheck]'")
+    track("rewrite")
     audit = None if args.no_audit else pipeline.audit_verifier(outline, records)
     notes = pipeline.global_notes(outline, records)
+    track("spoken")
     spoken = pipeline.run_spoken(outline, records)
     course = course_stats = None
     vault = Path(args.vault_dir) / name if args.vault_dir else work / "vault"
@@ -442,6 +519,7 @@ def run(args, series: dict | None = None) -> int:
 
     def write_course(audio: dict | None = None) -> dict:
         fresh.add("vault")
+        track("vault")
         stats = write_vault(vault, [{"name": name, "outline": outline, "course": course,
                                      "records": records, "terms": terms, "audio": audio}],
                             language, outline.title)
@@ -449,6 +527,7 @@ def run(args, series: dict | None = None) -> int:
         return stats
 
     if args.course:
+        track("course")
         course = CoursePipeline(pipeline, series.get("notation")).run(
             outline, records, on_done=book.cards_done, audit=not args.no_audit)
         if series.get("skip_vault"):
@@ -458,6 +537,37 @@ def run(args, series: dict | None = None) -> int:
             log(f"[course] {course_stats['cards']} card(s)")
         else:
             course_stats = write_course()
+    sections = project = None
+    builds: dict[str, dict | None] = {}
+    if args.recitation and not series.get("skip_vault"):
+        track("recitation")
+        sections = recitation.RecitationPipeline(pipeline).run(outline, records, course)
+    if args.project and not series:
+        track("project")
+        project = project_stage.run_project(pipeline, outline)
+
+    def document(stem: str, text: str) -> None:
+        """Write a LaTeX document and build its PDF (again only when the text changed)."""
+        track("documents")
+        tex = work / f"{stem}.tex"
+        same = tex.exists() and tex.read_text(encoding="utf-8") == text
+        tex.write_text(text, encoding="utf-8")
+        fresh.add("documents")
+        if not args.pdf:
+            builds[stem] = None
+        elif same and tex.with_suffix(".pdf").exists():
+            builds[stem] = {"pdf": tex.with_suffix(".pdf"), "errors": [],
+                            "engine": (latex.engine() or ["LaTeX"])[0]}
+        else:
+            log(f"[pdf] building {stem}.pdf")
+            builds[stem] = latex.build_pdf(tex, log)
+
+    if sections and any("blocks" in s for s in sections):
+        document("recitation", recitation.render_document(
+            name, outline, records, sections, course, terms, language, kind, bool(slides)))
+    if project:
+        document("project", project_stage.render_project(project, outline.title, language))
+    track("ledger")
     unverified = ledger.open_rows(ideas, bool(course))
     if unverified:
         log(f"[ideas] {len(unverified)} of {len(ideas)} idea(s) not "
@@ -472,6 +582,7 @@ def run(args, series: dict | None = None) -> int:
         usage[verify_llm.name + " (verifier)"] = verify_llm.usage
 
     def reports(chapters=None, roundtrip=None):
+        track.finish()
         write_script(work / "script.md", name, outline, records, language)
         write_index(work / "index.md", name, outline, chapters)
         write_questions(work / "questions.md", name, outline, records)
@@ -488,14 +599,21 @@ def run(args, series: dict | None = None) -> int:
                                                       if i["type"] == "unledgered"]},
                      factcheck, _asr_notes(work))
         override = {}
-        if source.suffix.lower() not in AUDIO_EXT:
-            override["transcribe"] = "read from the input file"
+        if kind != "recording":
+            override["transcribe"] = ("read from the slides (no recording, no transcript)"
+                                      if kind == "slides" else "read from the input file")
         override.update({stage: stages.REBUILT for stage in fresh})
         if course_stats and args.vault_dir:
             override["vault"] = f"written to {vault}"
         # the course section and the stage section go before the list of noise, which stays last
         section = (course_report(course, course_stats, language) if course else "") + "\n".join(
-            [""] + stages.report_lines(stages.statuses(work, before, override)))
+            [""] + (recitation.report_lines(sections, builds.get("recitation", None))
+                    if sections else [])
+            + (project_stage.report_lines(project, builds.get("project")) if args.project
+               and not series else [])
+            + slides_stage.report_lines(slide_notes)
+            + stages.report_lines(stages.statuses(work, before, override))
+            + [track.report_line(), ""])
         report = (work / "report.md").read_text(encoding="utf-8")
         cut = report.find("\n## Removed as noise")
         report = report + section if cut < 0 else report[:cut] + section + report[cut:]
@@ -512,12 +630,16 @@ def run(args, series: dict | None = None) -> int:
         log("[check] the idea listing missed a planted fact (see report.md)")
     if course and (course.get("audit") or {}).get("caught") is False:
         log("[check] the course judge passed an emptied card (see report.md)")
+    made = [str(b["pdf"]) for b in builds.values() if b and b.get("pdf")]
+    if made:
+        log("[pdf] " + ", ".join(made))
     if args.command == "text":
         log(f"Done. Read {work / 'script.md'} and {work / 'report.md'}.")
         if course_stats and not series:
             _open_obsidian(args, course_stats.get("entry"), log)
         return 0
 
+    track("audio")
     backend = make_tts(args.tts, language, args.voice, args.tts_command, args.tts_model)
     voiced = synth_blocks(backend, [s["blocks"] for s in spoken], work / "audio", args.chunk_chars,
                           not args.no_quiz, args.quiz_pause, log)
@@ -542,6 +664,7 @@ def run(args, series: dict | None = None) -> int:
     part_files = {}
     if course_stats and not series.get("skip_vault"):
         # one recording per part, for the player at the top of each part note
+        track("parts")
         part_files = encode_part_files(voiced, [r["part"] for r in records], work / "audio",
                                        work / "parts", name, args.format, titles,
                                        loudness=not args.no_loudnorm)
@@ -613,6 +736,9 @@ def run_series(args) -> int:
 
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "app":  # the local web app: drop the files, watch the run, read
+        from .app import main as app_main
+        sys.exit(app_main(argv[1:]))
     if argv and argv[0] not in (*COMMANDS, "-h", "--help"):
         argv = ["build", *argv]  # zero friction: `lecture2audio ./lecture_folder/`
     args = build_parser().parse_args(argv)

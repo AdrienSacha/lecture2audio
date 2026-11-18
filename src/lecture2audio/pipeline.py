@@ -35,6 +35,11 @@ SOFT_ISSUES = {"long", "filler", "plan", "marker", "idea_numbers", "unledgered",
                "duplicate_question"}
 
 
+SLIDES_ONLY = ("slides only. There is no recording and no transcript: the units are the text "
+               "of the slides (titles, bullets, formulas), in slide order. They state ideas "
+               "without explaining them.")
+
+
 class PipelineError(RuntimeError):
     pass
 
@@ -53,6 +58,8 @@ class Prompts:
     course_check: str
     cold_read: str
     ideas: str
+    recitation: str
+    project: str
 
 
 def load_prompts(language: str, prompts_dir: str | Path | None = None) -> Prompts:
@@ -67,7 +74,8 @@ def load_prompts(language: str, prompts_dir: str | Path | None = None) -> Prompt
 
     return Prompts(*(read(s) for s in ("outline", "rewrite", "verify", "spoken", "coverage",
                                         "termbase", "research", "terms", "course",
-                                        "course_check", "cold_read", "ideas")))
+                                        "course_check", "cold_read", "ideas", "recitation",
+                                        "project")))
 
 
 # ------------------------------------------------------------------ code gates
@@ -555,7 +563,8 @@ class TextPipeline:
                  prompts: Prompts, glossary: str = "", slides: list[str] | None = None,
                  max_retries: int = 2, log: Callable[[str], None] = print,
                  max_part_words: int = 1500, workers: int = 3,
-                 researcher: Callable[[str, str], tuple[str, list[dict]]] | None = None):
+                 researcher: Callable[[str, str], tuple[str, list[dict]]] | None = None,
+                 source_kind: str = "transcript"):
         self.work_dir = Path(work_dir)
         self.language = language
         self.language_name = LANGUAGE_NAMES.get(language, language)
@@ -570,6 +579,8 @@ class TextPipeline:
         self.workers = max(1, workers)
         # researcher(system, user) -> (answer, documents read); None: gaps are only listed.
         self.researcher = researcher
+        # "slides": no recording and no transcript, the units are the text of the slides
+        self.source_kind = source_kind
         # Filled by the gap stages; empty when they are not run.
         self.coverage: dict = {"slide_ideas": [], "gaps": [], "transcript_ideas": []}
         self.terms: list[dict] = []
@@ -581,6 +592,10 @@ class TextPipeline:
         directory = self.work_dir / name
         directory.mkdir(parents=True, exist_ok=True)
         return directory
+
+    def _kind(self) -> str:
+        """The SOURCE KIND section of a request: only said when the units are not speech."""
+        return _section("SOURCE KIND", SLIDES_ONLY if self.source_kind == "slides" else "")
 
     def _ask_json(self, llm: LLM, system: str, user: str, validate, what: str,
                   tries: int = 3) -> dict:
@@ -623,7 +638,7 @@ class TextPipeline:
         slides_text = "\n\n".join(self.slides)[:12000]
         user = (f"## LANGUAGE\n{self.language_name}\n\n"
                 f"## LIMITS\nAt most {self.max_part_words} words per part.\n\n"
-                + _section("GLOSSARY", self.glossary) + _section("SLIDES", slides_text)
+                + self._kind() + _section("GLOSSARY", self.glossary) + _section("SLIDES", slides_text)
                 + "## UNITS\n" + "\n".join(f"[{k}] {u}" for k, u in enumerate(units, 1)))
         holder = {}
 
@@ -657,7 +672,7 @@ class TextPipeline:
             return self.coverage
         self.log("[gaps] looking for what the lecture leaves out")
         ids = enrich.node_order(outline)
-        user = (f"## LANGUAGE\n{self.language_name}\n\n"
+        user = (f"## LANGUAGE\n{self.language_name}\n\n" + self._kind()
                 + _section("GLOSSARY", self.glossary) + _section("SLIDES", self._slides_numbered())
                 + "## TRANSCRIPT\n" + self._lecture(outline))
         try:
@@ -935,7 +950,7 @@ class TextPipeline:
 
     def _rewrite(self, outline: Outline, ctx: dict, feedback: str) -> dict:
         part = ctx["part"]
-        user = (f"## LANGUAGE\n{self.language_name}\n\n"
+        user = (f"## LANGUAGE\n{self.language_name}\n\n" + self._kind()
                 + _section("OUTLINE", render_outline(outline, part.id))
                 + _section("REQUIRED STRUCTURE (JSON)", json.dumps(ctx["shape"]))
                 + _section("TERMS ALREADY DEFINED", ", ".join(ctx["terms_before"]) or "none")

@@ -13,11 +13,11 @@ dependencies = [
     "pydantic>=2.9",
     "jinja2>=3.1",
     "latex2mathml>=3.77",
+    "pypdf>=5.0",  # slides and notes as PDF, and the checks on the PDFs the program writes
+    "python-pptx>=1.0.2",  # PowerPoint slides
 ]
 
 [project.optional-dependencies]
-pdf = ["pypdf"]
-pptx = ["python-pptx>=1.0.2"]  # PowerPoint slides
 voice = ["mlx-audio>=0.6.2"]  # Ming-3.0-tts on Apple chips
 whisper-mac = ["mlx-whisper"]
 whisper = ["faster-whisper"]

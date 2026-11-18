@@ -8,3 +8,4 @@ work/
 *.m4a
 *.mp3
 CLAUDE.local.md
+tests/.cache/

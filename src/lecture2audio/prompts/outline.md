@@ -8,6 +8,7 @@ You build the outline of a university lecture from its transcript. The outline i
 - LIMITS: the largest number of words allowed in one part.
 - GLOSSARY (optional): the correct spelling of the course's technical terms.
 - SLIDES (optional): text of the slides, useful to see where topics begin and end.
+- SOURCE KIND (optional): given when the lecture has no recording and no transcript. The units are then the text of the slides, not speech: a slide title names a topic and is content, never noise, and the slides' own order and titles are the best guide to the parts.
 - FEEDBACK (optional): why your previous outline was rejected.
 
 # Rules

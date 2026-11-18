@@ -14,6 +14,9 @@ A new stage: add it here, after the stages it needs, with the files it caches.
 """
 from __future__ import annotations
 
+import json
+import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,9 +35,12 @@ class Stage:
 STAGES: tuple[Stage, ...] = (
     # the transcript is the user's file once written (they may correct misheard terms), so
     # --redo transcribe deletes it only for a recording, in cli._transcript
+    Stage("slides", ("slides",),
+          about="the slides read by sight (formulas as LaTeX, figures described), one call "
+                "per slide"),
     Stage("transcribe", ("transcript.txt",), discard_own=False,
-          about="speech recognition of a recording, or the transcript as given"),
-    Stage("outline", ("outline.json",), ("transcribe",),
+          about="speech recognition of a recording, or the transcript or the slides as given"),
+    Stage("outline", ("outline.json",), ("transcribe", "slides"),
           about="parts, points and sub-points; every unit used once"),
     Stage("gaps", ("coverage.json", "coverage_audit.json", "termbase.json"), ("outline",),
           about="gap search over the whole lecture, its audit, and the termbase"),
@@ -56,6 +62,13 @@ STAGES: tuple[Stage, ...] = (
           about="cards, exercises, the judge, the cold read and the revision"),
     Stage("vault", ("vault",), ("course",), redo=False,
           about="the Obsidian notes"),
+    Stage("recitation", ("recitation",), ("rewrite", "ideas", "course"),
+          about="the recitation notes of each part, as blocks checked by code"),
+    Stage("project", ("project.json",), ("outline", "ideas", "gaps"),
+          about="the project: one thing to build in checkable steps (--project)"),
+    Stage("documents", ("recitation.tex", "recitation.pdf", "project.tex", "project.pdf",
+                        ".build"), ("recitation", "project"), redo=False, rebuilt=True,
+          about="the LaTeX documents and their PDFs"),
     Stage("ledger", ("ideas.csv", "anki.csv"), ("ideas", "rewrite", "course"), redo=False,
           rebuilt=True, about="the idea ledger and the Anki export"),
 )
@@ -140,6 +153,54 @@ def statuses(work: Path, before: set[str], override: dict[str, str] | None = Non
         else:
             out[stage.name] = REUSED if stage.name in before else COMPUTED
     return out
+
+
+class Tracker:
+    """What a run is doing, as data. Each change of stage is one JSON line in
+    `events.jsonl`, and on standard output as `@@stage {...}` when L2A_EVENTS is set: the app
+    follows a run from these lines and does not have to guess from the wording of the log.
+    Calling the tracker with a stage name closes the stage before it; a stage may be entered
+    more than once (the gap search and the termbase are both "gaps"), and its seconds add up.
+    """
+
+    def __init__(self, work: Path):
+        self.path = Path(work) / "events.jsonl"
+        self.path.write_text("", encoding="utf-8")
+        self.current: str | None = None
+        self.seconds: dict[str, float] = {}
+        self._began = 0.0
+        self._announce = bool(os.environ.get("L2A_EVENTS"))
+
+    def __call__(self, name: str) -> None:
+        if name not in BY_NAME:
+            raise ValueError(f"{name} is not a stage of stages.STAGES")
+        self.finish()
+        self.current, self._began = name, time.monotonic()
+        self._emit({"stage": name, "state": "running"})
+
+    def finish(self) -> None:
+        """Close the stage that is running."""
+        if self.current:
+            spent = time.monotonic() - self._began
+            self.seconds[self.current] = self.seconds.get(self.current, 0.0) + spent
+            self._emit({"stage": self.current, "state": "done",
+                        "seconds": round(self.seconds[self.current], 1)})
+            self.current = None
+
+    def _emit(self, event: dict) -> None:
+        line = json.dumps(event)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        if self._announce:
+            print("@@stage " + line, flush=True)
+
+    def report_line(self) -> str:
+        """Where the time of the run went, for report.md."""
+        spent = [(n, s) for n, s in self.seconds.items() if s >= 0.5]
+        if not spent:
+            return ""
+        return ("Time spent in this run: " + ", ".join(
+            f"{name} {seconds:.0f} s" for name, seconds in spent) + ".")
 
 
 def mermaid(stages: tuple[Stage, ...] = STAGES) -> str:

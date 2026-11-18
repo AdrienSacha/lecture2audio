@@ -31,6 +31,7 @@ HTML_ELEMENT = re.compile(r"</?(?:a|abbr|b|br|button|code|details|div|em|embed|f
                           r"span|strong|style|sub|summary|sup|svg|table|tbody|td|th|thead|tr|u|"
                           r"ul|video|audio|html|body|head)\b[^>]*>|&[a-z]+;|&#\d+;", re.I)
 INLINE_MATH = re.compile(r"\$([^$\n]+)\$")
+_CODE_SPAN = re.compile(r"`[^`\n]*`")
 
 
 def latex_error(source: str) -> str | None:
@@ -49,8 +50,10 @@ def math_in_text(text: str) -> list[str]:
 
 
 def html_in_text(text: str) -> bool:
-    """Prose is plain Markdown: raw HTML would not be shown as written."""
-    return bool(HTML_TAG.search(INLINE_MATH.sub("", text)))
+    """Prose is plain Markdown: raw HTML would not be shown as written. Math, code between
+    backquotes and placeholders such as <condition> are not HTML (real slides about
+    programming are full of "x < y" and "<expression>")."""
+    return bool(HTML_ELEMENT.search(_CODE_SPAN.sub("", INLINE_MATH.sub("", text))))
 
 
 class Model(BaseModel):

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 import re
+import statistics
+from functools import lru_cache
 from pathlib import Path
 
 AUDIO_EXT = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".webm", ".mp4", ".mov", ".mkv", ".aac"}
-TRANSCRIPT_EXT = (".srt", ".vtt", ".txt", ".md")  # in order of preference
+TRANSCRIPT_EXT = (".srt", ".vtt", ".txt", ".md", ".pdf")  # in order of preference
 SLIDE_EXT = (".pdf", ".pptx", ".md", ".txt")  # in order of preference
 _GLOSSARY_NAME = re.compile(r"gloss|lexi|terms?\b|termin|vocab", re.I)
 _SLIDE_NAME = re.compile(r"slide|diapo|deck|present|cours[-_ ]?notes|handout", re.I)
@@ -25,19 +27,24 @@ def discover_inputs(folder: str | Path) -> dict:
 
     - glossary: a .txt, .md or .csv file whose name says glossary, terms, lexique, vocabulary;
     - slides: a .pdf or .pptx file, or a .md/.txt file whose name says slides, deck, diapo;
-    - transcript: a .srt, .vtt, .txt or .md file (a name saying transcript wins, then the
-      largest); it is preferred to a recording, because it needs no speech recognition;
+      a PDF that holds a transcript (`pdf_is_transcript`) is a transcript, not slides;
+    - transcript: a .srt, .vtt, .txt or .md file, else a transcript PDF (a name saying
+      transcript wins, then the largest); it is preferred to a recording, because it needs no
+      speech recognition;
     - recording: else the largest audio or video file (.m4a .mp3 .wav .mp4 ...).
 
-    Returns {"input", "slides", "glossary", "skipped"}: paths or None, and the candidates that
-    were not chosen, so the caller can say which file it used."""
+    Returns {"input", "slides", "glossary", "kind", "skipped"}: paths or None, what the
+    lecture is built from ("transcript", "recording", "slides" when the folder holds slides
+    and nothing spoken, or None), and the candidates that were not chosen, so the caller can
+    say which file it used."""
     root = Path(folder)
     files = sorted(f for f in root.iterdir() if f.is_file() and not f.name.startswith((".", "~$")))
     suffix = {f: f.suffix.lower() for f in files}
     glossary = [f for f in files if suffix[f] in (".txt", ".md", ".csv")
                 and _GLOSSARY_NAME.search(f.stem)]
     rest = [f for f in files if f not in glossary]
-    slides = [f for f in rest if suffix[f] in (".pdf", ".pptx")
+    slides = [f for f in rest if suffix[f] == ".pptx"
+              or (suffix[f] == ".pdf" and not pdf_is_transcript(f))
               or (suffix[f] in (".md", ".txt") and _SLIDE_NAME.search(f.stem))]
     rest = [f for f in rest if f not in slides]
     transcripts = [f for f in rest if suffix[f] in TRANSCRIPT_EXT]
@@ -55,9 +62,186 @@ def discover_inputs(folder: str | Path) -> dict:
     chosen = (transcripts or audio or [None])[0]
     found = {"input": chosen, "slides": slides[0] if slides else None,
              "glossary": glossary[0] if glossary else None}
+    # what the lecture is built from: a folder with slides and nothing spoken is "slides"
+    found["kind"] = ("transcript" if transcripts else "recording" if audio
+                     else "slides" if slides else None)
     found["skipped"] = [f for f in transcripts + audio + slides + glossary
                         if f not in found.values()]
     return found
+
+
+def input_kind(path: str | Path) -> str:
+    """What one input file is: "recording", "slides" (a PDF, a PowerPoint, or a text file
+    whose name says slides: a written source with no speech) or "transcript". A PDF is read
+    to decide: a transcript published as a PDF (MIT OpenCourseWare does so) is a transcript."""
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix in AUDIO_EXT:
+        return "recording"
+    if suffix == ".pdf":
+        return "transcript" if pdf_is_transcript(p) else "slides"
+    if suffix == ".pptx" or (suffix in (".md", ".txt") and _SLIDE_NAME.search(p.stem)
+                             and not _TRANSCRIPT_NAME.search(p.stem)):
+        return "slides"
+    return "transcript"
+
+
+_CONTRACTION = re.compile(r"\b\w+['’](?:re|s|ll|ve|m|t|d)\b")
+_SPEAKER = re.compile(r"^(?:[A-Z][A-Z .]{3,30}|Speaker \d+|Intervenant \d+)\s*:\s*")
+
+
+def pdf_is_transcript(path: str | Path) -> bool:
+    """Whether a PDF holds the transcript of a lecture rather than slides or written notes.
+
+    Measured on real files (MIT OpenCourseWare): a transcript has a median of 500 to 600 words
+    a page and 4 contractions ("we're", "that's") per 100 words; slide decks have 50 to 75
+    words a page and under 0.6 contraction per 100 words. Written lecture notes are dense but
+    not spoken, so both signs are asked for. A file that cannot be read is not a transcript."""
+    p = Path(path)
+    try:
+        stat = p.stat()
+        return _pdf_is_transcript(str(p.resolve()), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return False
+
+
+@lru_cache(maxsize=64)
+def _pdf_is_transcript(path: str, _mtime: int, _size: int) -> bool:
+    try:
+        pages = _pdf_pages(path)
+    except Exception:  # a damaged PDF: let the reader of the slides report it
+        return False
+    counts = [len(page.split()) for page in pages if page.strip()]
+    if not counts or statistics.median(counts) < 250:
+        return False
+    text = " ".join(pages)
+    return len(_CONTRACTION.findall(text)) >= 0.015 * sum(counts)
+
+
+_LIGATURES = str.maketrans({"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "st",
+                            "ﬆ": "st", "\u00ad": "", "\u00a0": " "})
+
+
+def _pdf_pages(path: str | Path) -> list[str]:
+    """The text of each page of a PDF, ligatures written out.
+
+    pypdf was kept after a comparison with PyMuPDF, pdfplumber and pdfium on real decks
+    (November 2026): on Beamer slides with formulas it keeps a formula on its line where
+    pdfplumber scatters the operators and PyMuPDF breaks every line at a subscript; on
+    PowerPoint exports the four give the same text. What no reader can repair is a PDF whose
+    fonts map glyphs to the wrong characters (see `garbled_share`)."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise SystemExit("Reading a PDF needs pypdf (pip install pypdf), "
+                         "or give the slides as a .txt/.md file.") from exc
+    return [(page.extract_text() or "").translate(_LIGATURES).strip()
+            for page in PdfReader(str(path)).pages]
+
+
+_GARBLED = re.compile(r"\ufffd|^[a-z]+[A-Z][a-z]+$|^![a-z]|[a-z]!$|[ĂŶĚƚƌŝŽƉ]")
+
+
+def garbled_share(pages: list[str]) -> float:
+    """The share of words that a PDF's fonts turned into something else ("notaAon" for
+    "notation", "!me" for "time"): above a few percent the text needs a transcript or
+    the original PowerPoint file beside it."""
+    words = " ".join(pages).split()
+    return sum(bool(_GARBLED.search(w)) for w in words) / max(1, len(words))
+
+
+# a bullet sign (those of PowerPoint fonts are private-use characters, Beamer's are triangles)
+# with or without a space after it, or a number or a letter followed by "." or ")"
+_BULLET = re.compile(r"^\s*(?:[•◦▪‣·–—○●■□➢➤►▶◮▸▹◆◇§\ue000-\uf8ff]\s*|[-*+]\s+|"
+                     r"\(?\d{1,2}[.)]\s+|\(?[a-zA-Z][.)]\s+)")
+_PAGE_NUMBER = re.compile(r"^\s*(?:page|slide)?\s*\d{1,4}\s*(?:/|of|sur)?\s*\d{0,4}\s*$", re.I)
+_TRAILING_NUMBER = re.compile(r"\s*\d{1,4}(?:\s*/\s*\d{1,4})?\s*$")
+_DOTS = re.compile(r"\.(?:\s+\.){2,}")  # ". . ." of a formula, not the "..." of code
+_PRIVATE = re.compile(r"[\ue000-\uf8ff]")  # signs of a symbol font: no meaning as text
+# a line of program text: it is never joined to its neighbours, because a line break means
+# something in code and a wrapped sentence looks the same to a PDF reader
+_CODE = re.compile(
+    r"^(?:(?:if|elif|else|for|while|def|return|print|import|from|class|try|except|finally|with"
+    r"|break|continue|pass)\b.*[:)\]\w\"']$"
+    r"|(?:else|try|finally)\s*:$"
+    r"|[A-Za-z_][\w.\[\]]*\s*(?:=|\+=|-=|\*=|/=)\s*\S.*"
+    r"|.*\w\s*(?:==|!=|<=|>=)\s*\w.*"
+    r"|[A-Za-z_]\w*\s*[<>]\s*[A-Za-z_]\w*"
+    r"|[A-Za-z_][\w.]*\(.*\)\s*:?"
+    r"|<\w+>:?)$")
+
+
+def _is_code(line: str) -> bool:
+    return line.isascii() and bool(_CODE.match(line))
+
+
+def _letters(text: str) -> int:
+    return sum(c.isalnum() for c in text)
+
+
+def slide_units(pages: list[str]) -> list[str]:
+    """Slides as the source of a lecture with no recording and no transcript: one unit per
+    bullet or sentence, in slide order.
+
+    A line that continues the previous one (PDF text wraps mid-sentence) is joined to it: it
+    starts in lower case, or the line before it is as long as the long lines of the deck, or
+    it is a scrap of a formula (a bracket, a single symbol). The title of a slide (its first
+    line) and lines of code are never joined to. Page numbers go, and so does any line
+    repeated on more than half of the slides, with or without the page number after it (the
+    header or footer of the deck); so do lines with fewer than two letters or digits. ". . ." becomes
+    "…" so that "X1, . . . , Xn" is not cut into sentences. The result is what
+    `segment.split_units` gives back when the units are written one per paragraph, so the
+    user can correct `transcript.txt` like a transcript.
+    """
+    from .segment import split_units
+
+    def clean(line: str) -> str:
+        bullet = _BULLET.match(line)
+        at = bullet.end() if bullet else 0
+        line = line[:at] + _PRIVATE.sub(" ", line[at:])
+        line = _DOTS.sub("…", re.sub(r"\s+", " ", line)).strip()
+        return re.sub(r"\s+([,;])", r"\1", line)
+
+    def key(line: str) -> str:  # a footer is the same line on every slide but for the number
+        return _TRAILING_NUMBER.sub("", line) or line
+
+    lines_of = [[clean(l) for l in page.splitlines()] for page in pages]
+    lines_of = [[l for l in lines if l and not _PAGE_NUMBER.match(l)] for lines in lines_of]
+    seen: dict[str, int] = {}
+    for lines in lines_of:
+        for line in {key(l) for l in lines}:
+            seen[line] = seen.get(line, 0) + 1
+    repeated = {l for l, n in seen.items() if len(pages) >= 4 and n > len(pages) / 2}
+    lines_of = [[l for l in lines if key(l) not in repeated and l not in repeated]
+                for lines in lines_of]
+    lengths = sorted(len(l) for lines in lines_of for l in lines)
+    long = 0.8 * lengths[int(0.95 * (len(lengths) - 1))] if lengths else 0
+    units: list[str] = []
+    for lines in lines_of:
+        items: list[list] = []  # [text, is code, length of its last line, is the title]
+        for line in lines:
+            bullet = bool(_BULLET.match(line))
+            text = _BULLET.sub("", line).strip()
+            if not text:
+                continue
+            code = _is_code(text)
+            last = items[-1] if items else None
+            scrap = len(text) <= 2 or text[0] in ")]}"
+            joins = (last is not None and not bullet and not code and not last[1]
+                     and last[0][-1:] not in ".!?:;…"
+                     and (last[0][-1:] in ",-(" or (
+                         not last[3] and (text[:1].islower() or scrap or last[2] >= long))))
+            if joins:
+                last[0] += " " + text
+                last[2] = len(line)
+            else:
+                # code keeps its words, but a space after "..." inside it would end a unit
+                items.append([re.sub(r"(?<=[.!?…])\s+(?=\S)", "", text) if code else text,
+                              code, len(line), not items])
+        for item in items:
+            if _letters(item[0]) >= 2:  # a lone symbol is the scrap of a formula
+                units += [u for u in split_units(item[0]) if _letters(u)]
+    return units
 
 
 def _strip_subtitles(raw: str) -> str:
@@ -70,8 +254,36 @@ def _strip_subtitles(raw: str) -> str:
     return " ".join(lines)
 
 
+_TRANSCRIPT_HEADER = re.compile(r"^(?:MITOCW\b.*|.*\bwatch\?v=\S+)$")
+
+
+def _pdf_transcript(path: Path) -> str:
+    """The text of a transcript published as a PDF: one paragraph per paragraph of the file
+    as far as the lines show it (a short line ends one, a speaker's name starts one), without
+    page numbers, the publisher's header and the speakers' names."""
+    paragraphs: list[str] = []
+    for page in _pdf_pages(path):
+        lines = [re.sub(r"\s+", " ", l).strip() for l in page.splitlines()]
+        lines = [l for l in lines if l and not _PAGE_NUMBER.match(l)
+                 and not _TRANSCRIPT_HEADER.match(l)]
+        width = max((len(l) for l in lines), default=0)
+        open_paragraph = False
+        for line in lines:
+            speaker = _SPEAKER.match(line)
+            text = line[speaker.end():] if speaker else line
+            if speaker or not open_paragraph:
+                paragraphs.append(text)
+            else:
+                paragraphs[-1] += " " + text
+            open_paragraph = bool(text) and not (
+                len(line) < 0.75 * width and text[-1:] in ".!?")
+    return "\n\n".join(p.strip() for p in paragraphs if p.strip())
+
+
 def load_transcript(path: str | Path) -> str:
     p = Path(path)
+    if p.suffix.lower() == ".pdf":
+        return _pdf_transcript(p)
     raw = p.read_text(encoding="utf-8", errors="replace")
     if p.suffix.lower() in (".srt", ".vtt"):
         return _strip_subtitles(raw).strip()
@@ -108,12 +320,7 @@ def load_slides(path: str | Path | None) -> list[str]:
             slides.append("\n".join(texts))
         return slides
     if p.suffix.lower() == ".pdf":
-        try:
-            from pypdf import PdfReader
-        except ImportError as exc:
-            raise SystemExit("Reading a PDF needs pypdf (pip install pypdf), "
-                             "or give the slides as a .txt/.md file.") from exc
-        return [(page.extract_text() or "").strip() for page in PdfReader(str(p)).pages]
+        return _pdf_pages(p)
     raw = p.read_text(encoding="utf-8", errors="replace")
     return [x.strip() for x in re.split(r"\n-{3,}\n|\f", raw) if x.strip()]
 

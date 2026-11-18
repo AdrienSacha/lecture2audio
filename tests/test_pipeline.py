@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+os.environ["L2A_PDF"] = "0"  # the LaTeX build has its own tests (test_recitation)
 
 from lecture2audio.cli import main
 from lecture2audio.llm import FakeLLM, _between, dry_run_handler

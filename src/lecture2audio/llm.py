@@ -18,6 +18,7 @@ read timeout.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import email.utils
 import json
@@ -65,6 +66,7 @@ class LLM:
     base_url = ""
     unreachable_hint = ""
     _passthrough: tuple = ()  # SDK errors that `_errors` lets through to the caller
+    vision = False  # True when the model is known to read images (`read_image`)
 
     def __init__(self):
         self.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
@@ -78,6 +80,11 @@ class LLM:
 
     def complete(self, system: str, user: str, max_tokens: int = MAX_TOKENS) -> str:
         raise NotImplementedError
+
+    def read_image(self, system: str, user: str, png: bytes,
+                   max_tokens: int = MAX_TOKENS) -> str:
+        """Answer about one PNG image (a rendered slide)."""
+        raise LLMError(f"{self.name} cannot read images.")
 
     def research(self, system: str, user: str, max_tokens: int = MAX_TOKENS,
                  depth: int = 30) -> tuple[str, list[dict]]:
@@ -232,6 +239,16 @@ class AnthropicLLM(LLM):
     def _text(message) -> str:
         return "".join(b.text for b in message.content if b.type == "text")
 
+    vision = True
+
+    def read_image(self, system: str, user: str, png: bytes,
+                   max_tokens: int = MAX_TOKENS) -> str:
+        image = {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                             "data": base64.standard_b64encode(png).decode()}}
+        message = self._send(system, [{"role": "user", "content": [
+            image, {"type": "text", "text": user}]}], max_tokens)
+        return self._text(message)
+
     def complete(self, system: str, user: str, max_tokens: int = MAX_TOKENS) -> str:
         message = self._send(system, [{"role": "user", "content": user}], max_tokens)
         if message.stop_reason == "pause_turn":
@@ -383,6 +400,18 @@ class OpenAICompatLLM(LLM):
                                     {"role": "user", "content": user}], max_tokens)
         return strip_reasoning(message.content or "")
 
+    def read_image(self, system: str, user: str, png: bytes,
+                   max_tokens: int = MAX_TOKENS) -> str:
+        """Chat Completions with an image part. Whether the model reads images depends on
+        the model served: `vision` is True only where it is known (OpenAI)."""
+        address = "data:image/png;base64," + base64.standard_b64encode(png).decode()
+        message = self._completion([
+            {"role": self.system_role, "content": system},
+            {"role": "user", "content": [{"type": "text", "text": user},
+                                         {"type": "image_url", "image_url": {"url": address}}]}],
+            max_tokens)
+        return strip_reasoning(message.content or "")
+
     def chat(self, messages: list[dict], tools: list[dict] | None = None,
              tool_choice: str = "auto", max_tokens: int = MAX_TOKENS) -> dict:
         """One Chat Completions turn with function tools. Returns the assistant message as a
@@ -435,6 +464,7 @@ class OpenAILLM(OpenAICompatLLM):
     """OpenAI. `max_tokens` is deprecated there and rejected by reasoning models, so
     `max_completion_tokens` is sent, with room for the reasoning tokens."""
     provider = "openai"
+    vision = True
     token_param = "max_completion_tokens"
     reasoning_room = REASONING_ROOM
     key_env = "OPENAI_API_KEY"
@@ -745,6 +775,12 @@ def dry_run_handler(system: str, user: str) -> str:
     if "You check terminology" in system:
         pairs = json.loads(_between(user, "OCCURRENCES (JSON)"))
         return json.dumps({"uses": [dict(p, status="correct", detail="") for p in pairs]})
+    if "You write the recitation notes" in system:
+        from .recitation import dry_recitation
+        return dry_recitation(user)
+    if "You design the project" in system:
+        from .project import dry_project
+        return dry_project(user)
     if "You write the course material" in system:
         from .course import dry_course
         return dry_course(user)

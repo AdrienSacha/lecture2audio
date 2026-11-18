@@ -27,6 +27,32 @@ transcript ────────────────┴─► 2 outline �
 
 Checks cover the checkers themselves. Once per run, a fault is planted for each judge of completeness and the judge is asked again: an omission in an accepted script (the verifier), a blanked unit (the gap search), an extra fact (the idea listing), and an emptied card (the course judge). If one does not notice, `report.md` says that its passes are less trustworthy. The report also notes terms that the outline planned but no part defined, and warns when more than 20% of the words were marked as noise; all noise is listed at the end of the report so that you can check it.
 
+## What you give it, what you get
+
+Give it whatever you have; it detects what the files are.
+
+| You have | It does |
+|---|---|
+| A recording (with or without slides) | Transcribes it, then everything below |
+| A transcript or captions (`.txt`, `.srt`, `.vtt`, or a transcript as PDF) | Everything below |
+| Slides only (`.pdf`, `.pptx`) | Treats the slides as the lecture and researches what they state without explaining |
+| A folder holding any of these, and a glossary | Finds each file by its name and type |
+
+It writes, under `out/<name>/`:
+
+- `recitation.pdf` (and `.tex`): the lecture re-taught as a handout, with definitions, results, proofs, worked examples, figures, check questions and exercises with solutions, a glossary and references. Every term, question and citation is a link.
+- `project.pdf` with `--project`: one thing to build in about twenty steps, each with a check you can run alone.
+- `<name>.m4a`: the spoken explanation, with chapters (`build`; `text` stops before the voice).
+- `vault/`: the course notes for Obsidian. `ideas.csv`: every idea of the lecture and where it is taught. `report.md`: what was checked, repaired and left open.
+
+## The app
+
+```
+.venv/bin/python -m lecture2audio app
+```
+
+or double-click `app/Lecture2Audio.app`. Drop the files on the page, choose the options, follow the stages, then read the PDF and listen in the same page. The server answers only on this machine. Put your API keys in `~/.lecture2audio.env` (`DEEPSEEK_API_KEY=...`) for the double-click launcher, or type one in the page for a single run.
+
 ## Install
 
 ```bash
