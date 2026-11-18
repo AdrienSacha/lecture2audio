@@ -64,7 +64,7 @@ def read_slides(path: str | Path, cache: Path, llm: LLM, log=print, workers: int
                 prompts_dir: str | Path | None = None) -> tuple[list[str], dict]:
     """(one string per slide, notes). Slides the model could not read, or read unfaithfully,
     keep their text layer and are numbered in notes["fallback"]."""
-    layers = load_slides(path)
+    layers = load_slides(path, use_ocr=False, merge=False)
     images = render_pages(path)
     if images is None or len(images) != len(layers):
         why = ("poppler (pdftoppm) is not installed" if images is None

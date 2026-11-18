@@ -31,7 +31,7 @@ from .report import (write_glossary, write_index, write_questions, write_referen
 from .segment import split_units
 from .sources import (AUDIO_EXT, detect_language, discover_inputs, garbled_share, input_kind,
                       load_glossary,
-                      load_slides, load_transcript, slide_units, slugify)
+                      load_slides, load_transcript, merge_overlays, slide_units, slugify)
 from .transcribe import STTError, available as stt_available, transcribe_audio
 from .tts import TTSError, make_tts
 
@@ -77,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--out", default="out", help="output folder (default: ./out)")
         p.add_argument("--slides", help="slides as PDF (needs pypdf), PowerPoint (needs "
                                         "python-pptx) or text, optional")
+        p.add_argument("--ocr", action=argparse.BooleanOptionalAction, default=True,
+                       help="read by OCR the PDF pages that have no text and the pictures of "
+                            "PowerPoint slides (default: on when installed, uv pip install -e "
+                            "'.[ocr]'); --no-ocr skips it")
         p.add_argument("--glossary", help="text file, one course term per line, optional")
         p.add_argument("--read-slides", choices=["auto", "vision", "text"], default="auto",
                        help="how a PDF of slides is read: 'vision' = each page is shown to the "
@@ -420,6 +424,7 @@ def run(args, series: dict | None = None) -> int:
     track = stages.Tracker(work)
     rewrite_llm, verify_llm = (None, None) if args.transcribe_only else _llms(args)
     slide_notes: dict = {}
+    ocr_notes: list[dict] = []  # slides read by OCR, left empty, or merged (report.md)
 
     def read(path) -> list[str]:
         """The slides, one string per slide: read by sight when the file is a PDF and the
@@ -429,14 +434,16 @@ def run(args, series: dict | None = None) -> int:
         sees = (rewrite_llm is not None and args.llm != "dry" and (
             args.read_slides == "vision" or (args.read_slides == "auto" and rewrite_llm.vision)))
         if Path(path).suffix.lower() != ".pdf":
-            return load_slides(path)
+            return load_slides(path, ocr_notes, work / "slides_ocr.json", args.ocr)
         if not sees:
             slide_notes.update(mode="text", why="", fallback=[])
-            return load_slides(path)
+            return load_slides(path, ocr_notes, work / "slides_ocr.json", args.ocr)
         track("slides")
         pages, notes = slides_stage.read_slides(path, work / "slides", rewrite_llm, log,
                                                 args.workers, args.prompts_dir)
         slide_notes.update(notes)
+        pages, merged = merge_overlays(pages)  # the page of each animation step was read too
+        ocr_notes.extend({"slide": number, "how": "overlay"} for number in merged)
         return pages
 
     # slides given twice (as the lecture and as its slides) are only the lecture
@@ -444,6 +451,13 @@ def run(args, series: dict | None = None) -> int:
         Path(args.slides).resolve() == source.resolve()) else read(args.slides)
     track("transcribe")
     text = _transcript(args, work, glossary, log, read)
+    if ocr_notes:
+        shown = [f"{how}: {', '.join(str(n['slide']) for n in ocr_notes if n['how'] == how)}"
+                 for how in ("ocr", "empty", "no_ocr") if any(n["how"] == how for n in ocr_notes)]
+        merged = sum(n["how"] == "overlay" for n in ocr_notes)
+        if merged:
+            shown.append(f"{merged} animation step(s) merged into the page that completes them")
+        log("[slides] " + "; ".join(shown) + " (see report.md)")
     if args.transcribe_only:
         track.finish()
         return 0
@@ -597,7 +611,7 @@ def run(args, series: dict | None = None) -> int:
                                        "unledgered": [(r["part"], i) for r in records
                                                       for i in r["issues"]
                                                       if i["type"] == "unledgered"]},
-                     factcheck, _asr_notes(work))
+                     factcheck, _asr_notes(work), ocr_notes)
         override = {}
         if kind != "recording":
             override["transcribe"] = ("read from the slides (no recording, no transcript)"

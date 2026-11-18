@@ -106,7 +106,10 @@ def unaccounted_units(data, part) -> list[int]:
     return [u for u in part.all_units() if u not in seen]
 
 
-def validate_coverage(data, node_ids: list[str], slide_count: int) -> list[str]:
+def validate_coverage(data, node_ids: list[str], slide_count: int,
+                      blank: frozenset | set = frozenset()) -> list[str]:
+    """`blank`: slide numbers with no text (an animation step merged into the next page, a
+    page OCR could not read); the model is not shown them, so no idea is asked for them."""
     if not isinstance(data, dict) or not isinstance(data.get("slide_ideas"), list) \
             or not isinstance(data.get("gaps"), list):
         return ['the answer must be a JSON object with a "slide_ideas" list and a "gaps" list']
@@ -132,7 +135,7 @@ def validate_coverage(data, node_ids: list[str], slide_count: int) -> list[str]:
         elif idea.get("status") in ("covered", "partial") and not nodes:
             errors.append(f'slide idea {idea["id"]} is {idea["status"]}: name the node(s) '
                           "that cover it")
-    empty = [n for n in range(1, slide_count + 1) if n not in seen_slides]
+    empty = [n for n in range(1, slide_count + 1) if n not in seen_slides and n not in blank]
     if empty and slide_count:
         errors.append(f"slides {empty} have no idea listed: list the ideas of every slide "
                       "(a title slide gets one idea with status covered)")

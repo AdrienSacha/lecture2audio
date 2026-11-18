@@ -19,7 +19,7 @@ No command means `build`. The folder is read by extension and name (`sources.dis
 |---|---|
 | Transcript | `.srt`, `.vtt`, `.txt`, `.md` (a name containing "transcript" wins); preferred to a recording |
 | Recording | `.m4a`, `.mp3`, `.wav`, `.mp4`, ... (the largest one) |
-| Slides | `.pdf`, `.pptx`, or a `.md`/`.txt` whose name contains "slides" |
+| Slides | `.pdf`, `.pptx`, or a `.md`/`.txt` whose name contains "slides". Scanned or image-only pages are read by OCR when `.[ocr]` is installed; `report.md` lists them |
 | Glossary | a `.txt`/`.md`/`.csv` whose name contains "glossary", "terms", "lexique" |
 
 The log line `[inputs]` says which files were used and which were skipped. Give `--slides`, `--glossary` or the file itself as the input to choose another.

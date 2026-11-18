@@ -382,6 +382,12 @@ class Ideas(unittest.TestCase):
                                             "nodes": ["9"]}])
         self.assertEqual(len(enrich.validate_coverage(bad, ["1", "1.1"], 0)), 2)
         self.assertEqual(enrich.validate_coverage({"slide_ideas": [], "gaps": []}, ["1"], 0), [])
+        # a slide with no text (a merged animation step) is not shown, so no idea is asked for it
+        one = {"slide_ideas": [{"id": "S1", "slide": 2, "idea": "x", "status": "covered",
+                                "nodes": ["1"]}], "gaps": []}
+        self.assertTrue(enrich.validate_coverage(one, ["1"], 3))
+        self.assertTrue(enrich.validate_coverage(one, ["1"], 3, {1}))  # slide 3 still has text
+        self.assertEqual(enrich.validate_coverage(one, ["1"], 3, {1, 3}), [])
 
 
 class JudgeChecks(unittest.TestCase):

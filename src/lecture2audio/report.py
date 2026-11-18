@@ -168,11 +168,49 @@ def repair_lines(records: list[dict]) -> list[str]:
     return lines + [""]
 
 
+def slide_lines(slides: list[dict] | None) -> list[str]:
+    """The slides that had no text layer: which OCR read, which stayed empty."""
+    if not slides:
+        return []
+
+    def which(how: str) -> tuple[str, bool]:
+        """("Slides 3, 7", True) for the slides with this note; ("", False) when none."""
+        found = [str(n["slide"]) for n in slides if n["how"] == how]
+        if not found:
+            return "", False
+        return ("Slide " if len(found) == 1 else "Slides ") + ", ".join(found), len(found) > 1
+
+    lines = ["## Slides without a text layer", ""]
+    label, many = which("ocr")
+    if label:
+        lines.append(f"{label} had no text layer and {'were' if many else 'was'} read by optical "
+                     "character recognition. OCR reads the text of a picture and does not "
+                     "describe a diagram, and it can misread symbols and formulas: check them "
+                     "against the slides.")
+    label, many = which("empty")
+    if label:
+        lines.append(f"{label} returned no text, even by OCR (a slide that is only a picture or "
+                     "a diagram, or a scan too faint to read). "
+                     f"{'Their' if many else 'Its'} content is not used.")
+    label, many = which("no_ocr")
+    if label:
+        lines.append(f"{label} {'have' if many else 'has'} no text and OCR is not installed, so "
+                     f"{'their' if many else 'its'} content is not used. Install it with "
+                     "`uv pip install -e \".[ocr]\"` and run again.")
+    merged = sum(n["how"] == "overlay" for n in slides)
+    if merged:
+        lines.append(f"{merged} page(s) repeated the next page with fewer lines (animation steps "
+                     "of a slide, one page per step). Only the last step of each slide is used, "
+                     "so that a slide is not counted several times.")
+    return lines + [""]
+
+
 def write_report(path: Path, name: str, outline: Outline, records: list[dict],
                  spoken: list[dict], notes: list[str], audit: dict | None,
                  usage: dict | None = None, roundtrip: list[dict] | None = None,
                  gaps: dict | None = None, ideas: dict | None = None,
-                 factcheck: dict | None = None, asr: list[dict] | None = None) -> None:
+                 factcheck: dict | None = None, asr: list[dict] | None = None,
+                 slides: list[dict] | None = None) -> None:
     lines = [f"# {name}: quality report", ""]
     flagged = [r for r in records if r["flagged"]]
     lines.append(f"**{len(flagged)} part(s) still have open problems after the retries.** Listen "
@@ -208,6 +246,7 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
     if ideas is not None:
         lines += ledger_lines(ideas)
     lines += factcheck_lines(factcheck)
+    lines += slide_lines(slides)
     if asr:
         lines += ["## Speech recognition", "",
                   f"{len(asr)} recognised segment(s) were dropped because they are phrases speech "
