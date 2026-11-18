@@ -58,7 +58,7 @@ or double-click `app/Lecture2Audio.app`. Drop the files on the page, choose the 
 ## Install
 
 ```bash
-git clone <repository-url> && cd lecture2audio
+git clone https://github.com/AdrienSacha/lecture2audio && cd lecture2audio
 uv venv .venv && uv pip install -e ".[voice,whisper-mac,pdf]"   # whisper instead of whisper-mac off a Mac
 brew install ffmpeg                   # needed for the audio
 export DEEPSEEK_API_KEY=...           # the default model, and the web search for the gaps
