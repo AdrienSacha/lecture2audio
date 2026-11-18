@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 pdf = ["pypdf"]
 pptx = ["python-pptx>=1.0.2"]  # PowerPoint slides
+ocr = ["rapidocr>=3.1", "onnxruntime>=1.20", "pypdfium2>=4.30", "pypdf"]  # text in scanned or image slides
 voice = ["mlx-audio>=0.6.2"]  # Ming-3.0-tts on Apple chips
 whisper-mac = ["mlx-whisper"]
 whisper = ["faster-whisper"]

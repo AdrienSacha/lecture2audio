@@ -6,6 +6,8 @@ import math
 import re
 from pathlib import Path
 
+from . import ocr
+
 AUDIO_EXT = {".mp3", ".m4a", ".wav", ".flac", ".ogg", ".webm", ".mp4", ".mov", ".mkv", ".aac"}
 TRANSCRIPT_EXT = (".srt", ".vtt", ".txt", ".md")  # in order of preference
 SLIDE_EXT = (".pdf", ".pptx", ".md", ".txt")  # in order of preference
@@ -85,26 +87,66 @@ def load_glossary(path: str | Path | None) -> str:
     return "\n".join(l for l in lines if l.strip() and not l.lstrip().startswith("#"))
 
 
-def load_slides(path: str | Path | None) -> list[str]:
+def _read_picture(read, key: str, cache: ocr.Cache) -> str:
+    """OCR of one picture, from the cache when it was read before. A picture the engine cannot
+    decode (a vector format, a damaged file) gives no text rather than stopping the run."""
+    try:
+        return cache.get(key, read)
+    except Exception:
+        return ""
+
+
+def load_slides(path: str | Path | None, notes: list[dict] | None = None,
+                cache: str | Path | None = None, use_ocr: bool = True) -> list[str]:
     """One string per slide. PDF needs pypdf, PowerPoint needs python-pptx; text/markdown
-    files use '---' lines or form feeds."""
+    files use '---' lines or form feeds.
+
+    A PDF page with (almost) no text layer, and every picture of a PowerPoint slide, is read
+    by OCR when it is installed (`ocr.py`, `uv pip install -e ".[ocr]"`). `notes`, when given,
+    receives one {"slide", "how"} for each slide that needed it: "ocr" (text found), "empty"
+    (nothing found, even by OCR) or "no_ocr" (no text and OCR is not installed), for the
+    report. `cache` is a JSON file that keeps the OCR results between runs."""
     if not path:
         return []
     p = Path(path)
+    notes = notes if notes is not None else []
+    reading = use_ocr and ocr.available()
+    store = ocr.Cache(cache)
+
+    def note(number: int, found: str, existing: str) -> None:
+        if found:
+            notes.append({"slide": number, "how": "ocr"})
+        elif not existing:
+            notes.append({"slide": number, "how": "empty" if reading else "no_ocr"})
+
     if p.suffix.lower() == ".pptx":
         try:
             from pptx import Presentation
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
         except ImportError as exc:
             raise SystemExit("Reading a .pptx needs python-pptx (uv pip install "
                              "'python-pptx>=1.0.2'), or export the slides as PDF.") from exc
         slides = []
-        for slide in Presentation(str(p)).slides:
+        for number, slide in enumerate(Presentation(str(p)).slides, 1):
             texts = [shape.text_frame.text.strip() for shape in slide.shapes
                      if shape.has_text_frame and shape.text_frame.text.strip()]
+            pictures = [shape for shape in slide.shapes
+                        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE]
+            seen = "\n".join(texts)
+            found = []
+            for picture in pictures if reading else []:
+                blob = picture.image.blob
+                text = _read_picture(lambda blob=blob: ocr.read_image(blob), ocr.digest(blob),
+                                     store)
+                if text:
+                    found.append(text)
+            texts += found
+            if pictures and use_ocr:
+                note(number, "\n".join(found), seen)
             if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
-                notes = slide.notes_slide.notes_text_frame.text.strip()
-                if notes:
-                    texts.append(notes)
+                spoken = slide.notes_slide.notes_text_frame.text.strip()
+                if spoken:
+                    texts.append(spoken)
             slides.append("\n".join(texts))
         return slides
     if p.suffix.lower() == ".pdf":
@@ -113,7 +155,18 @@ def load_slides(path: str | Path | None) -> list[str]:
         except ImportError as exc:
             raise SystemExit("Reading a PDF needs pypdf (pip install pypdf), "
                              "or give the slides as a .txt/.md file.") from exc
-        return [(page.extract_text() or "").strip() for page in PdfReader(str(p)).pages]
+        pages = [(page.extract_text() or "").strip() for page in PdfReader(str(p)).pages]
+        key = ocr.digest(p.read_bytes()) if reading else ""
+        for index, text in enumerate(pages):
+            if len(text) >= ocr.MIN_CHARS or not use_ocr:
+                continue
+            found = ""
+            if reading:
+                found = _read_picture(lambda index=index: ocr.read_image(ocr.render_page(p, index)),
+                                      f"{key}:{index}", store)
+                pages[index] = (text + "\n" + found).strip()
+            note(index + 1, found, text)
+        return pages
     raw = p.read_text(encoding="utf-8", errors="replace")
     return [x.strip() for x in re.split(r"\n-{3,}\n|\f", raw) if x.strip()]
 

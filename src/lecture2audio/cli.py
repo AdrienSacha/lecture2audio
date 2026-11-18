@@ -75,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--out", default="out", help="output folder (default: ./out)")
         p.add_argument("--slides", help="slides as PDF (needs pypdf), PowerPoint (needs "
                                         "python-pptx) or text, optional")
+        p.add_argument("--ocr", action=argparse.BooleanOptionalAction, default=True,
+                       help="read by OCR the PDF pages that have no text and the pictures of "
+                            "PowerPoint slides (default: on when installed, uv pip install -e "
+                            "'.[ocr]'); --no-ocr skips it")
         p.add_argument("--glossary", help="text file, one course term per line, optional")
         p.add_argument("--language", choices=["en", "fr", "auto"], default="en")
         p.add_argument("--course", action=argparse.BooleanOptionalAction, default=True,
@@ -372,7 +376,13 @@ def run(args, series: dict | None = None) -> int:
     work = Path(args.out) / name
     work.mkdir(parents=True, exist_ok=True)
     glossary = load_glossary(args.glossary)
-    slides = load_slides(args.slides)
+    slide_notes: list[dict] = []
+    slides = load_slides(args.slides, slide_notes, work / "slides_ocr.json", args.ocr)
+    if slide_notes:
+        log("[slides] " + "; ".join(f"{how}: {', '.join(str(n['slide']) for n in slide_notes if n['how'] == how)}"
+                                    for how in ("ocr", "empty", "no_ocr")
+                                    if any(n["how"] == how for n in slide_notes))
+            + " (see report.md)")
     if args.redo:
         _discard(work, LATER[args.redo])
     start = stages.present(work)
@@ -486,7 +496,7 @@ def run(args, series: dict | None = None) -> int:
                                        "unledgered": [(r["part"], i) for r in records
                                                       for i in r["issues"]
                                                       if i["type"] == "unledgered"]},
-                     factcheck, _asr_notes(work))
+                     factcheck, _asr_notes(work), slide_notes)
         override = {}
         if source.suffix.lower() not in AUDIO_EXT:
             override["transcribe"] = "read from the input file"
