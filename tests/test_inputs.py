@@ -9,7 +9,7 @@ from lecture2audio.assemble import chunk_text
 from lecture2audio.llm import dry_run_handler, extract_json
 from lecture2audio.segment import split_units
 from lecture2audio.sources import (detect_language, discover_inputs, load_glossary,
-                                   load_transcript, select_slides)
+                                   load_transcript, merge_overlays, select_slides)
 
 
 def words(n, prefix="w"):
@@ -93,6 +93,50 @@ class Folder(unittest.TestCase):
             self.assertEqual(found["slides"].name, "deck.pptx")
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(discover_inputs(tmp)["input"])
+
+
+class Overlays(unittest.TestCase):
+    """A deck exported as one page per animation step lists each slide several times."""
+
+    FOOTER = "S. Taktak OSCA 14/44"
+
+    def page(self, *lines):
+        return "\n".join([*lines, self.FOOTER])
+
+    def test_a_step_that_adds_lines_is_merged_into_the_last_step(self):
+        pages = [self.page("Title", "add"), self.page("Title", "add", "sub"),
+                 self.page("Title", "add", "sub", "and"), self.page("Other slide")]
+        merged, numbers = merge_overlays(pages)
+        self.assertEqual(numbers, [1, 2])
+        self.assertEqual(merged, ["", "", pages[2], pages[3]])  # page numbers do not move
+
+    def test_a_table_row_filled_in_step_by_step_is_merged(self):
+        pages = [self.page("Results", "add t2, t0, t1", "sub t2, t0, t1"),
+                 self.page("Results", "add t2, t0, t1 0xE0 240 + (-16) = 224", "sub t2, t0, t1"),
+                 self.page("Results", "add t2, t0, t1 0xE0 240 + (-16) = 224",
+                           "sub t2, t0, t1 0x100 240 - (-16) = 256")]
+        self.assertEqual(merge_overlays(pages)[1], [1, 2])
+
+    def test_a_step_that_replaces_text_is_kept_so_nothing_is_lost(self):
+        pages = [self.page("Question", "What is 2 + 2?"), self.page("Question", "The answer is 4"),
+                 self.page("Identical", "same"), self.page("Identical", "same")]
+        merged, numbers = merge_overlays(pages)
+        self.assertEqual(numbers, [3])  # only the exact repeat
+        self.assertEqual(merged[0:2], pages[0:2])
+
+    def test_short_lines_are_matched_exactly_not_as_prefixes(self):
+        pages = [self.page("A", "x = 1"), self.page("Another", "x = 1")]
+        self.assertEqual(merge_overlays(pages)[1], [])
+        self.assertEqual(merge_overlays([]), ([], []))
+        self.assertEqual(merge_overlays(["", "text"]), (["", "text"], []))
+
+    def test_the_selection_skips_a_merged_page_and_keeps_the_numbers(self):
+        pages = ["Store encoding\nrs2 value", "Store encoding\nrs2 value\nimm split in two",
+                 "Branch\nbeq label", "Jump\njal ra"]
+        merged, _ = merge_overlays(pages)
+        chosen = select_slides(merged, "the store immediate is split in two", k=1)
+        self.assertEqual(chosen.splitlines()[0], "[Slide 2]")
+        self.assertNotIn("[Slide 1]", chosen)
 
 
 class JsonExtraction(unittest.TestCase):

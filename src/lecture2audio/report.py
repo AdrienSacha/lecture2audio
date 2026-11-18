@@ -197,6 +197,11 @@ def slide_lines(slides: list[dict] | None) -> list[str]:
         lines.append(f"{label} {'have' if many else 'has'} no text and OCR is not installed, so "
                      f"{'their' if many else 'its'} content is not used. Install it with "
                      "`uv pip install -e \".[ocr]\"` and run again.")
+    merged = sum(n["how"] == "overlay" for n in slides)
+    if merged:
+        lines.append(f"{merged} page(s) repeated the next page with fewer lines (animation steps "
+                     "of a slide, one page per step). Only the last step of each slide is used, "
+                     "so that a slide is not counted several times.")
     return lines + [""]
 
 

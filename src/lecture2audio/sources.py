@@ -14,6 +14,7 @@ SLIDE_EXT = (".pdf", ".pptx", ".md", ".txt")  # in order of preference
 _GLOSSARY_NAME = re.compile(r"gloss|lexi|terms?\b|termin|vocab", re.I)
 _SLIDE_NAME = re.compile(r"slide|diapo|deck|present|cours[-_ ]?notes|handout", re.I)
 _TRANSCRIPT_NAME = re.compile(r"transcri|caption|subtit|sous[-_ ]?titre", re.I)
+PREFIX_MIN = 5  # shortest line that may be covered by a longer line beginning with it
 
 
 def slugify(name: str) -> str:
@@ -87,6 +88,29 @@ def load_glossary(path: str | Path | None) -> str:
     return "\n".join(l for l in lines if l.strip() and not l.lstrip().startswith("#"))
 
 
+def merge_overlays(pages: list[str]) -> tuple[list[str], list[int]]:
+    """Animation steps of a slide deck exported as one page per step (LaTeX Beamer overlays,
+    PowerPoint builds): a page whose content is all on the next page is one step of that
+    slide, and only the last step, the complete slide, is kept. The earlier page becomes an
+    empty string, so the page numbers of the others do not move and `select_slides` skips it.
+
+    A line counts as on the next page when it is there as it is, or when a longer line there
+    begins with it (a table row filled in step by step: "add t2, t0, t1" then "add t2, t0, t1
+    0xE0 240 + (-16) = 224"). A page is dropped only when every one of its lines is covered, so
+    a step that replaces text instead of adding to it is kept, and nothing is lost. Returns the
+    pages and the numbers (from 1) of those emptied."""
+    lines = [[line.strip() for line in page.splitlines() if line.strip()] for page in pages]
+
+    def covered(earlier: list[str], later: list[str]) -> bool:
+        later_set = set(later)
+        return all(line in later_set or (len(line) >= PREFIX_MIN
+                                         and any(other.startswith(line) for other in later))
+                   for line in earlier)
+
+    merged = [k + 1 for k in range(len(pages) - 1) if lines[k] and covered(lines[k], lines[k + 1])]
+    return [("" if k + 1 in merged else page) for k, page in enumerate(pages)], merged
+
+
 def _read_picture(read, key: str, cache: ocr.Cache) -> str:
     """OCR of one picture, from the cache when it was read before. A picture the engine cannot
     decode (a vector format, a damaged file) gives no text rather than stopping the run."""
@@ -104,8 +128,9 @@ def load_slides(path: str | Path | None, notes: list[dict] | None = None,
     A PDF page with (almost) no text layer, and every picture of a PowerPoint slide, is read
     by OCR when it is installed (`ocr.py`, `uv pip install -e ".[ocr]"`). `notes`, when given,
     receives one {"slide", "how"} for each slide that needed it: "ocr" (text found), "empty"
-    (nothing found, even by OCR) or "no_ocr" (no text and OCR is not installed), for the
-    report. `cache` is a JSON file that keeps the OCR results between runs."""
+    (nothing found, even by OCR), "no_ocr" (no text and OCR is not installed) or "overlay"
+    (an animation step left out because the next page repeats it, see `merge_overlays`), for
+    the report. `cache` is a JSON file that keeps the OCR results between runs."""
     if not path:
         return []
     p = Path(path)
@@ -166,6 +191,8 @@ def load_slides(path: str | Path | None, notes: list[dict] | None = None,
                                       f"{key}:{index}", store)
                 pages[index] = (text + "\n" + found).strip()
             note(index + 1, found, text)
+        pages, merged = merge_overlays(pages)
+        notes.extend({"slide": number, "how": "overlay"} for number in merged)
         return pages
     raw = p.read_text(encoding="utf-8", errors="replace")
     return [x.strip() for x in re.split(r"\n-{3,}\n|\f", raw) if x.strip()]

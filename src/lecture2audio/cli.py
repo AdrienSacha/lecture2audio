@@ -379,10 +379,12 @@ def run(args, series: dict | None = None) -> int:
     slide_notes: list[dict] = []
     slides = load_slides(args.slides, slide_notes, work / "slides_ocr.json", args.ocr)
     if slide_notes:
-        log("[slides] " + "; ".join(f"{how}: {', '.join(str(n['slide']) for n in slide_notes if n['how'] == how)}"
-                                    for how in ("ocr", "empty", "no_ocr")
-                                    if any(n["how"] == how for n in slide_notes))
-            + " (see report.md)")
+        shown = [f"{how}: {', '.join(str(n['slide']) for n in slide_notes if n['how'] == how)}"
+                 for how in ("ocr", "empty", "no_ocr") if any(n["how"] == how for n in slide_notes)]
+        merged = sum(n["how"] == "overlay" for n in slide_notes)
+        if merged:
+            shown.append(f"{merged} animation step(s) merged into the page that completes them")
+        log("[slides] " + "; ".join(shown) + " (see report.md)")
     if args.redo:
         _discard(work, LATER[args.redo])
     start = stages.present(work)

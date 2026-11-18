@@ -620,7 +620,7 @@ class TextPipeline:
         if cache.exists():
             return Outline.from_dict(json.loads(cache.read_text(encoding="utf-8")))
         self.log(f"[outline] {len(units)} units")
-        slides_text = "\n\n".join(self.slides)[:12000]
+        slides_text = "\n\n".join(s for s in self.slides if s.strip())[:12000]
         user = (f"## LANGUAGE\n{self.language_name}\n\n"
                 f"## LIMITS\nAt most {self.max_part_words} words per part.\n\n"
                 + _section("GLOSSARY", self.glossary) + _section("SLIDES", slides_text)
@@ -646,8 +646,12 @@ class TextPipeline:
     def _lecture(self, outline: Outline) -> str:
         return "\n\n".join(render_part_transcript(outline, p, []) for p in outline.parts)
 
+    def _blank_slides(self) -> set[int]:
+        """Slide numbers with no text, which the gap search is not shown."""
+        return {k for k, s in enumerate(self.slides, 1) if not s.strip()}
+
     def _slides_numbered(self) -> str:
-        return "\n\n".join(f"[Slide {k}]\n{s}" for k, s in enumerate(self.slides, 1))
+        return "\n\n".join(f"[Slide {k}]\n{s}" for k, s in enumerate(self.slides, 1) if s.strip())
 
     def run_coverage(self, outline: Outline) -> dict:
         """Slide ideas with their status, and the gaps of the transcript."""
@@ -662,7 +666,8 @@ class TextPipeline:
                 + "## TRANSCRIPT\n" + self._lecture(outline))
         try:
             data = self._ask_json(self.rewrite_llm, self.prompts.coverage, user,
-                                  lambda d: enrich.validate_coverage(d, ids, len(self.slides)),
+                                  lambda d: enrich.validate_coverage(d, ids, len(self.slides),
+                                                                     self._blank_slides()),
                                   "gap search")
             result = {"slide_ideas": data["slide_ideas"], "gaps": data["gaps"],
                       "transcript_ideas": data.get("transcript_ideas", [])}
@@ -810,7 +815,8 @@ class TextPipeline:
                 data = self._ask_json(
                     self.rewrite_llm, self.prompts.coverage, user,
                     lambda d: enrich.validate_coverage(d, enrich.node_order(outline),
-                                                       len(self.slides)), "gap search audit")
+                                                       len(self.slides), self._blank_slides()),
+                    "gap search audit")
                 new = [g for g in data["gaps"]
                        if (str(g["node"]), g["kind"], str(g.get("term", "")).lower()) not in known]
                 result = {"node": node.id, "title": node.title, "unit": unit,

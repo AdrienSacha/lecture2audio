@@ -175,7 +175,9 @@ class Engine(unittest.TestCase):
 class Report(unittest.TestCase):
     def test_the_report_says_which_slides_were_read_and_which_were_not(self):
         text = "\n".join(slide_lines([{"slide": 2, "how": "ocr"}, {"slide": 5, "how": "ocr"},
-                                      {"slide": 7, "how": "empty"}, {"slide": 9, "how": "no_ocr"}]))
+                                      {"slide": 7, "how": "empty"}, {"slide": 9, "how": "no_ocr"},
+                                      {"slide": 3, "how": "overlay"}, {"slide": 4, "how": "overlay"}]))
+        self.assertIn("2 page(s) repeated the next page with fewer lines (animation steps", text)
         self.assertIn("## Slides", text)
         self.assertIn("Slides 2, 5 had no text layer and were read by optical character "
                       "recognition.", text)
@@ -208,6 +210,34 @@ class EndToEnd(unittest.TestCase):
             self.assertIn("Slide 2 had no text layer and was read by optical character "
                           "recognition.", report)
             self.assertTrue((out / "sample-transcript" / "slides_ocr.json").exists())
+
+
+    def test_merged_and_unreadable_pages_do_not_break_the_gap_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            page = root / "page.pdf"
+            page.write_bytes(text_pdf(TEXT))
+            writer = PdfWriter()
+            for _ in range(2):  # two identical pages: an animation step and its result
+                writer.append(PdfReader(str(page)))
+            writer.add_blank_page(width=400, height=200)  # a page nothing can read
+            pdf = root / "deck.pdf"
+            with open(pdf, "wb") as handle:
+                writer.write(handle)
+            out = root / "out"
+            env = {k: v for k, v in os.environ.items() if k != "L2A_VAULT_DIR"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(ocr, "available", return_value=False):
+                with contextlib.redirect_stdout(io.StringIO()) as log, \
+                        self.assertRaises(SystemExit) as raised:
+                    main(["text", str(SAMPLE), "--slides", str(pdf), "--llm", "dry",
+                          "--language", "en", "--max-part-words", "60", "--out", str(out),
+                          "--no-open-obsidian"])
+            self.assertEqual(raised.exception.code, 0)
+            self.assertNotIn("no valid answer", log.getvalue())
+            report = (out / "sample-transcript" / "report.md").read_text(encoding="utf-8")
+            self.assertIn("1 page(s) repeated the next page", report)
+            self.assertIn("Slide 3 has no text and OCR is not installed", report)
 
 
 if __name__ == "__main__":
