@@ -10,3 +10,4 @@ work/
 CLAUDE.local.md
 tests/.cache/
 
+.DS_Store

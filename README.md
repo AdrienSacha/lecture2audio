@@ -2,6 +2,8 @@
 
 Turns the transcript (or the recording) of a lecture into a clear, well-ordered spoken explanation that you can listen to, and into an Obsidian vault of course material that embeds the audio. It is not a podcast and not a summary: it keeps everything the teacher taught, removes the noise (pauses, sips of water, false starts, "as you can see on the board"), organises the lecture into parts, points and sub-points, announces each part's points before explaining them, defines each term before its first use, asks you questions at the end of each part, and prepares numbers, formulas and code so that a voice model reads them correctly.
 
+**Quick start** (no key, no model): `uv venv .venv && uv pip install -e .`, then `.venv/bin/python -m lecture2audio build examples/sample_transcript.txt --llm dry --tts fake --max-part-words 60` (needs `ffmpeg`), or `.venv/bin/python -m lecture2audio app` for the local web page on `127.0.0.1:8765`. A real run needs a provider key (see Install). Real provider calls and the real voices have not been tested; see Status.
+
 ## How it works
 
 ```
@@ -56,7 +58,7 @@ or double-click `app/Lecture2Audio.app`. Drop the files on the page, choose the 
 ## Install
 
 ```bash
-cd ~/code/lecture2audio
+git clone <repository-url> && cd lecture2audio
 uv venv .venv && uv pip install -e ".[voice,whisper-mac,pdf]"   # whisper instead of whisper-mac off a Mac
 brew install ffmpeg                   # needed for the audio
 export DEEPSEEK_API_KEY=...           # the default model, and the web search for the gaps
@@ -80,10 +82,10 @@ Optional parts:
 
 ## Use
 
-Try the whole flow without any key or model (the "dry" model keeps the text as it is, the Mac voice reads it):
+Try the whole flow without any key or model (the "dry" model keeps the text as it is, tones stand in for the voice):
 
 ```bash
-lecture2audio build examples/sample_transcript.txt --llm dry --tts say --language en --max-part-words 60
+lecture2audio build examples/sample_transcript.txt --llm dry --tts fake --language en --max-part-words 60
 ```
 
 A real run, from one folder that holds the recording or the transcript, the slides and a glossary (found by extension and name: `.m4a .mp3 .wav .mp4`, `.txt .srt .vtt`, `.pdf .pptx` or `slides.md`, `glossary.txt`):
@@ -151,6 +153,6 @@ The architecture follows 2026 work on language-model systems. It is a fixed chai
 
 ## Status
 
-Tested automatically (no key or model needed; 234 tests, see `CLAUDE.md` for the command), and passing on 5 November 2026 on Linux with the dry model and the fake voice: the outline checks (coverage, order, depth, size, folding, moves, noise assignment, fallback), the structure gates, the verifier's per-node statuses, the retry loop that keeps the best attempt, the bounded repair, the planted-fault tests, parallel parts, caching and `--redo`, the stage graph, previews in English and French, the spoken blocks, number and symbol conversion, chunking, joining with pauses, chapters, the idea ledger and the Anki export, the course cards and exercises, the folder input, the vault (figures, audio embeds, the continuous reading note), and the whole command line in English and French.
+Tested automatically (no key or model needed; 260 tests, one skipped, see `CLAUDE.md` for the command), and passing on 18 November 2026 on macOS with the dry model and the fake voice. The local app was also driven over HTTP and in a browser with the dry model (upload, run, stage events, results, and the readable error for a missing key). Request construction, streaming, retries and errors of the DeepSeek, OpenRouter, OpenAI and Anthropic clients are tested against fake servers, not the real APIs. The tests cover: the outline checks (coverage, order, depth, size, folding, moves, noise assignment, fallback), the structure gates, the verifier's per-node statuses, the retry loop that keeps the best attempt, the bounded repair, the planted-fault tests, parallel parts, caching and `--redo`, the stage graph, previews in English and French, the spoken blocks, number and symbol conversion, chunking, joining with pauses, chapters, the idea ledger and the Anki export, the course cards and exercises, the folder input, the vault (figures, audio embeds, the continuous reading note), and the whole command line in English and French.
 
 Not tested yet, because they need keys, models or a Mac: the real calls to every provider (DeepSeek, Anthropic, OpenAI, the others and local servers); the Ming, Qwen3-TTS, `say` and OpenAI voices; `mlx-whisper`, `faster-whisper` and Parakeet; the round trip with real voices; MiniCheck; PDF and PowerPoint slides on real files of yours (OCR has been tested on generated slides only); opening Obsidian. The prompts have not yet been tuned on real lectures: run one lecture, read `report.md` and `index.md`, listen, and adjust the prompts where the result is not what you want.
