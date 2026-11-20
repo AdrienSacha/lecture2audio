@@ -218,6 +218,8 @@ class AnthropicLLM(LLM):
         try:
             with trace.call("model", host=self.base_url, **params) as record, \
                     self._errors(), self.client.beta.messages.stream(**params) as stream:
+                for event in stream:  # the trace counts what arrives; nothing else is done
+                    record.feed(event)
                 message = stream.get_final_message()
                 record["answer"] = message
         except LLMError as exc:
@@ -273,8 +275,11 @@ class AnthropicLLM(LLM):
         documents: list[dict] = []
         # Each continuation resumes a server loop of about ten tool steps.
         continuations = max(5, depth // 4)
-        for _ in range(continuations + 1):
-            message = self._send(system, messages, max_tokens, self.search_tools(depth))
+        conversation = trace.new_id()
+        for turn in range(continuations + 1):
+            with trace.context(conversation=conversation, turn=turn + 1,
+                               parent=trace.last_id() if turn else None):
+                message = self._send(system, messages, max_tokens, self.search_tools(depth))
             blocks = [block.to_dict() for block in message.content]
             documents += anthropic_documents(blocks)
             if message.stop_reason != "pause_turn":
@@ -373,6 +378,8 @@ class OpenAICompatLLM(LLM):
             try:
                 with trace.call("model", host=self.base_url, **request) as record, \
                         self._errors(), self.client.chat.completions.stream(**request) as stream:
+                    for event in stream:  # the trace counts what arrives
+                        record.feed(event)
                     completion = stream.get_final_completion()
                     record["answer"] = completion
             except LLMError as exc:
@@ -488,16 +495,18 @@ class OpenAILLM(OpenAICompatLLM):
         """Responses API with the web_search tool, streamed. It returns cited addresses,
         not page text."""
         final = None
-        with self._errors():
-            with self.client.responses.create(
-                    model=self.model, instructions=system, input=user, stream=True,
-                    tools=[{"type": "web_search", "search_context_size": "high"}],
-                    include=["web_search_call.action.sources"], max_tool_calls=depth,
-                    max_output_tokens=max_tokens + self.reasoning_room) as stream:
+        request = dict(model=self.model, instructions=system, input=user, stream=True,
+                       tools=[{"type": "web_search", "search_context_size": "high"}],
+                       include=["web_search_call.action.sources"], max_tool_calls=depth,
+                       max_output_tokens=max_tokens + self.reasoning_room)
+        with trace.call("model", host=self.base_url, **request) as record, self._errors():
+            with self.client.responses.create(**request) as stream:
                 for event in stream:
+                    record.feed(event)
                     if event.type in ("response.completed", "response.incomplete",
                                       "response.failed"):
                         final = event.response
+            record["answer"] = final
         if final is None:
             raise LLMError(f"{self.name}: the response stream ended without a final response.")
         out = final.to_dict()
@@ -547,7 +556,11 @@ class FakeLLM(LLM):
         with self._lock:
             self.calls.append((system, user))
         self._count()
-        return self.handler(system, user)
+        # recorded like a real call (host "dry"), so a dry run shows the whole chain
+        with trace.call("model", host="dry", model=self.name, system=system,
+                        messages=[{"role": "user", "content": user}]) as record:
+            record["answer"] = self.handler(system, user)
+        return record["answer"]
 
     def research(self, system: str, user: str, max_tokens: int = MAX_TOKENS,
                  depth: int = 30) -> tuple[str, list[dict]]:
@@ -594,13 +607,19 @@ def research_loop(llm: "OpenAICompatLLM", system: str, user: str, search, depth:
     """Web research for any model that can call functions: the model asks for searches and
     pages, the program runs them. `depth` is the number of tool calls allowed. Returns
     (final answer, documents read), like `LLM.research`."""
-    from .web import FetchError, fetch_page
+    from .web import fetch_page
     fetch = fetch or fetch_page
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     documents: list[dict] = []
-    used = 0
+    used, turn, asker = 0, 0, None
+    # The trace links each turn to the one before it and each search or page to the turn
+    # that asked for it (conversation, turn, parent); it observes only.
+    conversation = trace.new_id()
     while used < depth:
-        message = llm.chat(messages, LOOP_TOOLS)
+        turn += 1
+        with trace.context(conversation=conversation, turn=turn, parent=asker):
+            message = llm.chat(messages, LOOP_TOOLS)
+            asker = trace.last_id()
         messages.append({k: v for k, v in message.items() if k in TURN_FIELDS})
         calls = message.get("tool_calls") or []
         if not calls:
@@ -612,27 +631,34 @@ def research_loop(llm: "OpenAICompatLLM", system: str, user: str, search, depth:
                 args = json.loads(function.get("arguments") or "{}")
             except ValueError:
                 args = {}
-            try:
-                if function.get("name") == "web_search":
-                    results = search(str(args.get("query", ""))[:400])
-                    documents += [dict(r, text=r.get("text") or None) for r in results]
-                    result = json.dumps(results, ensure_ascii=False)
-                elif function.get("name") == "fetch_page":
-                    url = str(args.get("url", ""))
-                    text = fetch(url)
-                    documents.append({"url": url, "title": "", "text": text})
-                    result = text[:PAGE_CHARS] + ("\n[page cut here]" if len(text) > PAGE_CHARS
-                                                 else "")
-                else:
-                    result = f"error: unknown tool {function.get('name')}"
-            except FetchError as exc:
-                result = f"error: {exc}"
+            with trace.context(conversation=conversation, turn=turn, parent=asker,
+                               tool=function.get("name")):
+                result = _run_tool(function.get("name"), args, search, fetch, documents)
             messages.append({"role": "tool", "tool_call_id": call.get("id", ""),
                              "content": result})
     messages.append({"role": "user", "content": "The research budget is used up. Give your final "
                      "answer now, in the required JSON, using only the pages you read."})
-    message = llm.chat(messages, LOOP_TOOLS, tool_choice="none")
+    with trace.context(conversation=conversation, turn=turn + 1, parent=asker):
+        message = llm.chat(messages, LOOP_TOOLS, tool_choice="none")
     return strip_reasoning(message.get("content") or ""), documents
+
+
+def _run_tool(name, args: dict, search, fetch, documents: list[dict]) -> str:
+    """Run one tool call of research_loop; the text sent back to the model."""
+    from .web import FetchError
+    try:
+        if name == "web_search":
+            results = search(str(args.get("query", ""))[:400])
+            documents += [dict(r, text=r.get("text") or None) for r in results]
+            return json.dumps(results, ensure_ascii=False)
+        if name == "fetch_page":
+            url = str(args.get("url", ""))
+            text = fetch(url)
+            documents.append({"url": url, "title": "", "text": text})
+            return text[:PAGE_CHARS] + ("\n[page cut here]" if len(text) > PAGE_CHARS else "")
+        return f"error: unknown tool {name}"
+    except FetchError as exc:
+        return f"error: {exc}"
 
 
 _THINK = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.S | re.I)

@@ -512,16 +512,41 @@ class TestTrace(unittest.TestCase):
                     trace.close()
             text = (Path(tmp) / "calls.jsonl").read_text()
             self.assertNotIn(key, text)
-            first, second = [json.loads(line) for line in text.splitlines()]
-            self.assertEqual(first["kind"], "model")
-            self.assertEqual(first["request"]["host"], "https://api.deepseek.com")
-            self.assertEqual([m["content"] for m in first["request"]["messages"]],
+            lines = [json.loads(line) for line in text.splitlines()]
+            self.assertEqual(lines[0]["kind"], "run")
+            start, end, _start2, second = [l for l in lines if l["kind"] == "model"
+                                           and l["phase"] in ("start", "end")]
+            self.assertEqual((start["phase"], end["phase"], start["id"]), ("start", "end", end["id"]))
+            self.assertEqual(start["model"], "deepseek-flash")
+            self.assertEqual(start["request"]["host"], "https://api.deepseek.com")
+            self.assertEqual([m["content"] for m in start["request"]["messages"]],
                              ["system text", "user text [key]"])
-            message = first["answer"]["choices"][0]["message"]
+            message = end["answer"]["choices"][0]["message"]
             self.assertEqual((message["content"], message["reasoning_content"]),
                              ("answer", "thinking"))
-            self.assertEqual(first["answer"]["usage"]["prompt_tokens"], 7)
+            self.assertEqual(end["answer"]["usage"]["prompt_tokens"], 7)
             self.assertIn("HTTP 400", second["error"])
+
+    def test_streamed_events_are_counted_by_the_sdks_own_events(self):
+        from lecture2audio import trace
+        with tempfile.TemporaryDirectory() as tmp:
+            server = FakeServer(chat_stream("hello world", reasoning_content="deep thought"),
+                                anthropic_stream([{"type": "text", "text": ""}]))
+            with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "k" * 12,
+                                              "ANTHROPIC_API_KEY": "a" * 12}), \
+                    mock.patch.object(trace, "PROGRESS_EVERY", 0):
+                trace.open_run(tmp)
+                try:
+                    HostedLLM("deepseek", "deepseek-flash", http_client=server.client()).complete("s", "u")
+                    AnthropicLLM("claude-opus-5-5", http_client=server.client()).complete("s", "u")
+                finally:
+                    trace.close()
+            lines = [json.loads(l) for l in (Path(tmp) / "calls.jsonl").read_text().splitlines()]
+            progress = [l for l in lines if l.get("phase") == "progress"]
+            self.assertEqual((progress[0]["chars"], progress[0]["thinking"]),
+                             (len("hello world"), len("deep thought")))
+            ends = [l for l in lines if l.get("phase") == "end"]
+            self.assertEqual([e["model"] for e in ends], ["deepseek-flash", "claude-opus-5-5"])
 
     def test_nothing_is_written_without_a_run(self):
         from lecture2audio import trace

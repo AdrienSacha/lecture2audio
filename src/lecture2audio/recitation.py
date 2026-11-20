@@ -18,7 +18,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, ValidationError, model_validator
 
-from . import enrich, latex
+from . import enrich, latex, trace
 from .course import CoursePipeline, reader_text
 from .course_schema import HTML_ELEMENT, Model, Text, describe, html_in_text
 from .outline import Node, Outline, render_outline
@@ -249,7 +249,9 @@ class RecitationPipeline:
         best, feedback, scope, attempts, repairs = None, "", None, 0, []
         for _ in range(self.p.max_retries + 1):
             attempts += 1
-            section = self._write(outline, ctx, record, feedback)
+            with trace.context(attempt=attempts, repair=scope_words(scope) if scope else
+                               ("whole part" if attempts > 1 else None)):
+                section = self._write(outline, ctx, record, feedback)
             if scope and best is not None:
                 section = splice(best["section"], section, scope, ctx["nodes"])
             issues = section_issues(section, ctx, self.p.language, self._figure)
