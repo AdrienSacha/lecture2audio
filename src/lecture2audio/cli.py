@@ -26,12 +26,12 @@ from .llm import PRESETS, FakeLLM, LLMError, dry_run_handler, make_llm, research
 from .web import SEARCH_ENGINES, FetchError, make_search, pick_engine
 from . import latex, project as project_stage, recitation, slides as slides_stage
 from .pipeline import PipelineError, TextPipeline, chapter_titles, load_prompts
-from .report import (write_glossary, write_index, write_questions, write_reference,
-                     write_report, write_script)
+from .report import (MISMATCH_TAG, slide_match_warning, write_glossary, write_index,
+                     write_questions, write_reference, write_report, write_script)
 from .segment import split_units
 from .sources import (AUDIO_EXT, detect_language, discover_inputs, garbled_share, input_kind,
-                      load_glossary,
-                      load_slides, load_transcript, merge_overlays, slide_units, slugify)
+                      load_glossary, load_slides, load_transcript, merge_overlays, slide_match,
+                      slide_units, slugify)
 from .transcribe import STTError, available as stt_available, transcribe_audio
 from .tts import TTSError, make_tts
 
@@ -77,6 +77,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--out", default="out", help="output folder (default: ./out)")
         p.add_argument("--slides", help="slides as PDF (needs pypdf), PowerPoint (needs "
                                         "python-pptx) or text, optional")
+        p.add_argument("--slides-all", action="store_true",
+                       help="use every slide even when the slides seem to belong to another "
+                            "lecture (by default only the slides that match the transcript "
+                            "are then used, so the gap search does not add another lecture)")
         p.add_argument("--ocr", action=argparse.BooleanOptionalAction, default=True,
                        help="read by OCR the PDF pages that have no text and the pictures of "
                             "PowerPoint slides (default: on when installed, uv pip install -e "
@@ -465,6 +469,19 @@ def run(args, series: dict | None = None) -> int:
     units = split_units(text)
     if not units:
         raise SystemExit("The transcript is empty.")
+    match = None
+    if slides and kind != "slides":  # do the slides belong to this lecture? (code, no model)
+        match = slide_match(slides, text)
+        match["kept_all"] = bool(getattr(args, "slides_all", False))
+        (work / "slide_match.json").write_text(json.dumps(match, indent=1), encoding="utf-8")
+        if match["low"]:
+            log(f"{MISMATCH_TAG} {slide_match_warning(match)} (see report.md)")
+            if not match["kept_all"]:  # blank, not drop, so that slide numbers do not move
+                slides = [s if r["matched"] else "" for s, r in zip(slides, match["slides"])]
+                slides = slides if any(s.strip() for s in slides) else []
+        elif match["matched"] < match["scored"]:
+            log(f"[slides] {match['matched']} of {match['scored']} slides match the transcript; "
+                "the others are listed in report.md")
     fingerprint = hashlib.sha1(json.dumps([args.max_part_words, units, slides, glossary])
                                .encode()).hexdigest()
     marker = work / "fingerprint.txt"
@@ -611,7 +628,7 @@ def run(args, series: dict | None = None) -> int:
                                        "unledgered": [(r["part"], i) for r in records
                                                       for i in r["issues"]
                                                       if i["type"] == "unledgered"]},
-                     factcheck, _asr_notes(work), ocr_notes)
+                     factcheck, _asr_notes(work), ocr_notes, match)
         override = {}
         if kind != "recording":
             override["transcribe"] = ("read from the slides (no recording, no transcript)"
