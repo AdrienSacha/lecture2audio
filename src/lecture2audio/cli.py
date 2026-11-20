@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import keys, ledger, stages, trace
@@ -151,8 +152,8 @@ def build_parser() -> argparse.ArgumentParser:
                               "lose faithfulness towards their end, so parts are kept short)")
         llm.add_argument("--max-retries", type=int, default=2,
                          help="rewrites allowed after a failed verification (default 2)")
-        llm.add_argument("--workers", type=int, default=16,
-                         help="parts processed at the same time (default 16)")
+        llm.add_argument("--workers", type=int, default=64,
+                         help="parts processed at the same time (default 64; requests per model are capped by a shared pool, L2A_CONCURRENCY)")
         llm.add_argument("--no-audit", action="store_true",
                          help="skip the tests that plant a fault (an omission for the verifier, a "
                               "hole for the gap search, a fact for the idea listing, an emptied "
@@ -496,7 +497,14 @@ def run(args, series: dict | None = None) -> int:
     book = ledger.Ledger(work / "ideas.csv", outline, coverage)
     ideas = book.rows
     log(f"[ideas] {len(ideas)} atomic idea(s) in {book.path}")
-    ideas_audit = None if args.no_audit else pipeline.audit_ideas(outline)
+    # The planted-omission audits only report: they run beside the main path, in their own
+    # threads, and are collected before the report (ADR-0006). None is skipped.
+    background = ThreadPoolExecutor(max_workers=3, thread_name_prefix="audit")
+
+    def beside(function, *arguments):
+        return None if args.no_audit else background.submit(function, *arguments)
+
+    ideas_audit = beside(pipeline.audit_ideas, outline)
     track("gaps")
     terms = pipeline.run_termbase(outline)
     if series.get("stop_after") == "termbase":
@@ -512,7 +520,7 @@ def run(args, series: dict | None = None) -> int:
     gaps = {"coverage": coverage, "terms": terms, "terms_error": pipeline.terms_error,
             "research": pipeline.research,
             "supplements": supplements, "note": research_note,
-            "audit": None if args.no_audit else pipeline.audit_coverage(outline)}
+            "audit": beside(pipeline.audit_coverage, outline)}
     track("rewrite")
     records = pipeline.run_parts(outline, on_done=book.script_done)
     factcheck = None
@@ -524,7 +532,7 @@ def run(args, series: dict | None = None) -> int:
             raise SystemExit("--factcheck minicheck needs MiniCheck: uv pip install -e "
                              "'.[factcheck]'")
     track("rewrite")
-    audit = None if args.no_audit else pipeline.audit_verifier(outline, records)
+    audit = beside(pipeline.audit_verifier, outline, records)
     notes = pipeline.global_notes(outline, records)
     track("spoken")
     spoken = pipeline.run_spoken(outline, records)
@@ -593,6 +601,8 @@ def run(args, series: dict | None = None) -> int:
     if args.export_anki:
         count = ledger.write_anki(work / "anki.csv", name, ideas, course, records, language)
         log(f"[anki] {count} note(s) in {work / 'anki.csv'} (Anki: File > Import)")
+    ideas_audit, audit, gaps["audit"] = (_collect(f) for f in (ideas_audit, audit, gaps["audit"]))
+    background.shutdown()
     usage = {rewrite_llm.name: rewrite_llm.usage}
     if verify_llm is not rewrite_llm:
         usage[verify_llm.name + " (verifier)"] = verify_llm.usage
@@ -749,6 +759,16 @@ def run_series(args) -> int:
     print(f"Done. Vault: {vault}. Read {root / 'series.md'}.", flush=True)
     _open_obsidian(args, stats.get("entry"), lambda m: print(m, flush=True))
     return 0
+
+
+def _collect(future) -> dict | None:
+    """The result of an audit run beside the main path; a crash is reported, not raised."""
+    if future is None:
+        return None
+    try:
+        return future.result()
+    except Exception as exc:  # an audit never stops a run
+        return {"skipped": f"the test failed ({exc}); it runs again next time"}
 
 
 def key_main(argv: list[str]) -> int:

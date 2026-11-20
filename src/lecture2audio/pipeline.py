@@ -1043,8 +1043,10 @@ class TextPipeline:
                      for i in ctx["ideas"]], ensure_ascii=False, indent=1) if ctx["ideas"] else "")
                 + _section("SUPPLEMENTS (JSON)", self._supplements_json(ctx, quotes=False))
                 + _section("GLOSSARY", self.glossary) + _section("SLIDES", ctx["slides"])
-                + _section("FEEDBACK", feedback)
-                + "## TRANSCRIPT OF THIS PART\n" + ctx["transcript"])
+                + "## TRANSCRIPT OF THIS PART\n" + ctx["transcript"]
+                # last, so that a repair resends the same opening and hits the provider's
+                # prefix cache (ADR-0006)
+                + ("\n\n" + _section("FEEDBACK", feedback).rstrip() if feedback else ""))
         data = self._ask_json(self.rewrite_llm, self.prompts.rewrite, user,
                               lambda d: validate_part(d, ctx["shape"]), f"rewrite of part {part.id}")
         data.setdefault("terms_defined", [])
