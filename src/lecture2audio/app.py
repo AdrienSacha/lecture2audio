@@ -12,8 +12,8 @@ Safety of a local server that a browser can reach:
 - every POST needs a token drawn at start-up, which only the served page holds (CSRF);
 - every file served is resolved and must lie under the output folder; an uploaded file keeps
   only a safe base name;
-- API keys typed in the page go to the subprocess environment and nowhere else: they are not
-  written to disk, logged, or sent back.
+- API keys typed in the page go to the subprocess environment and, only when "Remember" is
+  ticked, to ~/.lecture2audio.env (mode 600, keys.py); they are never logged or sent back.
 """
 from __future__ import annotations
 
@@ -33,8 +33,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import stages
-from .llm import PRESETS
+from . import keys, stages
 from .sources import discover_inputs, slugify
 
 ASSETS = Path(__file__).parent / "assets"
@@ -59,10 +58,7 @@ LABELS = {"transcribe": "Reading the lecture", "outline": "Outline", "gaps": "Ga
           "parts": "Audio of each part", "course": "Course cards", "vault": "Obsidian notes",
           "recitation": "Recitation notes", "project": "Project", "documents": "PDFs",
           "ledger": "Idea ledger"}
-# The variable each provider reads its key from (cli.py, llm.py); only that one is set.
-KEY_ENV = {**{name: env for name, (_, env) in PRESETS.items()},
-           "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
-           "local": "L2A_LOCAL_API_KEY"}
+KEY_ENV = keys.KEY_ENV  # the variable each provider reads its key from
 PROVIDERS = [  # (--llm value, name in the page, needs a key, needs model names)
     ("deepseek", "DeepSeek", True, False), ("anthropic", "Claude (Anthropic)", True, False),
     ("openai", "OpenAI", True, False), ("kimi", "Kimi (Moonshot)", True, True),
@@ -75,9 +71,10 @@ RESULT_FILES = (("recitation.pdf", "Recitation notes", "pdf"), ("project.pdf", "
                 ("script.md", "Script", "text"), ("report.md", "Quality report", "text"),
                 ("ideas.csv", "Idea ledger", "text"), ("recitation.tex", "LaTeX source", "text"),
                 ("project.tex", "Project, LaTeX source", "text"),
-                ("questions.md", "Questions", "text"), ("glossary.md", "Glossary", "text"))
+                ("questions.md", "Questions", "text"), ("glossary.md", "Glossary", "text"),
+                ("calls.jsonl", "Every request sent", "text"))
 TEXT_TYPES = {".md": "text/plain", ".tex": "text/plain", ".txt": "text/plain",
-              ".csv": "text/csv", ".json": "application/json", ".pdf": "application/pdf",
+              ".csv": "text/csv", ".json": "application/json", ".jsonl": "text/plain", ".pdf": "application/pdf",
               ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav"}
 _TAG = re.compile(r"^\[([a-z]+)\]")
 _FRACTION = re.compile(r"\b(?:part|chunk)\s+(\d+)\s*/\s*(\d+)")
@@ -245,6 +242,11 @@ class App:
         key = text("api_key")
         if key and llm in KEY_ENV:
             env[KEY_ENV[llm]] = key
+            if options.get("remember"):  # kept in ~/.lecture2audio.env, mode 600
+                try:
+                    keys.save(llm, key)
+                except (keys.KeyFileError, OSError) as exc:
+                    raise Refused(400, f"The key could not be saved: {exc}.") from None
         job.name, job.mode = name, mode
         skipped = set() if mode == "build" else {"audio", "parts"}
         skipped |= {"factcheck"}  # shown when it runs (it needs MiniCheck)
@@ -580,10 +582,12 @@ class Handler(BaseHTTPRequestHandler):
             "stages": [{"name": s.name, "label": LABELS.get(s.name, s.name.capitalize()),
                         "about": s.about} for s in stages.STAGES],
             "providers": [{"id": pid, "label": label, "key": needs_key, "models": needs_models,
-                           # whether a key is already set, never the key itself
-                           "has_key": bool(os.environ.get(KEY_ENV.get(pid, "")))}
+                           # where the key in use comes from, never the key itself
+                           "has_key": bool(os.environ.get(KEY_ENV.get(pid, ""))),
+                           "key_source": keys.source(KEY_ENV[pid]) if pid in KEY_ENV else None}
                           for pid, label, needs_key, needs_models in PROVIDERS],
             "vault_dir": os.environ.get("L2A_VAULT_DIR") or "",
+            "can_save": keys.available(),
             "out": str(self.app.out), "job": job.public() if job else None})
 
     def _inputs(self, _rest: str, query: dict) -> None:

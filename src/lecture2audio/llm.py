@@ -29,6 +29,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from . import trace
+
 
 class LLMError(RuntimeError):
     """A failed model call. `status` and `body` are set for HTTP errors."""
@@ -214,8 +216,10 @@ class AnthropicLLM(LLM):
         if self.fallbacks:
             params["betas"], params["fallbacks"] = [FALLBACK_BETA], "default"
         try:
-            with self._errors(), self.client.beta.messages.stream(**params) as stream:
+            with trace.call("model", host=self.base_url, **params) as record, \
+                    self._errors(), self.client.beta.messages.stream(**params) as stream:
                 message = stream.get_final_message()
+                record["answer"] = message
         except LLMError as exc:
             if not (self.fallbacks and exc.status == 400
                     and ("anthropic-beta" in exc.body or "fallbacks" in exc.body)):
@@ -367,8 +371,10 @@ class OpenAICompatLLM(LLM):
             if self.extra:
                 request["extra_body"] = self.extra
             try:
-                with self._errors(), self.client.chat.completions.stream(**request) as stream:
+                with trace.call("model", host=self.base_url, **request) as record, \
+                        self._errors(), self.client.chat.completions.stream(**request) as stream:
                     completion = stream.get_final_completion()
+                    record["answer"] = completion
             except LLMError as exc:
                 if attempt or not self._wrong_token_param(exc):
                     raise

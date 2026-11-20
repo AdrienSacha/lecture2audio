@@ -181,9 +181,12 @@ class OpenAITTS(TTS):
                 method="POST", headers={"authorization": f"Bearer {self.api_key}",
                                         "content-type": "application/json"})
             try:
-                with urllib.request.urlopen(request, timeout=300) as response:
+                from . import trace
+                with trace.call("speech", host=self.base_url, **self.payload(text)) as record, \
+                        urllib.request.urlopen(request, timeout=300) as response:
                     audio = response.read()
                     kind = response.headers.get("content-type", "")
+                    record.update(type=kind, bytes=len(audio))
                 if not audio or kind.startswith(("application/json", "text/")):
                     raise TTSError(f"The speech server returned no audio: {audio[:300]!r}")
                 out_path.write_bytes(audio)

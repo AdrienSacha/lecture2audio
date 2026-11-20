@@ -330,6 +330,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .32); -webkit-backdrop-filter: blur
       <div class="what"><label for="api-key">API key</label><small id="key-hint">Used for this run only. Never saved.</small></div>
       <input class="field" id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your key">
     </div>
+    <div class="row" id="remember-row">
+      <div class="what"><label for="remember">Remember this key</label><small>Saved in ~/.lecture2audio.env, readable only by you.</small></div>
+      <span class="switch"><input type="checkbox" role="switch" id="remember" checked><i></i></span>
+    </div>
     <div class="row">
       <div class="what"><span class="label" id="lang-label">Language</span></div>
       <div class="seg" role="radiogroup" aria-labelledby="lang-label">
@@ -619,9 +623,12 @@ function provider() { return state.config.providers.find((p) => p.id === $("llm"
 function refreshOptions() {
   const p = provider();
   $("key-row").hidden = !p.key;
-  $("api-key").placeholder = p.has_key ? "Found in your environment" : "Paste your key";
-  $("key-hint").textContent = p.has_key ? "A key is already set in your shell. Type one here to use another."
-                                        : "Used for this run only. Never saved.";
+  $("remember-row").hidden = !p.key || !state.config.can_save;
+  $("api-key").placeholder = p.key_source === "file" ? "Saved on this computer"
+                           : p.has_key ? "Found in your environment" : "Paste your key";
+  $("key-hint").textContent = p.key_source === "file" ? "A saved key is used. Type one here to replace it."
+                            : p.has_key ? "A key is already set in your shell. Type one here to use another."
+                            : state.config.can_save ? "Needed once: it can be remembered." : "Used for this run only. Never saved.";
   $("llm-hint").textContent = p.id === "dry" ? "No model is called: the pipeline runs on pass-through text."
                                              : "The provider that writes and checks the notes.";
   $("models-hint").textContent = p.models ? "Required for this provider." : "Leave empty for the provider's default.";
@@ -647,10 +654,12 @@ async function start() {
     llm: p.id, language: document.querySelector('input[name="language"]:checked').value,
     audio: $("audio").checked, project: $("project").checked, research: $("research").checked,
     vault_dir: $("vault").value, rewrite_model: $("rewrite-model").value,
-    verify_model: $("verify-model").value, base_url: $("base-url").value, api_key: $("api-key").value };
+    verify_model: $("verify-model").value, base_url: $("base-url").value, api_key: $("api-key").value,
+    remember: $("remember").checked && !!$("api-key").value.trim() };
   $("start").disabled = true; say("");
   try {
     const job = await api("/api/run", { job: state.job, options });
+    if (options.remember) { p.has_key = true; p.key_source = "file"; }
     $("api-key").value = "";
     follow(job, true);
   } catch (error) { say(error.message, true); refreshStart(); }

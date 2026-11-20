@@ -15,6 +15,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import trace
+
 MAX_BYTES = 3_000_000
 USER_AGENT = "lecture2audio/0.1 (study tool; fetches a page to check a quote)"
 
@@ -77,9 +79,11 @@ def fetch_page(url: str, timeout: float = 20) -> str:
     request = urllib.request.Request(url, headers={"user-agent": USER_AGENT,
                                                    "accept": "text/html,text/plain,application/pdf"})
     try:
-        with opener.open(request, timeout=timeout) as response:
+        with trace.call("page", url=url) as record, \
+                opener.open(request, timeout=timeout) as response:
             kind = (response.headers.get("content-type") or "").lower()
             data = response.read(MAX_BYTES + 1)
+            record.update(status=response.status, type=kind, bytes=len(data))
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise FetchError(f"could not read {url}: {exc}") from None
     if len(data) > MAX_BYTES:
@@ -135,8 +139,10 @@ def _json_request(url: str, payload: dict | None, headers: dict, timeout: float 
     request = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST" if data is not None else "GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+        with trace.call("search", url=url, payload=payload) as record, \
+                urllib.request.urlopen(request, timeout=timeout) as response:
+            record["answer"] = json.loads(response.read().decode("utf-8"))
+            return record["answer"]
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")[:300]
         raise FetchError(f"search failed (HTTP {exc.code}): {body}") from None

@@ -1,4 +1,6 @@
 """The local page's server: its safety rules and one whole run without a model."""
+import os
+os.environ["L2A_KEYS_FILE"] = "off"  # never read or write the real key file
 import http.client
 import json
 import os
@@ -7,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from lecture2audio import app as webapp
@@ -168,6 +171,32 @@ class RunTest(AppCase):
         response, _ = self.request("GET", files["script.md"]["url"],
                                    headers={"Range": f"bytes={len(whole) + 5}-"})
         self.assertEqual(response.status, 416)
+
+
+class KeyTest(AppCase):
+    def test_remembered_key_goes_to_the_keychain_only(self):
+        from lecture2audio import keys
+        job = self.app.job(self.upload()["job"])
+        options = {"llm": "deepseek", "audio": False, "api_key": "sk-remember", "remember": True}
+        with self.assertRaises(webapp.Refused) as refused:  # the key file is off in tests
+            self.app.arguments(job, options)
+        self.assertEqual(refused.exception.status, 400)
+        file = Path(self.tmp.name) / "keys.env"
+        try:
+            with mock.patch.dict(os.environ, {"L2A_KEYS_FILE": str(file)}):
+                os.environ.pop("DEEPSEEK_API_KEY", None)
+                _, env = self.app.arguments(job, options)
+                self.assertEqual(env["DEEPSEEK_API_KEY"], "sk-remember")
+                self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+                self.assertIn("DEEPSEEK_API_KEY=sk-remember", file.read_text())
+                _, body = self.request("GET", "/api/config")
+                self.assertNotIn(b"sk-remember", body)
+                config = json.loads(body)
+                deepseek = next(p for p in config["providers"] if p["id"] == "deepseek")
+                self.assertEqual((deepseek["has_key"], deepseek["key_source"]), (True, "file"))
+                self.assertTrue(config["can_save"])
+        finally:
+            keys._loaded.discard("DEEPSEEK_API_KEY")
 
 
 class CancelTest(AppCase):
