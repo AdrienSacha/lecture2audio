@@ -558,6 +558,28 @@ def blocking(issues: list[dict]) -> list[dict]:
 
 # --------------------------------------------------------------------- pipeline
 
+def _merge_slide_ideas(result: dict, extra: dict, slides: set[int]) -> dict:
+    """`result` with the slide ideas of `slides` from `extra` and the gaps that name them,
+    renumbered after the ids already used."""
+    def top(items, prefix):
+        numbers = [int(m.group(1)) for i in items
+                   if (m := re.fullmatch(prefix + r"(\d+)", str(i.get("id", ""))))]
+        return max(numbers, default=0)
+
+    next_idea, next_gap = top(result["slide_ideas"], "S"), top(result["gaps"], "G")
+    renamed, ideas, gaps = {}, [], []
+    for idea in extra["slide_ideas"]:
+        if idea.get("slide") in slides:
+            next_idea += 1
+            renamed[str(idea["id"])] = f"S{next_idea}"
+            ideas.append(dict(idea, id=f"S{next_idea}"))
+    for gap in extra["gaps"]:
+        if gap.get("kind") == "slide_missing" and str(gap.get("idea")) in renamed:
+            next_gap += 1
+            gaps.append(dict(gap, id=f"G{next_gap}", idea=renamed[str(gap["idea"])]))
+    return dict(result, slide_ideas=result["slide_ideas"] + ideas, gaps=result["gaps"] + gaps)
+
+
 class TextPipeline:
     def __init__(self, work_dir: Path, language: str, rewrite_llm: LLM, verify_llm: LLM,
                  prompts: Prompts, glossary: str = "", slides: list[str] | None = None,
@@ -584,6 +606,7 @@ class TextPipeline:
         # Filled by the gap stages; empty when they are not run.
         self.coverage: dict = {"slide_ideas": [], "gaps": [], "transcript_ideas": []}
         self.terms: list[dict] = []
+        self.terms_error: str | None = None
         self.idea_notes: dict = {"no_content": [], "unaccounted": {}}
         self.research: dict[str, dict] = {}
         self.supplements: list[dict] = []
@@ -599,7 +622,7 @@ class TextPipeline:
 
     def _ask_json(self, llm: LLM, system: str, user: str, validate, what: str,
                   tries: int = 3) -> dict:
-        note, problem = "", ""
+        note, best = "", None
         for _ in range(tries):
             raw = llm.complete(system, user + note)
             try:
@@ -609,10 +632,12 @@ class TextPipeline:
                 errors = [f"not valid JSON ({exc})"]
             if not errors:
                 return data
-            problem = "; ".join(errors)
+            if best is None or len(errors) < len(best):  # feedback from the best attempt
+                best = errors
             note = ("\n\n## PREVIOUS ANSWER REJECTED\nYour previous answer was rejected:\n- "
-                    + "\n- ".join(errors)
+                    + "\n- ".join(best)
                     + "\nReturn only the JSON object, in exactly the required format.")
+        problem = "; ".join(best or [])
         raise PipelineError(f"{what}: no valid answer after {tries} tries ({problem}).")
 
     def _map(self, function, items, on_done: Callable[[object], None] | None = None):
@@ -669,29 +694,76 @@ class TextPipeline:
         return "\n\n".join(f"[Slide {k}]\n{s}" for k, s in enumerate(self.slides, 1) if s.strip())
 
     def run_coverage(self, outline: Outline) -> dict:
-        """Slide ideas with their status, and the gaps of the transcript."""
+        """Slide ideas with their status, and the gaps of the transcript.
+
+        Slides the answer leaves without an idea (often section or title pages) do not reject
+        the whole answer, which costs a full regeneration and, after three tries, every gap:
+        they are asked for alone in one bounded call over the same transcript, merged in, and
+        any still missing are named in report.md (`unlisted_slides`). A search that keeps
+        failing its gate is not cached, so the next run tries it again."""
         cache = self.work_dir / "coverage.json"
         if cache.exists():
             self.coverage = json.loads(cache.read_text(encoding="utf-8"))
-            return self.coverage
+            if not self.coverage.get("error"):  # a failure saved by an older version: retry
+                return self.coverage
         self.log("[gaps] looking for what the lecture leaves out")
-        ids = enrich.node_order(outline)
+        ids, blank, count = enrich.node_order(outline), self._blank_slides(), len(self.slides)
         user = (f"## LANGUAGE\n{self.language_name}\n\n" + self._kind()
                 + _section("GLOSSARY", self.glossary) + _section("SLIDES", self._slides_numbered())
                 + "## TRANSCRIPT\n" + self._lecture(outline))
         try:
             data = self._ask_json(self.rewrite_llm, self.prompts.coverage, user,
-                                  lambda d: enrich.validate_coverage(d, ids, len(self.slides),
-                                                                     self._blank_slides()),
+                                  lambda d: enrich.validate_coverage(d, ids, count, blank,
+                                                                     require_slides=False),
                                   "gap search")
-            result = {"slide_ideas": data["slide_ideas"], "gaps": data["gaps"],
-                      "transcript_ideas": data.get("transcript_ideas", [])}
-        except PipelineError as exc:
-            self.log(f"[gaps] {exc}")
-            result = {"slide_ideas": [], "gaps": [], "transcript_ideas": [], "error": str(exc)}
+        except (PipelineError, LLMError) as exc:
+            self.log(f"[gaps] {exc} (not cached: the next run tries again)")
+            self.coverage = {"slide_ideas": [], "gaps": [], "transcript_ideas": [],
+                             "error": str(exc)}
+            return self.coverage
+        result = {"slide_ideas": data["slide_ideas"], "gaps": data["gaps"],
+                  "transcript_ideas": data.get("transcript_ideas", [])}
+        missing = enrich.unlisted_slides(result, count, blank)
+        if missing:
+            result, missing = self._repair_slides(outline, result, missing, ids, blank)
+        if missing:
+            result["unlisted_slides"] = missing
+            self.log(f"[gaps] slides {missing} still have no idea listed; named in report.md")
         cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         self.coverage = result
         return result
+
+    def _repair_slides(self, outline: Outline, result: dict, missing: list[int],
+                       ids: list[str], blank: set[int]) -> tuple[dict, list[int]]:
+        """One bounded call for the slides the gap search left without an idea: only those
+        slides are shown, the transcript stays, and the answer is merged under fresh ids. The
+        merged answer is kept only if it passes the gate."""
+        self.log(f"[gaps] asking again for slides {missing} only")
+        wanted = set(missing)
+        shown = "\n\n".join(f"[Slide {k}]\n{s}" for k, s in enumerate(self.slides, 1)
+                             if k in wanted)
+        others = set(range(1, len(self.slides) + 1)) - wanted
+        user = (f"## LANGUAGE\n{self.language_name}\n\n" + self._kind()
+                + _section("GLOSSARY", self.glossary) + _section("SLIDES", shown)
+                + _section("TASK", "Only the slides above are asked for: an earlier answer "
+                           "listed every other slide. List the ideas of each of these slides "
+                           "(a title or section page gets one idea, with the status the "
+                           "transcript gives that section) and a gap of kind \"slide_missing\" "
+                           "for each idea that is partial or missing. \"transcript_ideas\" "
+                           "stays empty and no other gap is listed.")
+                + "## TRANSCRIPT\n" + self._lecture(outline))
+        try:
+            extra = self._ask_json(
+                self.rewrite_llm, self.prompts.coverage, user,
+                lambda d: enrich.validate_coverage(d, ids, len(self.slides), blank | others),
+                "gap search, missing slides", tries=2)
+        except (PipelineError, LLMError) as exc:
+            self.log(f"[gaps] {exc}")
+            return result, missing
+        merged = _merge_slide_ideas(result, extra, wanted)
+        if enrich.validate_coverage(merged, ids, len(self.slides), blank, require_slides=False):
+            return result, missing
+        return merged, enrich.unlisted_slides(merged, len(self.slides), blank)
 
     def run_ideas(self, outline: Outline) -> list[dict]:
         """The atomic ideas the teacher taught, listed part by part (in parallel), so that no
@@ -830,7 +902,8 @@ class TextPipeline:
                 data = self._ask_json(
                     self.rewrite_llm, self.prompts.coverage, user,
                     lambda d: enrich.validate_coverage(d, enrich.node_order(outline),
-                                                       len(self.slides), self._blank_slides()),
+                                                       len(self.slides), self._blank_slides(),
+                                                       require_slides=False),
                     "gap search audit")
                 new = [g for g in data["gaps"]
                        if (str(g["node"]), g["kind"], str(g.get("term", "")).lower()) not in known]
@@ -860,9 +933,10 @@ class TextPipeline:
             data = self._ask_json(self.rewrite_llm, self.prompts.termbase, user,
                                   lambda d: enrich.validate_termbase(d, ids, required), "termbase")
             terms, error = enrich.build_termbase(data, outline, self.glossary), None
-        except PipelineError as exc:
-            self.log(f"[terms] {exc}")
-            terms, error = [], str(exc)
+        except (PipelineError, LLMError) as exc:  # not cached: the next run tries again
+            self.log(f"[terms] {exc} (not cached: the next run tries again)")
+            self.terms, self.terms_error = [], str(exc)
+            return self.terms
         cache.write_text(json.dumps({"terms": terms, "error": error}, ensure_ascii=False, indent=2),
                          encoding="utf-8")
         self.terms = terms

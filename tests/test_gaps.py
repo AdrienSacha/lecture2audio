@@ -419,3 +419,70 @@ class ResearchLoop(unittest.TestCase):
                 llm.make_llm("kimi", "k2")
         with self.assertRaises(llm.LLMError):
             llm.make_llm("compat", "m")  # no --base-url
+
+
+class SlideRepair(unittest.TestCase):
+    """Slides the gap search leaves without an idea are asked for alone, not by redoing it."""
+    SLIDES = ["Retransmission: a lost packet is sent again", "2 Flow control",
+              "The window limits unacknowledged data"]
+
+    def run_coverage(self, repair):
+        calls = []
+
+        def handle(system, user):
+            if "You find the gaps" in system:
+                calls.append(user)
+                if len(calls) == 1:  # skips the section page, slide 2
+                    return json.dumps({"slide_ideas": [
+                        {"id": "S1", "slide": 1, "idea": "resend", "status": "covered",
+                         "nodes": ["1.2"]},
+                        {"id": "S2", "slide": 3, "idea": "window", "status": "missing",
+                         "nodes": ["1.2"]}], "gaps": [
+                        {"id": "G1", "kind": "slide_missing", "node": "1.2", "idea": "S2",
+                         "detail": "d", "query": "q"}]})
+                return repair(user)
+            if "You build the outline" in system:
+                return json.dumps(OUTLINE)
+            return dry_run_handler(system, user)
+
+        fake = FakeLLM(handle)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        p = TextPipeline(pathlib.Path(tmp.name), "en", fake, fake, load_prompts("en"),
+                         log=silent, max_part_words=1000, workers=1, slides=self.SLIDES)
+        result = p.run_coverage(p.run_outline(UNITS))
+        return result, calls, pathlib.Path(tmp.name)
+
+    def test_missing_slide_is_asked_alone_and_merged(self):
+        def repair(user):
+            return json.dumps({"slide_ideas": [
+                {"id": "S1", "slide": 2, "idea": "flow control section", "status": "partial",
+                 "nodes": ["1.2"]}], "gaps": [
+                {"id": "G1", "kind": "slide_missing", "node": "1.2", "idea": "S1",
+                 "detail": "d2", "query": "q2"}]})
+        result, calls, _ = self.run_coverage(repair)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("[Slide 2]", calls[1])
+        self.assertNotIn("[Slide 1]", calls[1])
+        self.assertEqual([(i["id"], i["slide"]) for i in result["slide_ideas"]],
+                         [("S1", 1), ("S2", 3), ("S3", 2)])
+        self.assertEqual([(g["id"], g["idea"]) for g in result["gaps"]],
+                         [("G1", "S2"), ("G2", "S3")])
+        self.assertNotIn("unlisted_slides", result)
+
+    def test_a_failed_repair_keeps_the_answer_and_names_the_slide(self):
+        result, calls, work = self.run_coverage(lambda user: "not json")
+        self.assertEqual(len(calls), 3)  # the search, then two tries for slide 2
+        self.assertEqual(result["unlisted_slides"], [2])
+        self.assertEqual(len(result["gaps"]), 1)  # the gaps found are not lost
+        self.assertTrue((work / "coverage.json").exists())
+
+    def test_a_failed_search_is_not_cached(self):
+        fake = FakeLLM(lambda s, u: json.dumps(OUTLINE) if "You build the outline" in s
+                       else "not json")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = TextPipeline(pathlib.Path(tmp), "en", fake, fake, load_prompts("en"),
+                             log=silent, max_part_words=1000, workers=1, slides=self.SLIDES)
+            result = p.run_coverage(p.run_outline(UNITS))
+            self.assertIn("error", result)
+            self.assertFalse((pathlib.Path(tmp) / "coverage.json").exists())

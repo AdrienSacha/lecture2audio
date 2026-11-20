@@ -151,8 +151,8 @@ def build_parser() -> argparse.ArgumentParser:
                               "lose faithfulness towards their end, so parts are kept short)")
         llm.add_argument("--max-retries", type=int, default=2,
                          help="rewrites allowed after a failed verification (default 2)")
-        llm.add_argument("--workers", type=int, default=3,
-                         help="parts processed at the same time (default 3)")
+        llm.add_argument("--workers", type=int, default=16,
+                         help="parts processed at the same time (default 16)")
         llm.add_argument("--no-audit", action="store_true",
                          help="skip the tests that plant a fault (an omission for the verifier, a "
                               "hole for the gap search, a fact for the idea listing, an emptied "
@@ -509,7 +509,8 @@ def run(args, series: dict | None = None) -> int:
     log(f"[gaps] {len(coverage['gaps'])} gap(s), {len(terms)} term(s), "
         f"{len(supplements)} checked fact(s) from outside the lecture")
     track("gaps")
-    gaps = {"coverage": coverage, "terms": terms, "research": pipeline.research,
+    gaps = {"coverage": coverage, "terms": terms, "terms_error": pipeline.terms_error,
+            "research": pipeline.research,
             "supplements": supplements, "note": research_note,
             "audit": None if args.no_audit else pipeline.audit_coverage(outline)}
     track("rewrite")
