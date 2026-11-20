@@ -16,7 +16,7 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from . import keys, ledger, stages
+from . import keys, ledger, stages, trace
 from .assemble import encode_final, encode_part_files, join_parts, repair_chunks, synth_blocks
 from .factcheck import run_factcheck
 from .course import CoursePipeline, course_report
@@ -416,6 +416,7 @@ def run(args, series: dict | None = None) -> int:
     name = args.name or slugify(source.stem)
     work = Path(args.out) / name
     work.mkdir(parents=True, exist_ok=True)
+    trace.open_run(work)  # every request sent over the network, in full: calls.jsonl
     kind = input_kind(source)
     glossary = load_glossary(args.glossary)
     if args.redo:
@@ -713,6 +714,7 @@ def run_series(args) -> int:
         names.append(name)
     root = Path(args.out) / course_name
     root.mkdir(parents=True, exist_ok=True)
+    trace.open_run(root)
 
     def lecture_args(number: int, redo):
         lecture = copy.copy(args)

@@ -490,3 +490,42 @@ class TestOpenAITTS(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTrace(unittest.TestCase):
+    """calls.jsonl holds every request in full, never the key."""
+
+    def test_model_call_is_written_in_full_without_the_key(self):
+        from lecture2audio import trace
+        with tempfile.TemporaryDirectory() as tmp:
+            server = FakeServer(chat_stream("answer", reasoning_content="thinking"),
+                                error(400, {"error": {"message": "bad"}}))
+            key = "sk-secret-123456"
+            with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": key}):
+                model = HostedLLM("deepseek", "deepseek-flash", http_client=server.client())
+                trace.open_run(tmp)
+                try:
+                    model.complete("system text", f"user text {key}")
+                    with self.assertRaises(LLMError):
+                        model.complete("s", "u")
+                finally:
+                    trace.close()
+            text = (Path(tmp) / "calls.jsonl").read_text()
+            self.assertNotIn(key, text)
+            first, second = [json.loads(line) for line in text.splitlines()]
+            self.assertEqual(first["kind"], "model")
+            self.assertEqual(first["request"]["host"], "https://api.deepseek.com")
+            self.assertEqual([m["content"] for m in first["request"]["messages"]],
+                             ["system text", "user text [key]"])
+            message = first["answer"]["choices"][0]["message"]
+            self.assertEqual((message["content"], message["reasoning_content"]),
+                             ("answer", "thinking"))
+            self.assertEqual(first["answer"]["usage"]["prompt_tokens"], 7)
+            self.assertIn("HTTP 400", second["error"])
+
+    def test_nothing_is_written_without_a_run(self):
+        from lecture2audio import trace
+        trace.close()
+        with trace.call("model", host="h") as record:
+            record["answer"] = "x"
+        trace.write("model", host="h")  # no file, no error

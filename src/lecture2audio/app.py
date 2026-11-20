@@ -71,9 +71,10 @@ RESULT_FILES = (("recitation.pdf", "Recitation notes", "pdf"), ("project.pdf", "
                 ("script.md", "Script", "text"), ("report.md", "Quality report", "text"),
                 ("ideas.csv", "Idea ledger", "text"), ("recitation.tex", "LaTeX source", "text"),
                 ("project.tex", "Project, LaTeX source", "text"),
-                ("questions.md", "Questions", "text"), ("glossary.md", "Glossary", "text"))
+                ("questions.md", "Questions", "text"), ("glossary.md", "Glossary", "text"),
+                ("calls.jsonl", "Every request sent", "text"))
 TEXT_TYPES = {".md": "text/plain", ".tex": "text/plain", ".txt": "text/plain",
-              ".csv": "text/csv", ".json": "application/json", ".pdf": "application/pdf",
+              ".csv": "text/csv", ".json": "application/json", ".jsonl": "text/plain", ".pdf": "application/pdf",
               ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav"}
 _TAG = re.compile(r"^\[([a-z]+)\]")
 _FRACTION = re.compile(r"\b(?:part|chunk)\s+(\d+)\s*/\s*(\d+)")
