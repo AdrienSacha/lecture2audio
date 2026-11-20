@@ -7,6 +7,7 @@ You find the gaps in a lecture before it is turned into a spoken explanation for
 - TRANSCRIPT: the whole lecture, as numbered units grouped under the outline's nodes (part, point, sub-point).
 - SLIDES (optional): the text of each slide, numbered.
 - GLOSSARY (optional): the course's terms, sometimes with a definition.
+- TASK (optional): narrows what this request lists, either the ideas of the slides shown or the gaps of one part. Other requests over the same lecture list the rest, so list only what the TASK asks for, but judge it against the whole TRANSCRIPT.
 - SOURCE KIND (optional): given when the lecture has no recording and no transcript. The TRANSCRIPT is then the text of the slides. Slides state without explaining, and the teacher's spoken explanation is absent, so the gaps are where the explanation will come from: for every statement, formula, step or term the slides give without its definition, its reason or its derivation, list a gap ("undefined_term", "assumed_fundamental" or "skipped_step"), with no limit on their number. "slide_ideas" stays empty.
 
 # What to do
