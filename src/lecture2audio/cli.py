@@ -753,6 +753,9 @@ def main(argv=None) -> None:
     if argv and argv[0] == "app":  # the local web app: drop the files, watch the run, read
         from .app import main as app_main
         sys.exit(app_main(argv[1:]))
+    if argv and argv[0] == "mcp":  # the MCP server over stdio, for other agents (ADR-0008)
+        from .mcp_server import main as mcp_main
+        sys.exit(mcp_main(argv[1:]))
     if argv and argv[0] not in (*COMMANDS, "-h", "--help"):
         argv = ["build", *argv]  # zero friction: `lecture2audio ./lecture_folder/`
     args = build_parser().parse_args(argv)
