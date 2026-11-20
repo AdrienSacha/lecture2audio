@@ -1,3 +1,5 @@
+import os
+os.environ["L2A_KEYS_FILE"] = "off"  # never read or write the real key file
 import contextlib
 import csv
 import io

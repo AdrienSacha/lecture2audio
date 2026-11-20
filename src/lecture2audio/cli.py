@@ -16,7 +16,7 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from . import ledger, stages
+from . import keys, ledger, stages
 from .assemble import encode_final, encode_part_files, join_parts, repair_chunks, synth_blocks
 from .factcheck import run_factcheck
 from .course import CoursePipeline, course_report
@@ -748,8 +748,46 @@ def run_series(args) -> int:
     return 0
 
 
+def key_main(argv: list[str]) -> int:
+    """`lecture2audio key set|delete|list [provider]`: the keys kept in ~/.lecture2audio.env."""
+    parser = argparse.ArgumentParser(
+        prog="lecture2audio key",
+        description="Keep API keys in ~/.lecture2audio.env, a file only you can read "
+                    "(L2A_KEYS_FILE moves it). The command line and the app read it; a "
+                    "variable set in the shell wins.")
+    parser.add_argument("action", choices=("set", "delete", "list"))
+    parser.add_argument("provider", nargs="?", default="deepseek",
+                        help=f"one of {', '.join(keys.KEY_ENV)} (default: deepseek)")
+    args = parser.parse_args(argv)
+    try:
+        if args.action == "list":
+            for provider, var in keys.KEY_ENV.items():
+                where = ", ".join(w for w, on in (("file", keys.stored(var)),
+                                                  ("shell", os.environ.get(var))) if on)
+                print(f"{provider:<11} {var:<20} {where or '-'}")
+            return 0
+        var = keys.variable(args.provider)
+        if args.action == "delete":
+            gone = keys.delete(args.provider)
+            print(f"{var} removed from {keys.path()}." if gone else f"No {var} in {keys.path()}.")
+            return 0
+        import getpass
+        shell = os.environ.get(var)
+        keys.save(args.provider, getpass.getpass(f"{var} (typing is hidden): "))
+        print(f"{var} saved in {keys.path()} (readable only by you).")
+        if shell:
+            print(f"Note: {var} is also set in your shell, and the shell wins.")
+        return 0
+    except (keys.KeyFileError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "key":  # API keys in ~/.lecture2audio.env (keys.py)
+        sys.exit(key_main(argv[1:]))
+    keys.load()  # saved keys fill the variables the shell left unset
     if argv and argv[0] == "app":  # the local web app: drop the files, watch the run, read
         from .app import main as app_main
         sys.exit(app_main(argv[1:]))
