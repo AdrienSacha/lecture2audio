@@ -1,5 +1,7 @@
 import os
 os.environ["L2A_KEYS_FILE"] = "off"  # never read or write the real key file
+os.environ["L2A_LIBRARY"] = os.path.join(  # never read or write the real library
+    __import__("tempfile").gettempdir(), "l2a-tests-no-library", "library.db")
 import pathlib
 import sys
 import tempfile

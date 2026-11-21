@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .ledger import open_rows
+from .library import is_source
 from .outline import Outline, ranges
 from .pipeline import SOFT_ISSUES, list_sentence, scope_words
 
@@ -55,7 +56,8 @@ def _sources(records: list[dict]) -> list[str]:
     lines = ["## Sources from outside the lecture", ""]
     for item in items:
         title = item.get("title") or item["url"]
-        lines.append(f"- [{item['id']}] {title}. <{item['url']}>. Supporting passage: "
+        where = "" if is_source(item["url"]) else f" <{item['url']}>."  # a book: "Title, p. N"
+        lines.append(f"- [{item['id']}] {title}.{where} Supporting passage: "
                      f"\"{item['quote']}\"")
     return lines + [""]
 
@@ -452,7 +454,7 @@ def _gap_lines(outline: Outline, gaps: dict) -> list[str]:
     lines.append("")
     rejected = [(g, r) for g, res in research.items() for r in res.get("rejected", [])]
     if rejected:
-        lines += ["Facts found online but discarded, because their quote could not be checked:", ""]
+        lines += ["Facts found online or in the reference library but discarded, because their quote could not be checked:", ""]
         lines += [f"- {g}: {r.get('text', '')} <{r.get('url', '')}> ({r.get('reason', '')})"
                   for g, r in rejected]
         lines.append("")

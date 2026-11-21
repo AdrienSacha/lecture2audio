@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import enrich
+from . import library as books
 from .llm import LLM, LLMError, extract_json
 from .outline import (Node, Outline, checklist, dump, fallback_outline, moves, noise_by_part,
                       parse_outline, part_source, part_words, ranges, render_outline,
@@ -586,7 +587,7 @@ class TextPipeline:
                  max_retries: int = 2, log: Callable[[str], None] = print,
                  max_part_words: int = 1500, workers: int = 3,
                  researcher: Callable[[str, str], tuple[str, list[dict]]] | None = None,
-                 source_kind: str = "transcript"):
+                 source_kind: str = "transcript", library=None):
         self.work_dir = Path(work_dir)
         self.language = language
         self.language_name = LANGUAGE_NAMES.get(language, language)
@@ -603,6 +604,8 @@ class TextPipeline:
         self.researcher = researcher
         # "slides": no recording and no transcript, the units are the text of the slides
         self.source_kind = source_kind
+        # The user's reference library (library.Library with books), searched before the web.
+        self.library = library
         # Filled by the gap stages; empty when they are not run.
         self.coverage: dict = {"slide_ideas": [], "gaps": [], "transcript_ideas": []}
         self.terms: list[dict] = []
@@ -927,6 +930,7 @@ class TextPipeline:
                            if g.get("kind") in enrich.TERM_GAPS and str(g.get("term", "")).strip()})
         user = (f"## LANGUAGE\n{self.language_name}\n\n"
                 + _section("REQUIRED TERMS", "\n".join(required))
+                + _section("REFERENCE", self._term_references(required))
                 + _section("GLOSSARY", self.glossary) + _section("SLIDES", self._slides_numbered())
                 + "## TRANSCRIPT\n" + self._lecture(outline))
         try:
@@ -942,6 +946,15 @@ class TextPipeline:
         self.terms = terms
         return terms
 
+    def _term_references(self, required: list[str]) -> str:
+        """For each required term, the best page of the reference library that names it."""
+        hits = []
+        for term in required:
+            found = books.passages(self.library, [term], k=1, max_chars=1500)
+            if found and enrich.term_pattern(term).search(found[0]["text"]):
+                hits.append(dict(found[0], text=f'({term}) {found[0]["text"]}'))
+        return books.render_passages(hits)
+
     def _research_one(self, outline: Outline, gap: dict) -> dict:
         node = outline.node(str(gap["node"]))
         part = outline.node(str(gap["node"]).split(".")[0])
@@ -954,6 +967,8 @@ class TextPipeline:
                                              ensure_ascii=False)
                            + f"\nNode: {node.id} {node.title}")
                 + _section("TERM", json.dumps(entry, ensure_ascii=False) if entry else "")
+                + _section("LIBRARY", books.render_passages(books.passages(
+                    self.library, [str(gap.get("query", "")), str(gap.get("term") or "")])))
                 + "## CONTEXT\n" + render_part_transcript(outline, part, [])[:8000])
         try:
             text, documents = self.researcher(self.prompts.research, user)
@@ -964,7 +979,7 @@ class TextPipeline:
                         "error": "; ".join(errors)}
         except (LLMError, ValueError) as exc:
             return {"gap": gap["id"], "found": False, "facts": [], "rejected": [], "error": str(exc)}
-        kept, rejected = enrich.check_facts(data["facts"], documents)
+        kept, rejected = enrich.check_facts(data["facts"], documents, library=self.library)
         return {"gap": gap["id"], "found": bool(kept), "facts": kept, "rejected": rejected,
                 "error": None}
 

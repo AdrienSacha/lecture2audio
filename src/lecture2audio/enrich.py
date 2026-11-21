@@ -343,17 +343,35 @@ def validate_research(data) -> list[str]:
     return []
 
 
-def check_facts(facts: list[dict], documents: list[dict], fetch=fetch_page) -> tuple[list, list]:
+def check_facts(facts: list[dict], documents: list[dict], fetch=fetch_page,
+                library=None) -> tuple[list, list]:
     """Keep the facts whose quote is found word for word in a page the provider returned or
-    that the program fetched. Returns (kept, rejected with the reason)."""
+    that the program fetched, or, for a fact whose source is `library:<book>:p<page>`, in that
+    page of the reference library (`library.Library`) as stored. Returns (kept, rejected with
+    the reason)."""
+    from . import library as books
     pages: dict[str, list[str]] = {}
     for doc in documents:
+        if books.is_source(doc.get("url", "")):
+            continue
         pages.setdefault(doc["url"], [])
         if doc.get("text"):
             pages[doc["url"]].append(doc["text"])
     kept, rejected = [], []
     for fact in facts:
         url = str(fact["url"]).strip()
+        if books.is_source(url):
+            found = books.quote_pages(library, url)
+            if found is None:
+                rejected.append(dict(fact, reason="the book or the page is not in the reference "
+                                                  "library"))
+            elif quote_found(fact["quote"], found[0]):
+                kept.append({"text": str(fact["text"]).strip(), "url": url, "title": found[1],
+                             "quote": str(fact["quote"]).strip()})
+            else:
+                rejected.append(dict(fact, reason="the quote was not found word for word in the "
+                                                  "page of the book"))
+            continue
         known = [u for u in pages if same_page(u, url)]
         if not known:
             rejected.append(dict(fact, reason="the address is not among the pages the search "
