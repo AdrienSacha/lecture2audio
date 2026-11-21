@@ -69,6 +69,13 @@ export DEEPSEEK_API_KEY=...
 .venv/bin/python -m lecture2audio ./week-03/
 ```
 
+Your own textbooks and reference PDFs can go in a local library, which research searches before the web. A fact taken from a book is kept only if its quote is found word for word on the page, and it is cited as "Title, p. N" (`docs/adr/0007-reference-library.md`):
+
+```bash
+.venv/bin/python -m lecture2audio library add course-textbook.pdf
+.venv/bin/python -m lecture2audio library search "retransmission timeout"
+```
+
 Voice, Whisper and PDF reading are optional extras (`".[voice,whisper-mac,pdf]"`, see `pyproject.toml`). PDFs need LuaLaTeX with latexmk, or tectonic. `text` in place of `build` stops before the voice.
 
 ## Providers
@@ -83,7 +90,7 @@ Voice, Whisper and PDF reading are optional extras (`".[voice,whisper-mac,pdf]"`
 
 ## Status
 
-- The test suite has 260 tests and runs offline with no key and no model; it needs ffmpeg. One test is skipped. Run it with `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`.
+- The test suite has 284 tests and runs offline with no key and no model; it needs ffmpeg. One test is skipped. Run it with `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`.
 - Not tested: real calls to any provider (the tests use the dry model and a scripted harness), real voices, and Whisper transcription.
 - The prompts have not been tuned on real lectures. `tests/real_data.py` can fetch MIT OpenCourseWare material to try them on.
 - There are no evaluation numbers and no baseline yet. The planted-omission audits tell you whether a checker noticed one fault in a given run, not how often the pipeline loses an idea.

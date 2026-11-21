@@ -1,6 +1,8 @@
 """Gaps, research and terminology: gates, termbase logic, research clients, and the loop."""
 import json
 import os
+os.environ["L2A_LIBRARY"] = os.path.join(  # never read or write the real library
+    __import__("tempfile").gettempdir(), "l2a-tests-no-library", "library.db")
 import pathlib
 import re
 import sys

@@ -612,6 +612,28 @@ LOOP_TOOLS = [
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}},
                        "required": ["url"]}}},
 ]
+# Offered first when the user's reference library holds books (library.py): the model is told
+# to look there before the web, and a quote from a book is checked against the stored page.
+LIBRARY_TOOLS = [
+    {"type": "function", "function": {
+        "name": "search_library",
+        "description": "Search the user's own reference library (course textbooks and reference "
+                       "books) first, before the web. Returns, for each page found, its source "
+                       "(library:<book>:p<page>), the book's title, the page number and a "
+                       "snippet. Read a page with read_pages before quoting it.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "read_pages",
+        "description": "Read the full text of some pages of a book of the reference library, "
+                       "usually pages found with search_library. A fact taken from a book uses "
+                       "the page's source (library:<book>:p<page>) as its url, and its quote is "
+                       "copied from that page.",
+        "parameters": {"type": "object", "properties": {
+            "book": {"type": "string", "description": "the book id, as in library:<book>:p<page>"},
+            "pages": {"type": "array", "items": {"type": "integer"}, "maxItems": 5}},
+            "required": ["book", "pages"]}}},
+]
 PAGE_CHARS = 20000
 # Fields of an assistant turn that go back to the server: DeepSeek answers 400 when a
 # reasoning_content of an earlier turn is missing in a conversation with tools.
@@ -619,17 +641,19 @@ TURN_FIELDS = ("role", "content", "tool_calls", "reasoning_content", "reasoning_
 
 
 def research_loop(llm: "OpenAICompatLLM", system: str, user: str, search, depth: int = 30,
-                  fetch=None) -> tuple[str, list[dict]]:
+                  fetch=None, library=None) -> tuple[str, list[dict]]:
     """Web research for any model that can call functions: the model asks for searches and
-    pages, the program runs them. `depth` is the number of tool calls allowed. Returns
-    (final answer, documents read), like `LLM.research`."""
+    pages, the program runs them. `depth` is the number of tool calls allowed. With a
+    reference library (`library.Library` holding books), `search_library` and `read_pages`
+    come first. Returns (final answer, documents read), like `LLM.research`."""
     from .web import FetchError, fetch_page
     fetch = fetch or fetch_page
+    tools = (LIBRARY_TOOLS + LOOP_TOOLS) if library is not None and library.size() else LOOP_TOOLS
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     documents: list[dict] = []
     used = 0
     while used < depth:
-        message = llm.chat(messages, LOOP_TOOLS)
+        message = llm.chat(messages, tools)
         messages.append({k: v for k, v in message.items() if k in TURN_FIELDS})
         calls = message.get("tool_calls") or []
         if not calls:
@@ -652,6 +676,17 @@ def research_loop(llm: "OpenAICompatLLM", system: str, user: str, search, depth:
                     documents.append({"url": url, "title": "", "text": text})
                     result = text[:PAGE_CHARS] + ("\n[page cut here]" if len(text) > PAGE_CHARS
                                                  else "")
+                elif function.get("name") == "search_library" and tools is not LOOP_TOOLS:
+                    hits = library.search(str(args.get("query", ""))[:400], 8)
+                    result = (json.dumps(hits, ensure_ascii=False) if hits else
+                              "no page of the library matches; try other words or the web")
+                elif function.get("name") == "read_pages" and tools is not LOOP_TOOLS:
+                    pages = args.get("pages") or []
+                    pages = [int(p) for p in (pages if isinstance(pages, list) else [pages])
+                             if str(p).strip().isdigit()][:5]
+                    text = library.read_pages(str(args.get("book", "")), pages)
+                    result = (text[:PAGE_CHARS] if text else
+                              "error: no such book or pages in the library")
                 else:
                     result = f"error: unknown tool {function.get('name')}"
             except FetchError as exc:
@@ -660,7 +695,7 @@ def research_loop(llm: "OpenAICompatLLM", system: str, user: str, search, depth:
                              "content": result})
     messages.append({"role": "user", "content": "The research budget is used up. Give your final "
                      "answer now, in the required JSON, using only the pages you read."})
-    message = llm.chat(messages, LOOP_TOOLS, tool_choice="none")
+    message = llm.chat(messages, tools, tool_choice="none")
     return strip_reasoning(message.get("content") or ""), documents
 
 
