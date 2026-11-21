@@ -75,7 +75,7 @@ The chain trades call count for checkability. Every additional judge costs calls
 
 Listing ideas per part trades a whole-lecture view for completeness. An idea that spans two parts is listed in each; the ledger counts it as reached when any part teaches it. Ideas are not deduplicated across parts; a repeated idea is checked twice, which costs little.
 
-Obsidian trades a guided interface for a tool the owner already uses daily. The cost is that options are reached only through the command line, which the single-folder input and the skill file (`.claude/skills/lecture2audio/SKILL.md`) reduce.
+Obsidian trades a guided interface for a tool the owner already uses daily. The cost is that options are reached only through the command line, which the single-folder input and the skill (`.claude/skills/lecture2audio/SKILL.md` at the time; superseded by the tracked Agent Skill `skills/lecture2audio/` and the MCP server, ADR-0008) reduce.
 
 ## Consequences
 
