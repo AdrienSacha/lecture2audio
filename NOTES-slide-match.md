@@ -22,11 +22,12 @@
 - Tests: `tests/test_slide_match.py` (matched, mismatched, partial, French, blanks, report,
   two CLI end-to-end runs). Full suite passed before the new file (260 OK); new file 10 OK.
 
+- Full suite 270 tests OK (1 skipped), dry build OK; calibration in research-notes 2.20.
+
 ## Left
-- Rerun the full suite + dry build, then a final commit (not WIP).
 - Optional: pass each slide's likely place to the outline / gap search prompts
   (pipeline.py, owned by other agents; data is in slide_match.json).
-- Optional: research-notes.md entry with the calibration; app hook in `app.summary()`:
+- Optional: app hook in `app.summary()`:
   a log line starting with `report.MISMATCH_TAG` -> warn item (app.py/app.html not edited).
 
 ## Resume
