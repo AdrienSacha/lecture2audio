@@ -237,6 +237,7 @@ def slide_match_lines(match: dict | None) -> list[str]:
              "is computed by code before any model call."]
     loose = [s for s in match["slides"] if s["matched"] is False]
     if loose:
+        lines.append("")
         if match.get("low") and not match.get("kept_all"):
             lines.append("The slides below match nothing in the transcript. They were not given "
                          "to the models, so no gap was searched or researched for them; run "
