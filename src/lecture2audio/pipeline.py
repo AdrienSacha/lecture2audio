@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -610,6 +611,10 @@ class TextPipeline:
         self.idea_notes: dict = {"no_content": [], "unaccounted": {}}
         self.research: dict[str, dict] = {}
         self.supplements: list[dict] = []
+        # The idea list of each part, as each finishes: parts may finish in any order and
+        # while the gap search runs (flow.py), so the lecture's list is rebuilt in part order.
+        self._idea_results: dict[str, dict] = {}
+        self._ideas_lock = threading.RLock()
 
     def _dir(self, name: str) -> Path:
         directory = self.work_dir / name
@@ -703,7 +708,7 @@ class TextPipeline:
         failing its gate is not cached, so the next run tries it again."""
         cache = self.work_dir / "coverage.json"
         if cache.exists():
-            self.coverage = json.loads(cache.read_text(encoding="utf-8"))
+            self._set_coverage(json.loads(cache.read_text(encoding="utf-8")))
             if not self.coverage.get("error"):  # a failure saved by an older version: retry
                 return self.coverage
         self.log("[gaps] looking for what the lecture leaves out")
@@ -718,8 +723,8 @@ class TextPipeline:
                                   "gap search")
         except (PipelineError, LLMError) as exc:
             self.log(f"[gaps] {exc} (not cached: the next run tries again)")
-            self.coverage = {"slide_ideas": [], "gaps": [], "transcript_ideas": [],
-                             "error": str(exc)}
+            self._set_coverage({"slide_ideas": [], "gaps": [], "transcript_ideas": [],
+                                "error": str(exc)})
             return self.coverage
         result = {"slide_ideas": data["slide_ideas"], "gaps": data["gaps"],
                   "transcript_ideas": data.get("transcript_ideas", [])}
@@ -730,8 +735,16 @@ class TextPipeline:
             result["unlisted_slides"] = missing
             self.log(f"[gaps] slides {missing} still have no idea listed; named in report.md")
         cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.coverage = result
+        self._set_coverage(result)
         return result
+
+    def _set_coverage(self, coverage: dict) -> None:
+        """The result of the gap search, with the idea lists of the parts that are done (the
+        idea stage's lists replace the gap search's own, as they always did)."""
+        with self._ideas_lock:
+            if self._idea_results:
+                self._publish_ideas(coverage)
+            self.coverage = coverage
 
     def _repair_slides(self, outline: Outline, result: dict, missing: list[int],
                        ids: list[str], blank: set[int]) -> tuple[dict, list[int]]:
@@ -776,58 +789,71 @@ class TextPipeline:
         says fewer is fine, and the attempt with the fewest is kept; any that remain are named in
         report.md. A part whose list keeps failing the gate is logged, left empty and not cached,
         so the next run tries it again."""
-        directory = self._dir("ideas")
-        noise = noise_by_part(outline)
-
-        def one(part: Node) -> dict:
-            cache = directory / f"part_{int(part.id):03d}.json"
-            if cache.exists():
-                saved = json.loads(cache.read_text(encoding="utf-8"))
-                return saved if isinstance(saved, dict) else {"ideas": saved}
-            if not part.all_units():
-                return {"ideas": []}
-            user = self._ideas_request(outline, part, render_part_transcript(outline, part, []),
-                                       noise[part.id])
-            best, note = None, ""
-            for _ in range(self.max_retries + 1):
-                try:
-                    data = self._ask_json(self.rewrite_llm, self.prompts.ideas, user + note,
-                                          lambda d: enrich.validate_idea_list(d, part),
-                                          f"ideas of part {part.id}")
-                except PipelineError as exc:
-                    self.log(f"[ideas] part {part.id}: {exc}")
-                    break
-                left = enrich.unaccounted_units(data, part)
-                if best is None or len(left) < len(best[1]):
-                    best = (data, left)
-                if not left:
-                    break
-                note = ("\n\n## UNITS NOT ACCOUNTED FOR\nUnits " + ranges(left) + " are cited by no "
-                        "idea and are not in no_content. List the ideas they teach. If a unit "
-                        "teaches nothing, or is too garbled to interpret, list it under "
-                        "no_content: fewer ideas are fine, and an invented idea is worse than none.")
-            if best is None:
-                return {"ideas": []}
-            parsed = enrich.IdeaList.model_validate(best[0])
-            result = {"ideas": [{"id": f"T{part.id}.{k}", "kind": i.kind, "idea": i.idea,
-                                 "nodes": i.nodes, "units": sorted(set(i.units))}
-                                for k, i in enumerate(parsed.ideas, 1)],
-                      "no_content": [{"part": part.id, "units": sorted(set(n.units)),
-                                      "kind": n.kind, "reason": n.reason.strip()}
-                                     for n in parsed.no_content],
-                      "unaccounted": best[1]}
-            cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            return result
-
         self.log(f"[ideas] listing the atomic ideas of {len(outline.parts)} part(s)")
-        results = self._map(one, outline.parts)
-        ideas = [i for r in results for i in r.get("ideas", [])]
-        self.coverage["transcript_ideas"] = ideas
-        self.idea_notes = {"no_content": [n for r in results for n in r.get("no_content", [])],
-                           "unaccounted": {p.id: r.get("unaccounted", [])
-                                           for p, r in zip(outline.parts, results)
+        self._map(lambda part: self.keep_ideas(part.id, self.ideas_part(outline, part)),
+                  outline.parts)
+        with self._ideas_lock:
+            return self._publish_ideas(self.coverage)
+
+    def keep_ideas(self, part_id: str, result: dict) -> list[dict]:
+        """Add one part's idea list to the lecture's (coverage["transcript_ideas"], in part
+        order) and return the lecture's list so far. Safe from several threads."""
+        with self._ideas_lock:
+            self._idea_results[str(part_id)] = result
+            return self._publish_ideas(self.coverage)
+
+    def _publish_ideas(self, coverage: dict) -> list[dict]:
+        """Rebuild the lecture's list from the parts done so far, in part order: a new list
+        each time, so a reader in another thread never sees one half updated."""
+        results = [(k, self._idea_results[k]) for k in sorted(self._idea_results, key=int)]
+        ideas = [i for _, r in results for i in r.get("ideas", [])]
+        coverage["transcript_ideas"] = ideas
+        self.idea_notes = {"no_content": [n for _, r in results for n in r.get("no_content", [])],
+                           "unaccounted": {k: r.get("unaccounted", []) for k, r in results
                                            if r.get("unaccounted")}}
         return ideas
+
+    def ideas_part(self, outline: Outline, part: Node) -> dict:
+        """The idea list of one part, cached in ideas/ (see run_ideas). It needs only the
+        outline, so it runs while the gap search does (flow.py)."""
+        cache = self._dir("ideas") / f"part_{int(part.id):03d}.json"
+        if cache.exists():
+            saved = json.loads(cache.read_text(encoding="utf-8"))
+            return saved if isinstance(saved, dict) else {"ideas": saved}
+        if not part.all_units():
+            return {"ideas": []}
+        user = self._ideas_request(outline, part, render_part_transcript(outline, part, []),
+                                   noise_by_part(outline)[part.id])
+        best, note = None, ""
+        for _ in range(self.max_retries + 1):
+            try:
+                data = self._ask_json(self.rewrite_llm, self.prompts.ideas, user + note,
+                                      lambda d: enrich.validate_idea_list(d, part),
+                                      f"ideas of part {part.id}")
+            except PipelineError as exc:
+                self.log(f"[ideas] part {part.id}: {exc}")
+                break
+            left = enrich.unaccounted_units(data, part)
+            if best is None or len(left) < len(best[1]):
+                best = (data, left)
+            if not left:
+                break
+            note = ("\n\n## UNITS NOT ACCOUNTED FOR\nUnits " + ranges(left) + " are cited by no "
+                    "idea and are not in no_content. List the ideas they teach. If a unit "
+                    "teaches nothing, or is too garbled to interpret, list it under "
+                    "no_content: fewer ideas are fine, and an invented idea is worse than none.")
+        if best is None:
+            return {"ideas": []}
+        parsed = enrich.IdeaList.model_validate(best[0])
+        result = {"ideas": [{"id": f"T{part.id}.{k}", "kind": i.kind, "idea": i.idea,
+                             "nodes": i.nodes, "units": sorted(set(i.units))}
+                            for k, i in enumerate(parsed.ideas, 1)],
+                  "no_content": [{"part": part.id, "units": sorted(set(n.units)),
+                                  "kind": n.kind, "reason": n.reason.strip()}
+                                 for n in parsed.no_content],
+                  "unaccounted": best[1]}
+        cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
 
     def _ideas_request(self, outline: Outline, part: Node, transcript: str, noise: list[int]) -> str:
         source = part_source(outline, part, noise)
@@ -1224,19 +1250,19 @@ class TextPipeline:
     def run_parts(self, outline: Outline, on_done: Callable[[dict], None] | None = None) -> list[dict]:
         """Rewrite and verify every part. `on_done(record)` is called as each part finishes
         (from a worker thread), so that the idea ledger stays current during the run."""
-        directory = self._dir("rewrite")
+        return self._map(lambda part: self.rewrite_part(outline, part), outline.parts, on_done)
 
-        def one(part: Node) -> dict:
-            cache = directory / f"part_{int(part.id):03d}.json"
-            if cache.exists():
-                return json.loads(cache.read_text(encoding="utf-8"))
-            self.log(f"[rewrite] part {part.id}/{len(outline.parts)}: {part.title} "
-                     f"({part_words(outline, part)} words)")
-            record = self._process(outline, part)
-            cache.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-            return record
-
-        return self._map(one, outline.parts, on_done)
+    def rewrite_part(self, outline: Outline, part: Node) -> dict:
+        """The verified script of one part, cached in rewrite/. It needs the part's ideas, the
+        termbase and the research (flow.py)."""
+        cache = self._dir("rewrite") / f"part_{int(part.id):03d}.json"
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        self.log(f"[rewrite] part {part.id}/{len(outline.parts)}: {part.title} "
+                 f"({part_words(outline, part)} words)")
+        record = self._process(outline, part)
+        cache.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        return record
 
     # -- checks on the whole lecture ---------------------------------------------------
     def audit_verifier(self, outline: Outline, records: list[dict]) -> dict:
@@ -1328,15 +1354,14 @@ class TextPipeline:
                 "llm_residue": residue, "fallback": fallback}
 
     def run_spoken(self, outline: Outline, records: list[dict]) -> list[dict]:
-        directory = self._dir("spoken")
+        return self._map(lambda record: self.spoken_part(outline, record, len(records)), records)
 
-        def one(record: dict) -> dict:
-            cache = directory / f"part_{int(record['part']):03d}.json"
-            if cache.exists():
-                return json.loads(cache.read_text(encoding="utf-8"))
-            self.log(f"[spoken] part {record['part']}/{len(records)}")
-            result = self._spoken(outline.node(record["part"]), record)
-            cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            return result
-
-        return self._map(one, records)
+    def spoken_part(self, outline: Outline, record: dict, total: int) -> dict:
+        """The spoken form of one part's script, cached in spoken/."""
+        cache = self._dir("spoken") / f"part_{int(record['part']):03d}.json"
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        self.log(f"[spoken] part {record['part']}/{total}")
+        result = self._spoken(outline.node(record["part"]), record)
+        cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result

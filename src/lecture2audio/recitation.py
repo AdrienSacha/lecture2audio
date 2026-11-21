@@ -285,24 +285,25 @@ class RecitationPipeline:
     def run(self, outline: Outline, records: list[dict], course: dict | None = None) -> list[dict]:
         """The notes of every part, cached in recitation/. A part whose notes keep failing the
         gate is left out of the document, named in the report and not cached."""
-        directory = self.p._dir("recitation")
         by_part = {r["part"]: r for r in records}
         cards = {p["part"]: p for p in (course or {}).get("parts", [])}
+        return self.p._map(lambda part: self.part_notes(outline, part, by_part[part.id],
+                                                        cards.get(part.id)), outline.parts)
 
-        def one(part: Node) -> dict:
-            cache = directory / f"part_{int(part.id):03d}.json"
-            if cache.exists():
-                return json.loads(cache.read_text(encoding="utf-8"))
-            self.p.log(f"[recitation] part {part.id}/{len(outline.parts)}: {part.title}")
-            try:
-                result = self._process(outline, part, by_part[part.id], cards.get(part.id))
-            except PipelineError as exc:
-                self.p.log(f"[recitation] part {part.id}: {exc}")
-                return {"part": part.id, "title": part.title, "error": str(exc)}
-            cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            return result
-
-        return self.p._map(one, outline.parts)
+    def part_notes(self, outline: Outline, part: Node, record: dict,
+                   cards: dict | None) -> dict:
+        """The notes of one part (from its script and its final cards), cached in recitation/."""
+        cache = self.p._dir("recitation") / f"part_{int(part.id):03d}.json"
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        self.p.log(f"[recitation] part {part.id}/{len(outline.parts)}: {part.title}")
+        try:
+            result = self._process(outline, part, record, cards)
+        except PipelineError as exc:
+            self.p.log(f"[recitation] part {part.id}: {exc}")
+            return {"part": part.id, "title": part.title, "error": str(exc)}
+        cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
 
 
 def dry_recitation(user: str) -> str:

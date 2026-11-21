@@ -622,121 +622,148 @@ class CoursePipeline:
 
     def cold_read(self, parts: list[dict], tag: str = "cold") -> list[dict]:
         """A reader that knows only the earlier parts looks for loose ends, part by part."""
-        directory = self.p._dir("course")
+        return self.p._map(lambda part: self.cold_part(part, tag), parts)
 
-        def one(part: dict) -> dict:
-            cache = directory / f"{tag}_{int(part['part']):03d}.json"
-            if cache.exists():
-                return json.loads(cache.read_text(encoding="utf-8"))
-            pid = int(part["part"])
-            known = [{"term": t["term"], "definition": t["definition"]} for t in self.p.terms
-                     if t["part"] < pid]
-            ids = [c["id"] for c in part["cards"]]
-            user = (f"## LANGUAGE\n{self.p.language_name}\n\n"
-                    + _section("KNOWN BEFORE (JSON)", json.dumps(known, ensure_ascii=False,
-                                                                indent=1) if known else "nothing")
-                    + "## THIS PART\n" + reader_text(part["cards"]))
-            try:
-                data = self.p._ask_json(self.p.verify_llm, self.p.prompts.cold_read, user,
-                                        lambda d: validate_cold(d, ids),
-                                        f"cold read of part {part['part']}")
-                result = {"part": part["part"], "loose": data["loose"]}
-            except Exception as exc:  # a failed audit must not stop the build
-                self.p.log(f"[course] cold read of part {part['part']}: {exc}")
-                result = {"part": part["part"], "loose": [], "error": str(exc)}
-            cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            return result
+    def cold_part(self, part: dict, tag: str = "cold") -> dict:
+        """The cold read of one part's cards, cached in course/<tag>_NNN.json."""
+        cache = self.p._dir("course") / f"{tag}_{int(part['part']):03d}.json"
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        pid = int(part["part"])
+        known = [{"term": t["term"], "definition": t["definition"]} for t in self.p.terms
+                 if t["part"] < pid]
+        ids = [c["id"] for c in part["cards"]]
+        user = (f"## LANGUAGE\n{self.p.language_name}\n\n"
+                + _section("KNOWN BEFORE (JSON)", json.dumps(known, ensure_ascii=False,
+                                                            indent=1) if known else "nothing")
+                + "## THIS PART\n" + reader_text(part["cards"]))
+        try:
+            data = self.p._ask_json(self.p.verify_llm, self.p.prompts.cold_read, user,
+                                    lambda d: validate_cold(d, ids),
+                                    f"cold read of part {part['part']}")
+            result = {"part": part["part"], "loose": data["loose"]}
+        except Exception as exc:  # a failed audit must not stop the build
+            self.p.log(f"[course] cold read of part {part['part']}: {exc}")
+            result = {"part": part["part"], "loose": [], "error": str(exc)}
+        cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
 
-        return self.p._map(one, parts)
+    def cards_part(self, outline: Outline, part: Node, record: dict) -> dict:
+        """The judged cards of one part, before the cold read, cached in course/."""
+        cache = self.p._dir("course") / f"part_{int(part.id):03d}.json"
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        self.p.log(f"[course] part {part.id}/{len(outline.parts)}: {part.title}")
+        result = self._process(outline, part, record)
+        cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
+
+    def part_chain(self, outline: Outline, part: Node, record: dict,
+                   on_done=None) -> tuple[dict, dict]:
+        """Everything the course does for one part, which needs no other part: the cards and
+        their judge, the cold read, the one revision when the reader found loose ends, and
+        the second cold read of a revision that was kept. Returns (cards, cold read).
+        `on_done` is called with the cards, and again with a kept revision."""
+        cards = self.cards_part(outline, part, record)
+        if on_done:
+            on_done(cards)
+        cold = self.cold_part(cards)
+        if not cold.get("loose"):
+            return cards, cold
+        revised = self.revise_part(outline, cards, cold["loose"], record)
+        if not revised.get("revised"):
+            return revised, cold
+        if on_done:  # the ledger follows a revision too
+            on_done(revised)
+        again = self.cold_part(revised, tag="cold_revised")
+        # read again what changed, so the report shows the loose ends that remain
+        return revised, dict(again, before=len(cold["loose"]))
 
     def run(self, outline: Outline, records: list[dict], on_done=None, audit: bool = True) -> dict:
         """Cards for every part. `on_done(part result)` is called as each part finishes (from a
         worker thread), so that the idea ledger stays current; `audit` runs the planted test of
         the judge."""
-        directory = self.p._dir("course")
+        # stage by stage over every part (the streaming run uses part_chain, part by part;
+        # both give the same results, only the order of the calls differs)
         by_part = {r["part"]: r for r in records}
-
-        def one(part: Node) -> dict:
-            cache = directory / f"part_{int(part.id):03d}.json"
-            if cache.exists():
-                return json.loads(cache.read_text(encoding="utf-8"))
-            self.p.log(f"[course] part {part.id}/{len(outline.parts)}: {part.title}")
-            result = self._process(outline, part, by_part[part.id])
-            cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            return result
-
-        parts = self.p._map(one, outline.parts, on_done)
+        parts = self.p._map(lambda part: self.cards_part(outline, part, by_part[part.id]),
+                            outline.parts, on_done)
         cold = self.cold_read(parts)
         parts, cold = self.revise(outline, parts, cold, by_part)
         for part in parts:  # the ledger follows a revision too
             if on_done and part.get("revised"):
                 on_done(part)
+        return self.finish(outline, records, parts, cold, audit)
+
+    def finish(self, outline: Outline, records: list[dict], parts: list[dict], cold: list[dict],
+               audit: bool = True) -> dict:
+        """The course of the lecture from the results of every part, in part order: the
+        notation (notation.json), the review, and the planted test of the judge."""
         notation, clashes = collect_notation(parts)
-        (directory / "notation.json").write_text(json.dumps(notation, ensure_ascii=False,
-                                                            indent=2), encoding="utf-8")
+        (self.p._dir("course") / "notation.json").write_text(
+            json.dumps(notation, ensure_ascii=False, indent=2), encoding="utf-8")
+        by_part = {r["part"]: r for r in records}
         return {"parts": parts, "notation": notation, "clashes": clashes,
                 "review": build_review(parts), "cold": cold,
                 "audit": self.audit_judge(outline, parts, by_part) if audit else None}
 
     def revise(self, outline: Outline, parts: list[dict], cold: list[dict],
                by_part: dict) -> tuple[list[dict], list[dict]]:
-        """One revision round from the cold read: the loose ends a simulated first reader found
-        (unknown terms, missing context, confusing sentences) go back to the writer once, and
-        the revision is kept only if it has no more blocking problems. Feedback from simulated
-        readers, applied by one editor, improves both readability and factuality, best at one
-        or two rounds (Jung et al., 2026)."""
-        directory = self.p._dir("course")
+        """The revision round (revise_part) for every part whose cold read found loose ends,
+        and the second cold read of each kept revision."""
         loose = {c["part"]: c["loose"] for c in cold if c.get("loose")}
         if not loose:
             return parts, cold
-
-        def one(part: dict) -> dict:
-            if part["part"] not in loose:
-                return part
-            cache = directory / f"revised_{int(part['part']):03d}.json"
-            if cache.exists():
-                return json.loads(cache.read_text(encoding="utf-8"))
-            # bounded like a repair: only the cards of the sections with loose ends are new
-            node_of = {c["id"]: c["node"] for c in part["cards"]}
-            record = by_part[part["part"]]
-            at = {node_of.get(str(i["card"])) for i in loose[part["part"]]}
-            scope = [s["node"] for s in record["sections"] if s["node"] in at] or None
-            if scope and {c["node"] for c in part["cards"]} <= set(scope):
-                scope = None
-            self.p.log(f"[course] part {part['part']}: revising {len(loose[part['part']])} "
-                       "loose end(s) found by the cold read"
-                       + (f", in the cards of {scope_words(scope)} only" if scope else ""))
-            only = (f" Rewrite only the cards of {scope_words(scope)}: the program keeps every "
-                    "other card and the exercises word for word, so give them back unchanged."
-                    if scope else "")
-            feedback = ("A first-year reader who knows only the earlier parts read these cards "
-                        "and was lost at the places below. Fix each one in the card named (define "
-                        "the term, add the missing step or context, rewrite the confusing "
-                        "sentence), using only the SCRIPT, and keep everything else as it is."
-                        + only + "\n\n"
-                        + json.dumps({"cards": part["cards"], "exercises": part.get("exercises",
-                                                                                    [])},
-                                     ensure_ascii=False)
-                        + "\n\nLoose ends:\n" + "\n".join(
-                            f"- card {i['card']} ({i['kind']}): {i['detail']}"
-                            for i in loose[part["part"]]))
-            try:
-                result = self._process(outline, outline.node(part["part"]), record,
-                                       start=part, feedback=feedback, tries=1, scope=scope)
-            except Exception as exc:  # a failed revision keeps the reviewed cards
-                self.p.log(f"[course] revision of part {part['part']}: {exc}")
-                return part
-            result["revision_checked"] = True
-            cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            return result
-
-        parts = self.p._map(one, parts)
+        parts = self.p._map(lambda part: self.revise_part(outline, part, loose[part["part"]],
+                                                          by_part[part["part"]])
+                            if part["part"] in loose else part, parts)
         changed = [p for p in parts if p.get("revised")]
         if changed:  # read again what changed, so the report shows the loose ends that remain
             again = {c["part"]: c for c in self.cold_read(changed, tag="cold_revised")}
             cold = [dict(again[c["part"]], before=len(c["loose"])) if c["part"] in again else c
                     for c in cold]
         return parts, cold
+
+    def revise_part(self, outline: Outline, part: dict, loose: list[dict], record: dict) -> dict:
+        """One revision round from the cold read: the loose ends a simulated first reader found
+        (unknown terms, missing context, confusing sentences) go back to the writer once, and
+        the revision is kept only if it has no more blocking problems. Feedback from simulated
+        readers, applied by one editor, improves both readability and factuality, best at one
+        or two rounds (Jung et al., 2026). Cached in course/revised_NNN.json."""
+        cache = self.p._dir("course") / f"revised_{int(part['part']):03d}.json"
+        if cache.exists():
+            return json.loads(cache.read_text(encoding="utf-8"))
+        # bounded like a repair: only the cards of the sections with loose ends are new
+        node_of = {c["id"]: c["node"] for c in part["cards"]}
+        at = {node_of.get(str(i["card"])) for i in loose}
+        scope = [s["node"] for s in record["sections"] if s["node"] in at] or None
+        if scope and {c["node"] for c in part["cards"]} <= set(scope):
+            scope = None
+        self.p.log(f"[course] part {part['part']}: revising {len(loose)} "
+                   "loose end(s) found by the cold read"
+                   + (f", in the cards of {scope_words(scope)} only" if scope else ""))
+        only = (f" Rewrite only the cards of {scope_words(scope)}: the program keeps every "
+                "other card and the exercises word for word, so give them back unchanged."
+                if scope else "")
+        feedback = ("A first-year reader who knows only the earlier parts read these cards "
+                    "and was lost at the places below. Fix each one in the card named (define "
+                    "the term, add the missing step or context, rewrite the confusing "
+                    "sentence), using only the SCRIPT, and keep everything else as it is."
+                    + only + "\n\n"
+                    + json.dumps({"cards": part["cards"], "exercises": part.get("exercises",
+                                                                                [])},
+                                 ensure_ascii=False)
+                    + "\n\nLoose ends:\n" + "\n".join(
+                        f"- card {i['card']} ({i['kind']}): {i['detail']}" for i in loose))
+        try:
+            result = self._process(outline, outline.node(part["part"]), record,
+                                   start=part, feedback=feedback, tries=1, scope=scope)
+        except Exception as exc:  # a failed revision keeps the reviewed cards
+            self.p.log(f"[course] revision of part {part['part']}: {exc}")
+            return part
+        result["revision_checked"] = True
+        cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
 
     def audit_judge(self, outline: Outline, parts: list[dict], by_part: dict) -> dict:
         """Empty, in an accepted part, the one card that teaches an idea (it keeps its title

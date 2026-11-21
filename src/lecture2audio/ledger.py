@@ -147,6 +147,7 @@ class Ledger:
 
     def __init__(self, path: Path, outline: Outline, coverage: dict):
         self.path = Path(path)
+        self._outline = outline
         self._seed = seed(outline, coverage)
         self._records: dict[str, dict] = {}
         self._cards: dict[str, dict] = {}
@@ -164,6 +165,14 @@ class Ledger:
         apply_cards(rows, {"parts": self._ordered(self._cards)})
         self.rows[:] = rows  # same list object: callers that hold it see the update
         write(self.path, self.rows)
+
+    def ideas_done(self, coverage: dict) -> None:
+        """More parts have their idea list (coverage["transcript_ideas"], read now, under the
+        lock): the rows are seeded again from it. The idea lists of the parts may arrive
+        after the ledger is made, since they run beside the gap search (flow.py)."""
+        with self._lock:
+            self._seed = seed(self._outline, coverage)
+            self._rebuild()
 
     def script_done(self, record: dict) -> None:
         """A part's script was verified (called from a worker thread)."""

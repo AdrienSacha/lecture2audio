@@ -13,13 +13,14 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import keys, ledger, stages, trace
-from .assemble import encode_final, encode_part_files, join_parts, repair_chunks, synth_blocks
+from .assemble import encode_final, encode_part_files, join_parts, repair_chunks, synth_part
 from .factcheck import run_factcheck
+from .flow import Flow
 from .course import CoursePipeline, course_report
 from .course_render import write_vault
 from .series import load_lecture, merge_termbases, series_report
@@ -488,54 +489,167 @@ def run(args, series: dict | None = None) -> int:
     outline = pipeline.run_outline(units)
     log(f"[outline] {len(outline.parts)} part(s), "
         f"{sum(len(p.children) for p in outline.parts)} point(s)")
-    track("gaps")
-    coverage = pipeline.run_coverage(outline)
-    track("ideas")
-    pipeline.run_ideas(outline)  # fills coverage["transcript_ideas"], part by part
-    # the idea ledger: every atomic idea of the transcript, checked off by the later stages as
-    # each part finishes; ideas.csv is rewritten after every part
-    book = ledger.Ledger(work / "ideas.csv", outline, coverage)
-    ideas = book.rows
-    log(f"[ideas] {len(ideas)} atomic idea(s) in {book.path}")
-    # The planted-omission audits only report: they run beside the main path, in their own
-    # threads, and are collected before the report (ADR-0006). None is skipped.
-    background = ThreadPoolExecutor(max_workers=3, thread_name_prefix="audit")
+    track.finish()
+    # From here on, every (stage, part) pair is a node of a graph derived from stages.py and
+    # runs as soon as its own inputs are ready (flow.py, ADR-0006): the ideas of each part
+    # while the gap search runs, and each part through its script, spoken form, cards, notes
+    # and voice without waiting for the other parts. The whole-lecture stages (gap search,
+    # termbase, research) stay barriers, and so does everything that reads every part.
+    parts = outline.parts
+    stop = series.get("stop_after") == "termbase"
+    voice_on = args.command == "build" and not stop
+    course_on = args.course and not stop
+    notes_on = args.recitation and not series.get("skip_vault") and not stop
+    flow = Flow(args.workers, track)
+    # The idea ledger: every atomic idea of the transcript, checked off by the later stages as
+    # each part finishes; ideas.csv is rewritten after every part. It is made when the gap
+    # search is done and seeded again as the idea list of each later part arrives.
+    books: list[ledger.Ledger] = []
+    books_lock = threading.Lock()
 
     def beside(function, *arguments):
-        return None if args.no_audit else background.submit(function, *arguments)
+        """A planted-fault audit: it only reports, so it runs beside the main path, as soon as
+        its input exists, and a crash becomes a note in report.md (ADR-0006). None is
+        skipped."""
+        def node():
+            try:
+                return function(*arguments)
+            except Exception as exc:  # an audit never stops a run
+                return {"skipped": f"the test failed ({exc}); it runs again next time"}
+        return node
 
-    ideas_audit = beside(pipeline.audit_ideas, outline)
-    track("gaps")
-    terms = pipeline.run_termbase(outline)
-    if series.get("stop_after") == "termbase":
+    def ideas_of(part):
+        def node():
+            pipeline.keep_ideas(part.id, pipeline.ideas_part(outline, part))
+            with books_lock:
+                if books:
+                    books[0].ideas_done(pipeline.coverage)
+        return node
+
+    def gap_search():
+        coverage = pipeline.run_coverage(outline)
+        with books_lock:
+            books.append(ledger.Ledger(work / "ideas.csv", outline, pipeline.coverage))
+        return coverage
+
+    def research():
+        coverage = pipeline.coverage
+        if research_note and coverage["gaps"]:
+            log(f"[research] skipped: {research_note}")
+        supplements = pipeline.run_research(outline)
+        log(f"[gaps] {len(coverage['gaps'])} gap(s), {len(pipeline.terms)} term(s), "
+            f"{len(supplements)} checked fact(s) from outside the lecture")
+        return supplements
+
+    log(f"[ideas] listing the atomic ideas of {len(parts)} part(s)")
+    for part in parts:
+        flow.add_part("ideas", part.id, ideas_of(part))
+    flow.add("coverage", gap_search, stage="gaps")
+    flow.add("seeded", lambda: log(f"[ideas] {len(books[0].rows)} atomic idea(s) in "
+                                   f"{books[0].path}"), [*flow.of_stage("ideas"), "coverage"])
+    if not args.no_audit:
+        flow.add("ideas_audit", beside(pipeline.audit_ideas, outline), flow.of_stage("ideas"))
+    flow.add("termbase", lambda: pipeline.run_termbase(outline), ["coverage"], stage="gaps")
+    if stop:
+        flow.run()
         track.finish()
         return 0
-    track("research")
-    if research_note and coverage["gaps"]:
-        log(f"[research] skipped: {research_note}")
-    supplements = pipeline.run_research(outline)
-    log(f"[gaps] {len(coverage['gaps'])} gap(s), {len(terms)} term(s), "
-        f"{len(supplements)} checked fact(s) from outside the lecture")
-    track("gaps")
+    if not args.no_audit:
+        flow.add("coverage_audit", beside(pipeline.audit_coverage, outline), ["coverage"])
+    flow.add_stage("research", research)
+    records = lambda: [flow[("rewrite", p.id)] for p in parts]
+
+    def rewrite(part):
+        def node():
+            record = pipeline.rewrite_part(outline, part)
+            books[0].script_done(record)
+            return record
+        return node
+
+    for part in parts:
+        flow.add_part("rewrite", part.id, rewrite(part))
+    if args.factcheck != "off":
+        def fact_check():
+            found = run_factcheck(work, outline, records(),
+                                  pipeline.coverage.get("transcript_ideas", []), log)
+            if found is None and args.factcheck == "minicheck":
+                raise SystemExit("--factcheck minicheck needs MiniCheck: uv pip install -e "
+                                 "'.[factcheck]'")
+            return found
+        flow.add_stage("factcheck", fact_check)
+    if not args.no_audit:
+        flow.add("verifier_audit", lambda: beside(pipeline.audit_verifier, outline,
+                                                  records())(), flow.of_stage("rewrite"))
+    for part in parts:
+        flow.add_part("spoken", part.id, lambda part=part: pipeline.spoken_part(
+            outline, flow[("rewrite", part.id)], len(parts)))
+    voice: dict = {}
+
+    def speak(part, index):
+        """Voice one part as soon as its spoken form exists, while the model calls of the
+        other parts go on. In the main thread: the local voice and speech models are loaded
+        and used there only."""
+        def node():
+            if "backend" not in voice:
+                voice["backend"] = make_tts(args.tts, language, args.voice, args.tts_command,
+                                            args.tts_model)
+                voice["check"] = args.roundtrip if args.roundtrip is not None else (
+                    voice["backend"].name not in ("fake", "command") and stt_available())
+                if voice["check"]:
+                    log("[roundtrip] transcribing every chunk again; a chunk heard wrong is "
+                        "voiced anew")
+            backend = voice["backend"]
+            entries = synth_part(backend, flow[("spoken", part.id)]["blocks"], work / "audio",
+                                 args.chunk_chars, not args.no_quiz, args.quiz_pause, log,
+                                 index, len(parts))
+            checked = repair_chunks(
+                backend, [entries],
+                lambda p: transcribe_audio(p, args.stt, language, None, args.stt_model),
+                args.roundtrip_threshold, args.voice_retries, work / "audio" / "roundtrip.json",
+                log, first=index) if voice["check"] else []
+            return entries, checked
+        return node
+
+    if voice_on:
+        for index, part in enumerate(parts):
+            flow.add_part("audio", part.id, speak(part, index), main=True)
+    teacher = CoursePipeline(pipeline, series.get("notation"))
+    if course_on:
+        for part in parts:
+            flow.add_part("course", part.id, lambda part=part: teacher.part_chain(
+                outline, part, flow[("rewrite", part.id)], books[0].cards_done))
+        # the course of the lecture (notation, review) needs every part; still "course"
+        flow.add("course_done", lambda: teacher.finish(
+            outline, records(), [flow[("course", p.id)][0] for p in parts],
+            [flow[("course", p.id)][1] for p in parts], audit=False),
+            flow.of_stage("course"), stage="course")
+        if not args.no_audit:
+            flow.add("judge_audit", lambda: beside(
+                teacher.audit_judge, outline, flow["course_done"]["parts"],
+                {r["part"]: r for r in records()})(), ["course_done"])
+    if notes_on:
+        writer = recitation.RecitationPipeline(pipeline)
+        for part in parts:
+            flow.add_part("recitation", part.id, lambda part=part: writer.part_notes(
+                outline, part, flow[("rewrite", part.id)],
+                flow[("course", part.id)][0] if course_on else None))
+    if args.project and not series:
+        flow.add_stage("project", lambda: project_stage.run_project(pipeline, outline))
+    flow.run()
+
+    coverage, terms, supplements = flow["coverage"], flow["termbase"], flow["research"]
+    book = books[0]
+    ideas = book.rows
+    records = records()
     gaps = {"coverage": coverage, "terms": terms, "terms_error": pipeline.terms_error,
             "research": pipeline.research,
             "supplements": supplements, "note": research_note,
-            "audit": beside(pipeline.audit_coverage, outline)}
-    track("rewrite")
-    records = pipeline.run_parts(outline, on_done=book.script_done)
-    factcheck = None
-    if args.factcheck != "off":
-        track("factcheck")
-        factcheck = run_factcheck(work, outline, records, coverage.get("transcript_ideas", []),
-                                  log)
-        if factcheck is None and args.factcheck == "minicheck":
-            raise SystemExit("--factcheck minicheck needs MiniCheck: uv pip install -e "
-                             "'.[factcheck]'")
-    track("rewrite")
-    audit = beside(pipeline.audit_verifier, outline, records)
+            "audit": flow.results.get("coverage_audit")}
+    factcheck = flow.results.get("factcheck")
+    audit = flow.results.get("verifier_audit")
+    ideas_audit = flow.results.get("ideas_audit")
     notes = pipeline.global_notes(outline, records)
-    track("spoken")
-    spoken = pipeline.run_spoken(outline, records)
+    spoken = [flow[("spoken", p.id)] for p in parts]
     course = course_stats = None
     vault = Path(args.vault_dir) / name if args.vault_dir else work / "vault"
 
@@ -550,10 +664,9 @@ def run(args, series: dict | None = None) -> int:
         log(f"[course] {stats['cards']} card(s), {stats['notes']} note(s): {vault}")
         return stats
 
-    if args.course:
-        track("course")
-        course = CoursePipeline(pipeline, series.get("notation")).run(
-            outline, records, on_done=book.cards_done, audit=not args.no_audit)
+    if course_on:
+        course = flow["course_done"]
+        course["audit"] = flow.results.get("judge_audit")
         if series.get("skip_vault"):
             course_stats = {"cards": sum(len(p["cards"]) for p in course["parts"]),
                             "notes": 0, "diagrams": sum(bool(c["diagram"]) for p in course["parts"]
@@ -561,14 +674,9 @@ def run(args, series: dict | None = None) -> int:
             log(f"[course] {course_stats['cards']} card(s)")
         else:
             course_stats = write_course()
-    sections = project = None
+    sections = [flow[("recitation", p.id)] for p in parts] if notes_on else None
+    project = flow.results.get("project")
     builds: dict[str, dict | None] = {}
-    if args.recitation and not series.get("skip_vault"):
-        track("recitation")
-        sections = recitation.RecitationPipeline(pipeline).run(outline, records, course)
-    if args.project and not series:
-        track("project")
-        project = project_stage.run_project(pipeline, outline)
 
     def document(stem: str, text: str) -> None:
         """Write a LaTeX document and build its PDF (again only when the text changed)."""
@@ -601,8 +709,6 @@ def run(args, series: dict | None = None) -> int:
     if args.export_anki:
         count = ledger.write_anki(work / "anki.csv", name, ideas, course, records, language)
         log(f"[anki] {count} note(s) in {work / 'anki.csv'} (Anki: File > Import)")
-    ideas_audit, audit, gaps["audit"] = (_collect(f) for f in (ideas_audit, audit, gaps["audit"]))
-    background.shutdown()
     usage = {rewrite_llm.name: rewrite_llm.usage}
     if verify_llm is not rewrite_llm:
         usage[verify_llm.name + " (verifier)"] = verify_llm.usage
@@ -665,19 +771,12 @@ def run(args, series: dict | None = None) -> int:
             _open_obsidian(args, course_stats.get("entry"), log)
         return 0
 
+    # every part was voiced (and heard back) as soon as its spoken form existed: join them
     track("audio")
-    backend = make_tts(args.tts, language, args.voice, args.tts_command, args.tts_model)
-    voiced = synth_blocks(backend, [s["blocks"] for s in spoken], work / "audio", args.chunk_chars,
-                          not args.no_quiz, args.quiz_pause, log)
+    voiced = [flow[("audio", p.id)][0] for p in parts]
     roundtrip = None
-    check = args.roundtrip if args.roundtrip is not None else (
-        backend.name not in ("fake", "command") and stt_available())
-    if check:
-        log("[roundtrip] transcribing every chunk again; a chunk heard wrong is voiced anew")
-        results = repair_chunks(
-            backend, voiced,
-            lambda p: transcribe_audio(p, args.stt, language, None, args.stt_model),
-            args.roundtrip_threshold, args.voice_retries, work / "audio" / "roundtrip.json", log)
+    if voice.get("check"):
+        results = [r for p in parts for r in flow[("audio", p.id)][1]]
         roundtrip = [r for r in results if r["score"] < args.roundtrip_threshold]
         repaired = sum(1 for r in results if r["tries"] and r["score"] > r["first"])
         log(f"[roundtrip] {len(results)} chunk(s) checked, {repaired} improved by a new take, "
@@ -759,16 +858,6 @@ def run_series(args) -> int:
     print(f"Done. Vault: {vault}. Read {root / 'series.md'}.", flush=True)
     _open_obsidian(args, stats.get("entry"), lambda m: print(m, flush=True))
     return 0
-
-
-def _collect(future) -> dict | None:
-    """The result of an audit run beside the main path; a crash is reported, not raised."""
-    if future is None:
-        return None
-    try:
-        return future.result()
-    except Exception as exc:  # an audit never stops a run
-        return {"skipped": f"the test failed ({exc}); it runs again next time"}
 
 
 def key_main(argv: list[str]) -> int:

@@ -1,6 +1,6 @@
 # ADR-0006: A harness that fans out to the provider's limits, streams parts through the stage graph, and exposes itself as a skill and an MCP server
 
-**Status:** Proposed
+**Status:** Proposed; item 5 of the action items (the per-part scheduler) is built
 **Date:** 20 November 2026
 **Deciders:** The project owner. Evidence: `docs/research/2026-11-speed-and-agents.md`.
 
@@ -125,7 +125,7 @@ The decision on prompts (cache layout, effort by stage) is the riskiest, because
 2. [ ] Bounded repair of the gap search for missing slides; research runs on whatever gaps exist (`pipeline.run_coverage`, `enrich.validate_coverage`, tests, `dry_run_handler`).
 3. [ ] Run the four audits beside the critical path (`cli.run`, `course.py`).
 4. [ ] Move `FEEDBACK` last in `_rewrite`; measure `prompt_cache_hit_tokens` on one real run.
-5. [ ] Per-part scheduler derived from `stages.py`; per-part events in `events.jsonl`; audio per part as soon as its spoken form exists.
+5. [x] Per-part scheduler derived from `stages.py`; per-part events in `events.jsonl`; audio per part as soon as its spoken form exists. Built in `flow.py` (November 2026): each (stage, part) pair is a node whose needs come from `stages.part_needs` (the `per_part` flag of ideas, rewrite, spoken, audio, course and recitation). The ideas of each part run beside the gap search. The rewrite of part k waits for the ideas of part k and for the termbase and the research, which stay barriers because supplement ids are numbered across the lecture. Each part then goes through its spoken form, its course chain (cards, judge, cold read, revision, second cold read: `CoursePipeline.part_chain`), its recitation notes and its voice without waiting for the other parts. The voice and the round trip run in the main thread, where the local models live (`synth_part`, `repair_chunks(first=)`). The audits are nodes beside the path: the idea audit after every idea list, the gap-search audit after the gap search, the verifier audit after every script, and the judge audit after the course. A stage is "running" from its first node to its last (`Tracker.start`/`stop`), so several stages can be running at once. The app opens one stage without closing another. Every cache file, `--redo`, `stages.check`, the ledger callbacks and `report.md` are unchanged; a dry build gives byte-identical outputs. Not done: per-part events (the events stay per stage); the gap search is still one call (item 6).
 6. [ ] Split the gap search by slide range, plus the whole-lecture terms pass.
 7. [ ] Try `reasoning_effort: low` on the spoken form, the terminology check and the cold read; keep it only if the audits hold.
 8. [ ] Turn `.claude/skills/lecture2audio/` into a full skill with scripts and references; add an MCP server over the command line.
