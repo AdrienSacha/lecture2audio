@@ -1,0 +1,6 @@
+# One term per line. An optional note after a colon helps the model and the speech recognition.
+link-state routing: every router learns the whole network map
+Dijkstra's algorithm: computes the least-cost path from one node to all others
+forwarding table: for each destination, the next hop
+next hop: the neighbouring router to which a packet is sent
+cost: a number attached to a link, used to compare paths

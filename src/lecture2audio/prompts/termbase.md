@@ -7,6 +7,7 @@ You build the termbase of a lecture: the list of its technical terms, each with 
 - TRANSCRIPT: the whole lecture, as numbered units grouped under the outline's nodes.
 - SLIDES (optional) and GLOSSARY (optional). A glossary definition is authoritative.
 - REQUIRED TERMS: terms that the gap search found used without a definition, or taken for granted. Each must have an entry.
+- REFERENCE (optional): for some required terms, a page of a textbook from the user's reference library that uses the term, each under its source and "Title, p. N". Prefer the textbook's definition when it matches the sense the lecture uses; the lecture's usage wins when they differ.
 
 # Rules
 

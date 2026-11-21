@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .ledger import open_rows
+from .library import is_source
 from .outline import Outline, ranges
 from .pipeline import SOFT_ISSUES, list_sentence, scope_words
 
@@ -55,7 +56,8 @@ def _sources(records: list[dict]) -> list[str]:
     lines = ["## Sources from outside the lecture", ""]
     for item in items:
         title = item.get("title") or item["url"]
-        lines.append(f"- [{item['id']}] {title}. <{item['url']}>. Supporting passage: "
+        where = "" if is_source(item["url"]) else f" <{item['url']}>."  # a book: "Title, p. N"
+        lines.append(f"- [{item['id']}] {title}.{where} Supporting passage: "
                      f"\"{item['quote']}\"")
     return lines + [""]
 
@@ -205,17 +207,72 @@ def slide_lines(slides: list[dict] | None) -> list[str]:
     return lines + [""]
 
 
+MISMATCH_TAG = "[slides] the slides seem to belong to another lecture:"  # read by the app
+
+
+def _slide_list(numbers: list[int]) -> str:
+    return ("slide " if len(numbers) == 1 else "slides ") + ", ".join(map(str, numbers))
+
+
+def slide_match_warning(match: dict | None) -> str:
+    """What follows `MISMATCH_TAG` when the slides seem to belong to another lecture
+    (`sources.slide_match`), else ""."""
+    if not match or not match.get("low"):
+        return ""
+    used = ("every slide is still used (--slides-all)" if match.get("kept_all") else
+            f"only the {match['matched']} matching slide(s) are used, and the others are neither "
+            "researched nor added (--slides-all keeps every slide)")
+    return (f"{match['matched']} of {match['scored']} slides share enough words with the "
+            f"transcript (share {match['score']:.2f}, threshold {match['threshold']:.2f}); "
+            f"{used}")
+
+
+def slide_match_lines(match: dict | None) -> list[str]:
+    """How well the slides match the transcript, and the slides that match nothing."""
+    if not match or not match.get("scored"):
+        return []
+    lines = ["## How the slides match the transcript", "",
+             f"{match['matched']} of {match['scored']} slides with text share enough words with "
+             "the transcript to be placed in it (each slide is compared with every stretch of "
+             f"about 200 words of the transcript; share {match['score']:.2f}, below "
+             f"{match['threshold']:.2f} the deck is taken to belong to another lecture). This "
+             "is computed by code before any model call."]
+    loose = [s for s in match["slides"] if s["matched"] is False]
+    if loose:
+        lines.append("")
+        if match.get("low") and not match.get("kept_all"):
+            lines.append("The slides below match nothing in the transcript. They were not given "
+                         "to the models, so no gap was searched or researched for them; run "
+                         "again with `--slides-all` to use them.")
+        elif match.get("low"):
+            lines.append("The slides below match nothing in the transcript. They were kept "
+                         "because of `--slides-all`, so the gap search may treat their content "
+                         "as untaught and add it from outside the lecture.")
+        else:
+            lines.append("The slides below match nothing in the transcript. The teacher may "
+                         "have skipped them; the gap search treats their content as untaught.")
+        lines.append("")
+        lines += [f"- Slide {s['slide']}" + (f": {s['title']}" if s["title"] else "")
+                  + f" (score {s['score']:.2f})" for s in loose]
+    return lines + [""]
+
+
 def write_report(path: Path, name: str, outline: Outline, records: list[dict],
                  spoken: list[dict], notes: list[str], audit: dict | None,
                  usage: dict | None = None, roundtrip: list[dict] | None = None,
                  gaps: dict | None = None, ideas: dict | None = None,
                  factcheck: dict | None = None, asr: list[dict] | None = None,
-                 slides: list[dict] | None = None) -> None:
+                 slides: list[dict] | None = None, match: dict | None = None) -> None:
     lines = [f"# {name}: quality report", ""]
     flagged = [r for r in records if r["flagged"]]
     lines.append(f"**{len(flagged)} part(s) still have open problems after the retries.** Listen "
                  "to them with the transcript at hand." if flagged else
                  "No part has open problems.")
+    warning = slide_match_warning(match)
+    if warning:  # after the first sentence, which the app shows as the state of the script
+        lines += ["", f"**Warning: the slides seem to belong to another lecture.** "
+                      f"{warning[:1].upper() + warning[1:]}. See \"How the slides match the "
+                      "transcript\" below."]
     lines += ["", "| Part | Title | Words | Attempts | Open problems | Digits/symbols left by the model |",
               "|---|---|---|---|---|---|"]
     for record, sp in zip(records, spoken):
@@ -246,6 +303,7 @@ def write_report(path: Path, name: str, outline: Outline, records: list[dict],
     if ideas is not None:
         lines += ledger_lines(ideas)
     lines += factcheck_lines(factcheck)
+    lines += slide_match_lines(match)
     lines += slide_lines(slides)
     if asr:
         lines += ["## Speech recognition", "",
@@ -408,6 +466,9 @@ def _gap_lines(outline: Outline, gaps: dict) -> list[str]:
     if coverage.get("unlisted_slides"):
         lines += [f"Slides {coverage['unlisted_slides']} have no idea listed, even after they "
                   "were asked for alone; whether the lecture teaches them was not checked.", ""]
+    for chunk in coverage.get("failed_chunks", []):
+        lines += [f"The gap search of {chunk['label']} failed: {chunk['error']} Its gaps are "
+                  "missing from this run; it is asked again, alone, on the next run.", ""]
     ideas = coverage.get("slide_ideas", [])
     if ideas:
         counts = {s: sum(i["status"] == s for i in ideas) for s in ("covered", "partial", "missing")}
@@ -452,7 +513,7 @@ def _gap_lines(outline: Outline, gaps: dict) -> list[str]:
     lines.append("")
     rejected = [(g, r) for g, res in research.items() for r in res.get("rejected", [])]
     if rejected:
-        lines += ["Facts found online but discarded, because their quote could not be checked:", ""]
+        lines += ["Facts found online or in the reference library but discarded, because their quote could not be checked:", ""]
         lines += [f"- {g}: {r.get('text', '')} <{r.get('url', '')}> ({r.get('reason', '')})"
                   for g, r in rejected]
         lines.append("")

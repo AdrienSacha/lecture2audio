@@ -19,6 +19,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader
 
 from . import enrich
+from .library import is_source
 from .course import _texts
 from .outline import Outline
 
@@ -292,7 +293,8 @@ def write_vault(root: Path, lectures: list[dict], language: str, title: str | No
                 sources[x["id"]] = {"id": x["id"], "text": x.get("text", ""),
                                     "quote": x.get("quote", ""),
                                     "url": x["url"] if str(x.get("url", "")).startswith(
-                                        ("http://", "https://")) else ""}
+                                        ("http://", "https://")) else
+                                    x.get("title", "") if is_source(x.get("url", "")) else ""}
         write(lecture["folder"] / f"{lecture['prefix']} – Sources.md", "back.md.j2",
               kind="sources", heading=f"{lecture['prefix']} – {labels['sources']}",
               sources=list(sources.values()))

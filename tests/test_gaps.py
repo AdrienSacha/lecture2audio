@@ -1,7 +1,10 @@
 """Gaps, research and terminology: gates, termbase logic, research clients, and the loop."""
 import json
 import os
+os.environ["L2A_LIBRARY"] = os.path.join(  # never read or write the real library
+    __import__("tempfile").gettempdir(), "l2a-tests-no-library", "library.db")
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -421,6 +424,29 @@ class ResearchLoop(unittest.TestCase):
             llm.make_llm("compat", "m")  # no --base-url
 
 
+def coverage_pipeline(test, handle, slides, workers=1, work=None):
+    """A pipeline whose gap search goes to `handle(system, user)`."""
+    def route(system, user):
+        if "You build the outline" in system:
+            return json.dumps(OUTLINE)
+        return handle(system, user)
+
+    fake = FakeLLM(route)
+    if work is None:
+        tmp = tempfile.TemporaryDirectory()
+        test.addCleanup(tmp.cleanup)
+        work = pathlib.Path(tmp.name)
+    p = TextPipeline(work, "en", fake, fake, load_prompts("en"), log=silent,
+                     max_part_words=1000, workers=workers, slides=slides)
+    return p, p.run_outline(UNITS), work
+
+
+def part_of_request(user):
+    """The part a request of the gap search asks for, or None for a slide range."""
+    match = re.search(r"Only the gaps of part (\d+)", user)
+    return match.group(1) if match else None
+
+
 class SlideRepair(unittest.TestCase):
     """Slides the gap search leaves without an idea are asked for alone, not by redoing it."""
     SLIDES = ["Retransmission: a lost packet is sent again", "2 Flow control",
@@ -430,28 +456,21 @@ class SlideRepair(unittest.TestCase):
         calls = []
 
         def handle(system, user):
-            if "You find the gaps" in system:
-                calls.append(user)
-                if len(calls) == 1:  # skips the section page, slide 2
-                    return json.dumps({"slide_ideas": [
-                        {"id": "S1", "slide": 1, "idea": "resend", "status": "covered",
-                         "nodes": ["1.2"]},
-                        {"id": "S2", "slide": 3, "idea": "window", "status": "missing",
-                         "nodes": ["1.2"]}], "gaps": [
-                        {"id": "G1", "kind": "slide_missing", "node": "1.2", "idea": "S2",
-                         "detail": "d", "query": "q"}]})
-                return repair(user)
-            if "You build the outline" in system:
-                return json.dumps(OUTLINE)
-            return dry_run_handler(system, user)
+            if part_of_request(user):
+                return json.dumps({"slide_ideas": [], "gaps": []})
+            calls.append(user)
+            if len(calls) == 1:  # skips the section page, slide 2
+                return json.dumps({"slide_ideas": [
+                    {"id": "S1", "slide": 1, "idea": "resend", "status": "covered",
+                     "nodes": ["1.2"]},
+                    {"id": "S2", "slide": 3, "idea": "window", "status": "missing",
+                     "nodes": ["1.2"]}], "gaps": [
+                    {"id": "G1", "kind": "slide_missing", "node": "1.2", "idea": "S2",
+                     "detail": "d", "query": "q"}]})
+            return repair(user)
 
-        fake = FakeLLM(handle)
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        p = TextPipeline(pathlib.Path(tmp.name), "en", fake, fake, load_prompts("en"),
-                         log=silent, max_part_words=1000, workers=1, slides=self.SLIDES)
-        result = p.run_coverage(p.run_outline(UNITS))
-        return result, calls, pathlib.Path(tmp.name)
+        p, o, work = coverage_pipeline(self, handle, self.SLIDES)
+        return p.run_coverage(o), calls, work
 
     def test_missing_slide_is_asked_alone_and_merged(self):
         def repair(user):
@@ -464,25 +483,129 @@ class SlideRepair(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("[Slide 2]", calls[1])
         self.assertNotIn("[Slide 1]", calls[1])
+        # a fresh search is numbered in lecture order: ideas by slide, gaps by node
         self.assertEqual([(i["id"], i["slide"]) for i in result["slide_ideas"]],
-                         [("S1", 1), ("S2", 3), ("S3", 2)])
-        self.assertEqual([(g["id"], g["idea"]) for g in result["gaps"]],
-                         [("G1", "S2"), ("G2", "S3")])
+                         [("S1", 1), ("S2", 2), ("S3", 3)])
+        self.assertEqual(sorted((g["idea"], g["detail"]) for g in result["gaps"]),
+                         [("S2", "d2"), ("S3", "d")])
         self.assertNotIn("unlisted_slides", result)
 
     def test_a_failed_repair_keeps_the_answer_and_names_the_slide(self):
         result, calls, work = self.run_coverage(lambda user: "not json")
-        self.assertEqual(len(calls), 3)  # the search, then two tries for slide 2
+        self.assertEqual(len(calls), 3)  # the range, then two tries for slide 2
         self.assertEqual(result["unlisted_slides"], [2])
         self.assertEqual(len(result["gaps"]), 1)  # the gaps found are not lost
+        self.assertNotIn("failed_chunks", result)  # the range answered
         self.assertTrue((work / "coverage.json").exists())
 
     def test_a_failed_search_is_not_cached(self):
-        fake = FakeLLM(lambda s, u: json.dumps(OUTLINE) if "You build the outline" in s
-                       else "not json")
-        with tempfile.TemporaryDirectory() as tmp:
-            p = TextPipeline(pathlib.Path(tmp), "en", fake, fake, load_prompts("en"),
-                             log=silent, max_part_words=1000, workers=1, slides=self.SLIDES)
-            result = p.run_coverage(p.run_outline(UNITS))
-            self.assertIn("error", result)
-            self.assertFalse((pathlib.Path(tmp) / "coverage.json").exists())
+        p, o, work = coverage_pipeline(self, lambda s, u: "not json", self.SLIDES)
+        result = p.run_coverage(o)
+        self.assertIn("error", result)
+        self.assertFalse((work / "coverage.json").exists())
+
+
+class MapReduce(unittest.TestCase):
+    """The gap search as parallel requests over slide ranges and parts, merged by code."""
+    SLIDES = [f"Slide text {k}" for k in range(1, 31)]
+
+    def test_same_result_as_one_call_for_the_dry_model(self):
+        calls = []
+
+        def handle(system, user):
+            calls.append(user)
+            return dry_run_handler(system, user)
+
+        p, o, _ = coverage_pipeline(self, handle, self.SLIDES, workers=4)
+        result = p.run_coverage(o)
+        whole = json.loads(dry_run_handler(
+            p.prompts.coverage, p._coverage_request(o, list(range(1, 31)), "")))
+        self.assertEqual(result["slide_ideas"], whole["slide_ideas"])
+        self.assertEqual(result["gaps"], whole["gaps"])
+        # three ranges of at most twelve slides, and one request per part
+        self.assertEqual(len(calls), 3 + 2)
+        shown = sorted(len(re.findall(r"^\[Slide \d+\]$", u, flags=re.M)) for u in calls)
+        self.assertEqual(shown, [0, 0, 6, 12, 12])
+        self.assertTrue(all("## TRANSCRIPT" in u and "[7]" in u for u in calls))  # whole lecture
+
+    def test_ids_are_unique_and_a_gap_found_twice_is_kept_once(self):
+        def handle(system, user):
+            part = part_of_request(user)
+            if part is None:
+                slides = [int(n) for n in re.findall(r"^\[Slide (\d+)\]$", user, flags=re.M)]
+                return json.dumps({"slide_ideas": [
+                    {"id": f"S{k}", "slide": n, "idea": f"idea {n}", "status": "missing",
+                     "nodes": ["2"]} for k, n in enumerate(slides, 1)], "gaps": [
+                    {"id": f"G{k}", "kind": "slide_missing", "node": "2", "idea": f"S{k}",
+                     "detail": f"slide {n}", "query": "q"} for k, n in enumerate(slides, 1)]})
+            node = "1.2" if part == "1" else "2"
+            return json.dumps({"slide_ideas": [], "gaps": [
+                {"id": "G1", "kind": "undefined_term", "node": node,
+                 "term": "Timeout" if part == "1" else "timeout ", "detail": "d", "query": "q"},
+                {"id": "G2", "kind": "skipped_step", "node": node, "detail": "step",
+                 "query": "q"},
+                {"id": "G3", "kind": "skipped_step", "node": "1.1", "detail": "other part",
+                 "query": "q"}]})  # outside part 2: dropped there
+
+        p, o, _ = coverage_pipeline(self, handle, self.SLIDES)
+        result = p.run_coverage(o)
+        ids = [g["id"] for g in result["gaps"]]
+        self.assertEqual(ids, [f"G{k}" for k in range(1, len(ids) + 1)])
+        self.assertEqual([i["id"] for i in result["slide_ideas"]],
+                         [f"S{k}" for k in range(1, 31)])
+        terms = [g for g in result["gaps"] if g["kind"] == "undefined_term"]
+        self.assertEqual([(g["node"], g["term"]) for g in terms], [("1.2", "Timeout")])
+        steps = sorted((g["node"], g["detail"]) for g in result["gaps"]
+                       if g["kind"] == "skipped_step")
+        self.assertEqual(steps, [("1.1", "other part"), ("1.2", "step"), ("2", "step")])
+        ideas = {i["id"]: i["slide"] for i in result["slide_ideas"]}
+        self.assertEqual(sorted(ideas[g["idea"]] for g in result["gaps"]
+                                if g["kind"] == "slide_missing"), list(range(1, 31)))
+        self.assertEqual(enrich.validate_coverage(result, IDS, 30), [])
+
+    def test_a_failing_chunk_loses_nothing_else_and_is_asked_again_next_run(self):
+        broken = {"slides 13-24", "part 2"}
+        calls = []
+
+        def handle(system, user):
+            part = part_of_request(user)
+            slides = [int(n) for n in re.findall(r"^\[Slide (\d+)\]$", user, flags=re.M)]
+            label = f"part {part}" if part else f"slides {slides[0]}-{slides[-1]}"
+            calls.append(label)
+            if label in broken or (broken and part is None and slides[0] in range(13, 25)):
+                return "not json"  # the range, and its repair
+            if part:
+                return json.dumps({"slide_ideas": [], "gaps": [
+                    {"id": "G1", "kind": "skipped_step", "node": "1.2" if part == "1" else "2",
+                     "detail": f"step of part {part}", "query": "q"}]})
+            return dry_run_handler(system, user)
+
+        p, o, work = coverage_pipeline(self, handle, self.SLIDES)
+        result = p.run_coverage(o)
+        self.assertNotIn("error", result)
+        self.assertEqual(sorted({i["slide"] for i in result["slide_ideas"]}),
+                         list(range(1, 13)) + list(range(25, 31)))
+        self.assertEqual([g["detail"] for g in result["gaps"]], ["step of part 1"])
+        self.assertEqual(result["unlisted_slides"], list(range(13, 25)))
+        self.assertEqual([c["label"] for c in result["failed_chunks"]], ["slides 13-24", "part 2"])
+        self.assertTrue((work / "coverage.json").exists())
+        from lecture2audio.report import _gap_lines
+        shown = "\n".join(_gap_lines(o, {"coverage": result, "research": {},
+                                          "supplements": []}))
+        self.assertIn("The gap search of part 2 failed", shown)
+        first = {g["id"]: g["detail"] for g in result["gaps"]}
+
+        broken.clear()
+        calls.clear()
+        p2, o2, _ = coverage_pipeline(self, handle, self.SLIDES, work=work)
+        again = p2.run_coverage(o2)
+        self.assertEqual(sorted(calls), ["part 2", "slides 13-24"])  # only the failed ones
+        self.assertNotIn("failed_chunks", again)
+        self.assertNotIn("unlisted_slides", again)
+        self.assertEqual(sorted({i["slide"] for i in again["slide_ideas"]}), list(range(1, 31)))
+        for gap_id, detail in first.items():  # the research cache is keyed by these ids
+            self.assertEqual(next(g["detail"] for g in again["gaps"] if g["id"] == gap_id),
+                             detail)
+        self.assertIn("step of part 2", [g["detail"] for g in again["gaps"]])
+        self.assertEqual(len({g["id"] for g in again["gaps"]}), len(again["gaps"]))
+        self.assertEqual(len({i["id"] for i in again["slide_ideas"]}), 30)

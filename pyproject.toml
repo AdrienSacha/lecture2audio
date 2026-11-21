@@ -23,6 +23,7 @@ voice = ["mlx-audio>=0.6.2"]  # Ming-3.0-tts on Apple chips
 whisper-mac = ["mlx-whisper"]
 whisper = ["faster-whisper"]
 parakeet = ["parakeet-mlx>=0.4"]  # NVIDIA Parakeet speech recognition on Apple chips
+mcp = ["mcp>=2.3.0"]  # the MCP server for other agents (lecture2audio mcp)
 factcheck = ["minicheck @ git+https://github.com/Liyan06/MiniCheck.git@main"]  # local fact-checker
 
 [project.scripts]

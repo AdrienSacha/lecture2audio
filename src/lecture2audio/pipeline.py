@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import enrich
+from . import library as books
 from .llm import LLM, LLMError, extract_json
 from .outline import (Node, Outline, checklist, dump, fallback_outline, moves, noise_by_part,
                       parse_outline, part_source, part_words, ranges, render_outline,
@@ -39,6 +40,19 @@ SOFT_ISSUES = {"long", "filler", "plan", "marker", "idea_numbers", "unledgered",
 SLIDES_ONLY = ("slides only. There is no recording and no transcript: the units are the text "
                "of the slides (titles, bullets, formulas), in slide order. They state ideas "
                "without explaining them.")
+
+# The TASK of each request of the gap search (`TextPipeline.run_coverage`).
+SLIDE_TASK = ("Only the slides above are asked for: other requests over the same lecture list "
+              "the other slides and the gaps of the transcript. List the ideas of each of these "
+              "slides (a title or section page gets one idea, with the status the transcript "
+              "gives that section) and a gap of kind \"slide_missing\" for each idea that is "
+              "partial or missing. No other gap is listed.")
+PART_TASK = ("Only the gaps of part {part} (\"{title}\") are asked for: the gaps of kind "
+             "\"undefined_term\", \"assumed_fundamental\" or \"skipped_step\" whose \"node\" is "
+             "one of {nodes}. The whole lecture is shown so that you can see what is defined, "
+             "taught or derived anywhere in it; the other parts and the slides are listed by "
+             "other requests over the same lecture. List a term at the node of this part where "
+             "it is first used. \"slide_ideas\" stays empty.")
 
 
 class PipelineError(RuntimeError):
@@ -559,9 +573,27 @@ def blocking(issues: list[dict]) -> list[dict]:
 
 # --------------------------------------------------------------------- pipeline
 
-def _merge_slide_ideas(result: dict, extra: dict, slides: set[int]) -> dict:
-    """`result` with the slide ideas of `slides` from `extra` and the gaps that name them,
-    renumbered after the ids already used."""
+# Slides with text per request of the gap search. One request over a whole deck wrote about
+# 100 s of output and failed whole when a few slides were left out (ADR-0006).
+SLIDES_PER_CHUNK = 12
+
+
+def _gap_key(gap: dict) -> tuple:
+    """Two gaps with the same key are the same gap. A term is researched and defined once,
+    wherever it is first missed, so a term gap is keyed by its kind and term alone; any other
+    gap by its node, kind, term and detail."""
+    term = " ".join(str(gap.get("term", "")).lower().split())
+    if gap.get("kind") in enrich.TERM_GAPS and term:
+        return (gap.get("kind"), term)
+    return (str(gap.get("node")), gap.get("kind"), term,
+            " ".join(str(gap.get("detail", "")).lower().split()))
+
+
+def _merge_coverage(result: dict, extra: dict) -> dict:
+    """`result` with the slide ideas and gaps of `extra` appended under fresh ids (after the
+    ids already used, so that the ids of `result`, which the research cache is keyed by, never
+    change). A gap already in `result` (`_gap_key`) is not added twice, and a "slide_missing"
+    gap whose idea is not in `extra` is dropped."""
     def top(items, prefix):
         numbers = [int(m.group(1)) for i in items
                    if (m := re.fullmatch(prefix + r"(\d+)", str(i.get("id", ""))))]
@@ -569,16 +601,75 @@ def _merge_slide_ideas(result: dict, extra: dict, slides: set[int]) -> dict:
 
     next_idea, next_gap = top(result["slide_ideas"], "S"), top(result["gaps"], "G")
     renamed, ideas, gaps = {}, [], []
+    seen = {_gap_key(g) for g in result["gaps"]}
     for idea in extra["slide_ideas"]:
-        if idea.get("slide") in slides:
-            next_idea += 1
-            renamed[str(idea["id"])] = f"S{next_idea}"
-            ideas.append(dict(idea, id=f"S{next_idea}"))
+        next_idea += 1
+        renamed[str(idea["id"])] = f"S{next_idea}"
+        ideas.append(dict(idea, id=f"S{next_idea}"))
     for gap in extra["gaps"]:
-        if gap.get("kind") == "slide_missing" and str(gap.get("idea")) in renamed:
-            next_gap += 1
-            gaps.append(dict(gap, id=f"G{next_gap}", idea=renamed[str(gap["idea"])]))
-    return dict(result, slide_ideas=result["slide_ideas"] + ideas, gaps=result["gaps"] + gaps)
+        if gap.get("kind") == "slide_missing":
+            if str(gap.get("idea")) not in renamed:
+                continue
+            gap = dict(gap, idea=renamed[str(gap["idea"])])
+        if _gap_key(gap) in seen:
+            continue
+        seen.add(_gap_key(gap))
+        next_gap += 1
+        gaps.append(dict(gap, id=f"G{next_gap}"))
+    return dict(result, slide_ideas=result["slide_ideas"] + ideas, gaps=result["gaps"] + gaps,
+                transcript_ideas=result.get("transcript_ideas", [])
+                + extra.get("transcript_ideas", []))
+
+
+def _merge_slide_ideas(result: dict, extra: dict, slides: set[int]) -> dict:
+    """`result` with the slide ideas of `slides` from `extra` and the gaps that name them,
+    renumbered after the ids already used."""
+    ideas = [i for i in extra["slide_ideas"] if i.get("slide") in slides]
+    return _merge_coverage(result, {"slide_ideas": ideas, "gaps": [
+        g for g in extra["gaps"] if g.get("kind") == "slide_missing"]})
+
+
+def _in_lecture_order(result: dict, node_ids: list[str]) -> dict:
+    """Ideas by slide and gaps by node, renumbered S1, S2, ... and G1, G2, ... (for a fresh
+    search only: renumbering a saved one would detach the research cached under its ids)."""
+    rank = {n: k for k, n in enumerate(node_ids)}
+    ideas = sorted(result["slide_ideas"], key=lambda i: i["slide"])
+    renamed = {str(i["id"]): f"S{k}" for k, i in enumerate(ideas, 1)}
+    gaps = sorted(result["gaps"], key=lambda g: rank.get(str(g["node"]), len(rank)))
+    return dict(result,
+                slide_ideas=[dict(i, id=renamed[str(i["id"])]) for i in ideas],
+                gaps=[dict(g, id=f"G{k}", **({"idea": renamed[str(g["idea"])]}
+                                             if g.get("kind") == "slide_missing" else {}))
+                      for k, g in enumerate(gaps, 1)])
+
+
+def _scope_chunk(data, chunk: dict, part_nodes: set[str]):
+    """Only what a request of the gap search was asked for: the ideas of its slides and their
+    "slide_missing" gaps, or the other gaps of its part. Anything else is dropped (the request
+    that owns it lists it, over the same transcript) rather than rejected, because a rejection
+    costs a whole new answer."""
+    if not isinstance(data, dict) or not isinstance(data.get("slide_ideas"), list) \
+            or not isinstance(data.get("gaps"), list):
+        return data
+    if chunk["kind"] == "slides":
+        wanted = set(chunk["slides"])
+        ideas = [i for i in data["slide_ideas"]
+                 if not isinstance(i, dict) or i.get("slide") in wanted]
+        kept = {str(i.get("id")) for i in ideas if isinstance(i, dict)}
+        gaps = [g for g in data["gaps"] if not isinstance(g, dict)
+                or (g.get("kind") == "slide_missing" and str(g.get("idea")) in kept)]
+    else:
+        ideas = []
+        gaps = [g for g in data["gaps"] if not isinstance(g, dict)
+                or (g.get("kind") != "slide_missing" and str(g.get("node")) in part_nodes)]
+    return dict(data, slide_ideas=ideas, gaps=gaps, transcript_ideas=[])
+
+
+def _chunk_label(chunk: dict) -> str:
+    if chunk["kind"] == "slides":
+        first, last = chunk["slides"][0], chunk["slides"][-1]
+        return f"slides {first}-{last}" if last != first else f"slide {first}"
+    return f"part {chunk['part']}"
 
 
 class TextPipeline:
@@ -587,7 +678,7 @@ class TextPipeline:
                  max_retries: int = 2, log: Callable[[str], None] = print,
                  max_part_words: int = 1500, workers: int = 3,
                  researcher: Callable[[str, str], tuple[str, list[dict]]] | None = None,
-                 source_kind: str = "transcript"):
+                 source_kind: str = "transcript", library=None):
         self.work_dir = Path(work_dir)
         self.language = language
         self.language_name = LANGUAGE_NAMES.get(language, language)
@@ -604,6 +695,8 @@ class TextPipeline:
         self.researcher = researcher
         # "slides": no recording and no transcript, the units are the text of the slides
         self.source_kind = source_kind
+        # The user's reference library (library.Library with books), searched before the web.
+        self.library = library
         # Filled by the gap stages; empty when they are not run.
         self.coverage: dict = {"slide_ideas": [], "gaps": [], "transcript_ideas": []}
         self.terms: list[dict] = []
@@ -699,41 +792,65 @@ class TextPipeline:
         return "\n\n".join(f"[Slide {k}]\n{s}" for k, s in enumerate(self.slides, 1) if s.strip())
 
     def run_coverage(self, outline: Outline) -> dict:
-        """Slide ideas with their status, and the gaps of the transcript.
+        """Slide ideas with their status, and the gaps of the transcript, as a map-reduce.
 
-        Slides the answer leaves without an idea (often section or title pages) do not reject
-        the whole answer, which costs a full regeneration and, after three tries, every gap:
-        they are asked for alone in one bounded call over the same transcript, merged in, and
-        any still missing are named in report.md (`unlisted_slides`). A search that keeps
-        failing its gate is not cached, so the next run tries it again."""
+        Map: one request per range of SLIDES_PER_CHUNK slides with text (their ideas and
+        "slide_missing" gaps) and one per part (the other gaps whose node is in that part), run
+        in parallel. Every request sees the whole transcript, because a slide idea can be taught
+        anywhere and a term used in part 2 may be defined in part 5; only what it must list is
+        narrowed, so each answer is short. Reduce, in code: the answers are merged under fresh
+        ids, a gap found twice is kept once (`_gap_key`), and the merged result passes the same
+        gate as one whole answer.
+
+        Slides an answer leaves without an idea (often section or title pages) are asked for
+        alone in one bounded call; any still missing are named in report.md
+        (`unlisted_slides`). A request that keeps failing never drops the others: it is named in
+        report.md (`failed_chunks`) and asked again, alone, on the next run. A search whose
+        every request fails is not cached, so the next run tries it again."""
         cache = self.work_dir / "coverage.json"
+        base, chunks = None, None
         if cache.exists():
-            self._set_coverage(json.loads(cache.read_text(encoding="utf-8")))
-            if not self.coverage.get("error"):  # a failure saved by an older version: retry
-                return self.coverage
-        self.log("[gaps] looking for what the lecture leaves out")
+            saved = json.loads(cache.read_text(encoding="utf-8"))
+            if not saved.get("error"):  # a failure saved by an older version: retry
+                if not saved.get("failed_chunks"):
+                    self._set_coverage(saved)
+                    return saved
+                base = {k: v for k, v in saved.items()
+                        if k not in ("failed_chunks", "unlisted_slides")}
+                chunks = [{k: v for k, v in f.items() if k in ("kind", "slides", "part")}
+                          for f in saved["failed_chunks"]]
         ids, blank, count = enrich.node_order(outline), self._blank_slides(), len(self.slides)
-        user = (f"## LANGUAGE\n{self.language_name}\n\n" + self._kind()
-                + _section("GLOSSARY", self.glossary) + _section("SLIDES", self._slides_numbered())
-                + "## TRANSCRIPT\n" + self._lecture(outline))
-        try:
-            data = self._ask_json(self.rewrite_llm, self.prompts.coverage, user,
-                                  lambda d: enrich.validate_coverage(d, ids, count, blank,
-                                                                     require_slides=False),
-                                  "gap search")
-        except (PipelineError, LLMError) as exc:
-            self.log(f"[gaps] {exc} (not cached: the next run tries again)")
+        if chunks is None:
+            chunks = self._coverage_chunks(outline)
+        ranges_ = sum(c["kind"] == "slides" for c in chunks)
+        self.log(f"[gaps] looking for what the lecture leaves out: {ranges_} slide range(s) and "
+                 f"{len(chunks) - ranges_} part(s), in parallel")
+        results = self._map(lambda c: self._run_chunk(outline, ids, c), chunks)
+        failed = [r for r in results if r["error"]]
+        if base is None and failed and len(failed) == len(results):
+            error = "; ".join(f"{_chunk_label(r['chunk'])}: {r['error']}" for r in failed)
+            self.log(f"[gaps] every request failed (not cached: the next run tries again)")
             self._set_coverage({"slide_ideas": [], "gaps": [], "transcript_ideas": [],
-                                "error": str(exc)})
+                                "error": error})
             return self.coverage
-        result = {"slide_ideas": data["slide_ideas"], "gaps": data["gaps"],
-                  "transcript_ideas": data.get("transcript_ideas", [])}
-        missing = enrich.unlisted_slides(result, count, blank)
-        if missing:
-            result, missing = self._repair_slides(outline, result, missing, ids, blank)
+        result = base or {"slide_ideas": [], "gaps": [], "transcript_ideas": []}
+        for r in results:
+            result = _merge_coverage(result, r["data"])
+        if base is None:
+            result = _in_lecture_order(result, ids)
+        errors = enrich.validate_coverage(result, ids, count, blank, require_slides=False)
+        if errors:  # each answer passed the gate; the merge should keep it so
+            self.log(f"[gaps] the merged answers fail the gate: {'; '.join(errors)}")
+        missing = enrich.unlisted_slides(result, count, blank) \
+            if self.source_kind != "slides" else []
         if missing:
             result["unlisted_slides"] = missing
             self.log(f"[gaps] slides {missing} still have no idea listed; named in report.md")
+        if failed:
+            result["failed_chunks"] = [dict(r["chunk"], label=_chunk_label(r["chunk"]),
+                                            error=r["error"]) for r in failed]
+            self.log(f"[gaps] {', '.join(_chunk_label(r['chunk']) for r in failed)} kept "
+                     "failing; named in report.md and asked again on the next run")
         cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         self._set_coverage(result)
         return result
@@ -746,37 +863,85 @@ class TextPipeline:
                 self._publish_ideas(coverage)
             self.coverage = coverage
 
-    def _repair_slides(self, outline: Outline, result: dict, missing: list[int],
-                       ids: list[str], blank: set[int]) -> tuple[dict, list[int]]:
-        """One bounded call for the slides the gap search left without an idea: only those
-        slides are shown, the transcript stays, and the answer is merged under fresh ids. The
-        merged answer is kept only if it passes the gate."""
-        self.log(f"[gaps] asking again for slides {missing} only")
-        wanted = set(missing)
+    def _coverage_chunks(self, outline: Outline) -> list[dict]:
+        """The requests of the gap search: the slides with text in ranges of
+        SLIDES_PER_CHUNK, then one request per part. When the lecture is only slides, the
+        slides are the transcript and no slide idea is asked for."""
+        chunks = []
+        if self.source_kind != "slides":
+            shown = [k for k, s in enumerate(self.slides, 1) if s.strip()]
+            chunks = [{"kind": "slides", "slides": shown[k:k + SLIDES_PER_CHUNK]}
+                      for k in range(0, len(shown), SLIDES_PER_CHUNK)]
+        return chunks + [{"kind": "part", "part": p.id} for p in outline.parts]
+
+    def _coverage_request(self, lecture: Outline, slides: list[int], task: str) -> str:
+        """The transcript comes before what differs between the requests of one search, so
+        that they share their beginning (and the provider's prefix cache)."""
+        wanted = set(slides)
         shown = "\n\n".join(f"[Slide {k}]\n{s}" for k, s in enumerate(self.slides, 1)
-                             if k in wanted)
-        others = set(range(1, len(self.slides) + 1)) - wanted
-        user = (f"## LANGUAGE\n{self.language_name}\n\n" + self._kind()
-                + _section("GLOSSARY", self.glossary) + _section("SLIDES", shown)
-                + _section("TASK", "Only the slides above are asked for: an earlier answer "
-                           "listed every other slide. List the ideas of each of these slides "
-                           "(a title or section page gets one idea, with the status the "
-                           "transcript gives that section) and a gap of kind \"slide_missing\" "
-                           "for each idea that is partial or missing. \"transcript_ideas\" "
-                           "stays empty and no other gap is listed.")
-                + "## TRANSCRIPT\n" + self._lecture(outline))
+                            if k in wanted)
+        return (f"## LANGUAGE\n{self.language_name}\n\n" + self._kind()
+                + _section("GLOSSARY", self.glossary)
+                + "## TRANSCRIPT\n" + self._lecture(lecture) + "\n\n"
+                + _section("SLIDES", shown) + _section("TASK", task))
+
+    def _ask_chunk(self, lecture: Outline, chunk: dict, ids: list[str], what: str,
+                   tries: int = 3) -> dict:
+        """One request of the gap search, checked by the gate on what it was asked for."""
+        everything = set(range(1, len(self.slides) + 1))
+        if chunk["kind"] == "slides":
+            nodes, hidden, task = set(), everything - set(chunk["slides"]), SLIDE_TASK
+        else:
+            part = lecture.node(chunk["part"])
+            nodes = {n.id for n in part.walk()}
+            hidden = everything
+            task = PART_TASK.format(part=part.id, title=part.title,
+                                    nodes=", ".join(n.id for n in part.walk()))
+        user = self._coverage_request(lecture, chunk.get("slides", []), task)
+        data = self._ask_json(
+            self.rewrite_llm, self.prompts.coverage, user,
+            lambda d: enrich.validate_coverage(_scope_chunk(d, chunk, nodes), ids,
+                                               len(self.slides), hidden, require_slides=False),
+            what, tries=tries)
+        return _scope_chunk(data, chunk, nodes)
+
+    def _run_chunk(self, lecture: Outline, ids: list[str], chunk: dict,
+                   repair: bool = True) -> dict:
+        """{"chunk", "data", "error"}: one request, and for a slide range the bounded repair of
+        the slides it left without an idea. `error` is set when nothing usable came back (for
+        a slide range: the request and its repair both failed)."""
+        label = _chunk_label(chunk)
+        empty = {"slide_ideas": [], "gaps": [], "transcript_ideas": []}
         try:
-            extra = self._ask_json(
-                self.rewrite_llm, self.prompts.coverage, user,
-                lambda d: enrich.validate_coverage(d, ids, len(self.slides), blank | others),
-                "gap search, missing slides", tries=2)
+            data, error = self._ask_chunk(lecture, chunk, ids, f"gap search, {label}"), None
+        except (PipelineError, LLMError) as exc:
+            self.log(f"[gaps] {label}: {exc}")
+            data, error = empty, str(exc)
+        if chunk["kind"] == "slides" and repair:
+            listed = {i["slide"] for i in data["slide_ideas"]}
+            missing = [k for k in chunk["slides"] if k not in listed]
+            if missing:
+                data, repaired = self._repair_slides(lecture, data, missing, ids)
+                error = None if repaired else error
+        return {"chunk": chunk, "data": data, "error": error}
+
+    def _repair_slides(self, lecture: Outline, data: dict, missing: list[int],
+                       ids: list[str]) -> tuple[dict, bool]:
+        """One bounded call for the slides of a range that its answer left without an idea:
+        only those slides are shown, the transcript stays, and the answer is merged under fresh
+        ids. The merged answer is kept only if it passes the gate."""
+        self.log(f"[gaps] asking again for slides {missing} only")
+        try:
+            extra = self._ask_chunk(lecture, {"kind": "slides", "slides": missing}, ids,
+                                    "gap search, missing slides", tries=2)
         except (PipelineError, LLMError) as exc:
             self.log(f"[gaps] {exc}")
-            return result, missing
-        merged = _merge_slide_ideas(result, extra, wanted)
-        if enrich.validate_coverage(merged, ids, len(self.slides), blank, require_slides=False):
-            return result, missing
-        return merged, enrich.unlisted_slides(merged, len(self.slides), blank)
+            return data, False
+        merged = _merge_slide_ideas(data, extra, set(missing))
+        if enrich.validate_coverage(merged, ids, len(self.slides), self._blank_slides(),
+                                    require_slides=False):
+            return data, False
+        return merged, True
 
     def run_ideas(self, outline: Outline) -> list[dict]:
         """The atomic ideas the teacher taught, listed part by part (in parallel), so that no
@@ -920,24 +1085,27 @@ class TextPipeline:
                      for g in self.coverage.get("gaps", [])}
             region = {node.id, node.id.rsplit(".", 1)[0]}
             self.log(f"[audit] blanking unit {unit} of node {node.id} to test the gap search")
-            user = (f"## LANGUAGE\n{self.language_name}\n\n"
-                    + _section("GLOSSARY", self.glossary)
-                    + _section("SLIDES", self._slides_numbered())
-                    + "## TRANSCRIPT\n" + self._lecture(mutated))
-            try:
-                data = self._ask_json(
-                    self.rewrite_llm, self.prompts.coverage, user,
-                    lambda d: enrich.validate_coverage(d, enrich.node_order(outline),
-                                                       len(self.slides), self._blank_slides(),
-                                                       require_slides=False),
-                    "gap search audit")
-                new = [g for g in data["gaps"]
-                       if (str(g["node"]), g["kind"], str(g.get("term", "")).lower()) not in known]
-                result = {"node": node.id, "title": node.title, "unit": unit,
-                          "caught": any(str(g["node"]) in region for g in new)}
-            except (PipelineError, LLMError) as exc:  # retried next run: not cached
-                self.log(f"[audit] gap search: {exc}")
-                return {"skipped": f"the test failed ({exc}); it runs again next time"}
+            # The requests of the search that can name a node of the region: the part's own, and
+            # the slides with an idea taught there (a blank can only make such an idea partial).
+            # The others list nodes elsewhere, so running them would not change the score.
+            taught = {i["slide"] for i in self.coverage.get("slide_ideas", [])
+                      if region & {str(n) for n in i.get("nodes", [])}}
+            part_id = node.id.split(".")[0]
+            chunks = [c for c in (dict(c, slides=[k for k in c["slides"] if k in taught])
+                                  if c["kind"] == "slides" else c
+                                  for c in self._coverage_chunks(outline))
+                      if c.get("slides") or c.get("part") == part_id]
+            ids = enrich.node_order(outline)
+            results = self._map(lambda c: self._run_chunk(mutated, ids, c, repair=False), chunks)
+            failed = [r for r in results if r["error"]]
+            if failed:  # retried next run: not cached
+                error = "; ".join(f"{_chunk_label(r['chunk'])}: {r['error']}" for r in failed)
+                self.log(f"[audit] gap search: {error}")
+                return {"skipped": f"the test failed ({error}); it runs again next time"}
+            new = [g for r in results for g in r["data"]["gaps"]
+                   if (str(g["node"]), g["kind"], str(g.get("term", "")).lower()) not in known]
+            result = {"node": node.id, "title": node.title, "unit": unit,
+                      "caught": any(str(g["node"]) in region for g in new)}
         cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         return result
 
@@ -953,6 +1121,7 @@ class TextPipeline:
                            if g.get("kind") in enrich.TERM_GAPS and str(g.get("term", "")).strip()})
         user = (f"## LANGUAGE\n{self.language_name}\n\n"
                 + _section("REQUIRED TERMS", "\n".join(required))
+                + _section("REFERENCE", self._term_references(required))
                 + _section("GLOSSARY", self.glossary) + _section("SLIDES", self._slides_numbered())
                 + "## TRANSCRIPT\n" + self._lecture(outline))
         try:
@@ -968,6 +1137,15 @@ class TextPipeline:
         self.terms = terms
         return terms
 
+    def _term_references(self, required: list[str]) -> str:
+        """For each required term, the best page of the reference library that names it."""
+        hits = []
+        for term in required:
+            found = books.passages(self.library, [term], k=1, max_chars=1500)
+            if found and enrich.term_pattern(term).search(found[0]["text"]):
+                hits.append(dict(found[0], text=f'({term}) {found[0]["text"]}'))
+        return books.render_passages(hits)
+
     def _research_one(self, outline: Outline, gap: dict) -> dict:
         node = outline.node(str(gap["node"]))
         part = outline.node(str(gap["node"]).split(".")[0])
@@ -980,6 +1158,8 @@ class TextPipeline:
                                              ensure_ascii=False)
                            + f"\nNode: {node.id} {node.title}")
                 + _section("TERM", json.dumps(entry, ensure_ascii=False) if entry else "")
+                + _section("LIBRARY", books.render_passages(books.passages(
+                    self.library, [str(gap.get("query", "")), str(gap.get("term") or "")])))
                 + "## CONTEXT\n" + render_part_transcript(outline, part, [])[:8000])
         try:
             text, documents = self.researcher(self.prompts.research, user)
@@ -990,7 +1170,7 @@ class TextPipeline:
                         "error": "; ".join(errors)}
         except (LLMError, ValueError) as exc:
             return {"gap": gap["id"], "found": False, "facts": [], "rejected": [], "error": str(exc)}
-        kept, rejected = enrich.check_facts(data["facts"], documents)
+        kept, rejected = enrich.check_facts(data["facts"], documents, library=self.library)
         return {"gap": gap["id"], "found": bool(kept), "facts": kept, "rejected": rejected,
                 "error": None}
 

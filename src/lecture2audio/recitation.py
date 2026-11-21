@@ -19,6 +19,7 @@ from typing import Annotated, Literal
 from pydantic import Field, ValidationError, model_validator
 
 from . import enrich, latex
+from .library import is_source
 from .course import CoursePipeline, reader_text
 from .course_schema import HTML_ELEMENT, Model, Text, describe, html_in_text
 from .outline import Node, Outline, render_outline
@@ -574,7 +575,7 @@ def render_document(name: str, outline: Outline, records: list[dict], sections: 
             item = supplements[source_id]
             out.append(rf"\bibitem{{{source_id}}} "
                        + latex.escape(item.get("title") or item["url"]) + ". "
-                       + latex.url(item["url"]) + ". "
+                       + ("" if is_source(item["url"]) else latex.url(item["url"]) + ". ")
                        + rf"{{\small {labels['passage']}: ``{latex.escape(item.get('quote', ''))}''}}")
         out.append(r"\end{thebibliography}")
     flagged = [s["part"] for s in written if s.get("flagged")]

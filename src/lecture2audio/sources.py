@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 import statistics
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 
@@ -433,6 +434,107 @@ def select_slides(pages: list[str], segment: str, k: int = 4, max_chars: int = 6
         numbered = [numbered[i] for i in sorted(best)]
     text = "\n\n".join(f"[Slide {num}]\n{page}" for num, page in numbered)
     return text[:max_chars]
+
+
+_STOPWORDS = frozenset("""
+a about above after again against all also am an and any are as at be because been before being
+below between both but by can could did do does doing done down during each even every few for
+from further get gets got had has have having he her here hers him his how however i if in into
+is it its itself just let like lot make many may me might more most much must my no nor not now
+of off on once one only or other our out over own per same she should so some such than that
+the their them then there these they thing things this those though through thus to too under
+until up upon us use used uses using very via want was way we well were what when where which
+while who whom why will with would yes yet you your actually basically going gonna kind know
+okay ok really right say see something sort think um uh yeah look mean need don doesn didn
+isn aren wasn won couldn wouldn shouldn
+au aux avec ce ces cet cette ci comme dans de des du elle elles en est et être eux il ils je la
+le les leur leurs lui ma mais me même mes moi mon ne nos notre nous on ou où par pas pour qu que
+qui sa se ses si son sont sur ta te tes toi ton tu un une vos votre vous été était sont donc
+alors aussi bien très tout tous toute toutes fait faire peut plus moins entre car ni sans sous
+vers chez avoir avons avez ont suis es sommes êtes cela ça voilà quoi euh ben bon parce
+""".split())
+_MATCH_WORD = re.compile(r"[^\W_]+")
+MATCH_WINDOW = 200  # words of transcript one slide is compared with (a few minutes of speech)
+MATCH_SLIDE = 0.12  # a slide whose best window is under this cosine matches nothing
+MATCH_DECK = 0.5    # under this share of slides that match, the deck is another lecture's
+
+
+def _match_tokens(text: str) -> list[str]:
+    """Content words of a slide or a transcript, for `slide_match`: lower case, stopwords of
+    English and French dropped, a final plural s cut ("registers" = "register"). A pure
+    number goes (speech recognition writes "thirty-two", slides write 32), and so does a
+    word of fewer than three characters unless it mixes letters and digits (x0, t2, rv32i)."""
+    out = []
+    for word in _MATCH_WORD.findall(text.lower()):  # "l'adresse" gives "l", dropped, "adresse"
+        if word in _STOPWORDS or word.isdigit():
+            continue
+        if len(word) < 3 and not (any(c.isdigit() for c in word) and any(c.isalpha() for c in word)):
+            continue
+        if word.startswith("0x") and len(word) > 3:  # a hexadecimal constant: never spoken so
+            continue
+        if len(word) > 4 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        out.append(word)
+    return out
+
+
+def slide_match(slides: list[str], transcript: str, window: int = MATCH_WINDOW) -> dict:
+    """How well a slide deck matches a transcript, computed in code before any model call.
+
+    The transcript is cut into windows of `window` words (half overlapping); each slide is
+    compared with every window by TF-IDF cosine (sublinear term frequency, IDF over the
+    windows and the slides together, so that a word said everywhere or printed on every slide
+    weighs little and a slide term the teacher never says weighs much). A slide's score is
+    its best cosine, and its place is the span of that window, as a share of the transcript
+    (0.0 = start, 1.0 = end). A slide with no content word (a blank page, a title page with
+    only a number) is not scored.
+
+    Calibrated on real pairs (November 2026, see `docs/research-notes.md`): a deck with its
+    own lecture's transcript has 67 to 96 % of its slides at or above `MATCH_SLIDE`; a deck of
+    another lecture, of the same course or not, 0 to 21 %. `MATCH_DECK` lies between.
+
+    Returns {"score": share of the scored slides that match, "matched", "scored", "low":
+    whether the deck seems to belong to another lecture, "threshold": MATCH_DECK, "slides":
+    [{"slide", "title", "score", "start", "end", "words", "matched"}]}, slides numbered from
+    1; "words" is the [first, last) range of the best window in the transcript's words."""
+    words = transcript.split()
+    step = max(1, window // 2)
+    spans = [(i, min(len(words), i + window)) for i in range(0, max(1, len(words) - step), step)]
+    windows = [Counter(_match_tokens(" ".join(words[a:b]))) for a, b in spans]
+    decks = [Counter(_match_tokens(s)) for s in slides]
+    documents = windows + [d for d in decks if d]
+    frequency = Counter(t for d in documents for t in d)
+    n = len(documents)
+
+    def vector(counts: Counter) -> dict[str, float]:
+        v = {t: (1 + math.log(c)) * math.log((1 + n) / (1 + frequency[t])) + 1e-9
+             for t, c in counts.items()}
+        norm = math.sqrt(sum(x * x for x in v.values())) or 1.0
+        return {t: x / norm for t, x in v.items()}
+
+    window_vectors = [vector(w) for w in windows]
+    result = []
+    for number, counts in enumerate(decks, 1):
+        if not counts:
+            result.append({"slide": number, "title": "", "score": None, "start": None,
+                           "end": None, "words": None, "matched": None})
+            continue
+        v = vector(counts)
+        scores = [sum(x * w.get(t, 0.0) for t, x in v.items()) for w in window_vectors]
+        best = max(range(len(scores)), key=scores.__getitem__)
+        a, b = spans[best]
+        total = max(1, len(words))
+        title = next((line.strip() for line in slides[number - 1].splitlines()
+                      if _letters(line) >= 3), "")
+        result.append({"slide": number, "title": title[:80], "score": round(scores[best], 3),
+                       "start": round(a / total, 2), "end": round(b / total, 2),
+                       "words": [a, b], "matched": scores[best] >= MATCH_SLIDE})
+    scored = [r for r in result if r["score"] is not None]
+    matched = sum(r["matched"] for r in scored)
+    share = matched / len(scored) if scored else 1.0
+    return {"score": round(share, 2), "matched": matched, "scored": len(scored),
+            "low": bool(scored) and share < MATCH_DECK, "threshold": MATCH_DECK,
+            "slides": result}
 
 
 _FR_WORDS = {"le", "la", "les", "des", "est", "et", "que", "une", "dans", "pour", "pas", "sur",

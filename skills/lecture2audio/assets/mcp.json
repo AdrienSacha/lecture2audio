@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "lecture2audio": {
+      "command": "lecture2audio",
+      "args": ["mcp", "--out", "/absolute/path/to/out"]
+    }
+  }
+}

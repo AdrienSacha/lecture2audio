@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -24,16 +25,17 @@ from .flow import Flow
 from .course import CoursePipeline, course_report
 from .course_render import write_vault
 from .series import load_lecture, merge_termbases, series_report
+from .library import Library, LibraryError
 from .llm import PRESETS, FakeLLM, LLMError, dry_run_handler, make_llm, research_loop
 from .web import SEARCH_ENGINES, FetchError, make_search, pick_engine
 from . import latex, project as project_stage, recitation, slides as slides_stage
 from .pipeline import PipelineError, TextPipeline, chapter_titles, load_prompts
-from .report import (write_glossary, write_index, write_questions, write_reference,
-                     write_report, write_script)
+from .report import (MISMATCH_TAG, slide_match_warning, write_glossary, write_index,
+                     write_questions, write_reference, write_report, write_script)
 from .segment import split_units
 from .sources import (AUDIO_EXT, detect_language, discover_inputs, garbled_share, input_kind,
-                      load_glossary,
-                      load_slides, load_transcript, merge_overlays, slide_units, slugify)
+                      load_glossary, load_slides, load_transcript, merge_overlays, slide_match,
+                      slide_units, slugify)
 from .transcribe import STTError, available as stt_available, transcribe_audio
 from .tts import TTSError, make_tts
 
@@ -79,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--out", default="out", help="output folder (default: ./out)")
         p.add_argument("--slides", help="slides as PDF (needs pypdf), PowerPoint (needs "
                                         "python-pptx) or text, optional")
+        p.add_argument("--slides-all", action="store_true",
+                       help="use every slide even when the slides seem to belong to another "
+                            "lecture (by default only the slides that match the transcript "
+                            "are then used, so the gap search does not add another lecture)")
         p.add_argument("--ocr", action=argparse.BooleanOptionalAction, default=True,
                        help="read by OCR the PDF pages that have no text and the pictures of "
                             "PowerPoint slides (default: on when installed, uv pip install -e "
@@ -261,8 +267,10 @@ def _llms(args):
     return rewrite_llm, verify_llm
 
 
-def _researcher(args, llm):
-    """(researcher function, None) or (None, why the gaps are not searched)."""
+def _researcher(args, llm, shelf=None):
+    """(researcher function, None) or (None, why the gaps are not searched). `shelf` is the
+    reference library (library.Library with books, or None): the research loop offers it
+    first, and alone when no web search engine is set up."""
     mode = args.research
     if mode == "off":
         return None, "web research was turned off (--research off)"
@@ -277,15 +285,19 @@ def _researcher(args, llm):
         raise SystemExit(f"--research loop needs a model that calls tools through an "
                          f"OpenAI-compatible API; with --llm {args.llm} use --research native.")
     engine = pick_engine(args.search, args.llm, args.searxng_url)
-    if engine is None:
+    if engine is None and shelf is None:
         return None, ("no search engine is set up for the research loop: set TAVILY_API_KEY, "
                       "BRAVE_API_KEY or DEEPSEEK_API_KEY, or give --searxng-url")
-    try:
-        search = make_search(engine, base_url=args.searxng_url)
-    except FetchError as exc:
-        raise SystemExit(str(exc)) from None
+    if engine is None:
+        def search(query):
+            raise FetchError("no web search engine is set up; use the reference library")
+    else:
+        try:
+            search = make_search(engine, base_url=args.searxng_url)
+        except FetchError as exc:
+            raise SystemExit(str(exc)) from None
     return (lambda system, user: research_loop(llm, system, user, search,
-                                               args.research_depth)), None
+                                               args.research_depth, library=shelf)), None
 
 
 def _transcript(args, work: Path, glossary: str, log, read=load_slides) -> str:
@@ -468,6 +480,19 @@ def run(args, series: dict | None = None) -> int:
     units = split_units(text)
     if not units:
         raise SystemExit("The transcript is empty.")
+    match = None
+    if slides and kind != "slides":  # do the slides belong to this lecture? (code, no model)
+        match = slide_match(slides, text)
+        match["kept_all"] = bool(getattr(args, "slides_all", False))
+        (work / "slide_match.json").write_text(json.dumps(match, indent=1), encoding="utf-8")
+        if match["low"]:
+            log(f"{MISMATCH_TAG} {slide_match_warning(match)} (see report.md)")
+            if not match["kept_all"]:  # blank, not drop, so that slide numbers do not move
+                slides = [s if r["matched"] else "" for s, r in zip(slides, match["slides"])]
+                slides = slides if any(s.strip() for s in slides) else []
+        elif match["matched"] < match["scored"]:
+            log(f"[slides] {match['matched']} of {match['scored']} slides match the transcript; "
+                "the others are listed in report.md")
     fingerprint = hashlib.sha1(json.dumps([args.max_part_words, units, slides, glossary])
                                .encode()).hexdigest()
     marker = work / "fingerprint.txt"
@@ -480,11 +505,14 @@ def run(args, series: dict | None = None) -> int:
     before = start & stages.present(work)
     log(f"{len(text.split())} words, {len(units)} units, language: {language}")
 
-    researcher, research_note = _researcher(args, rewrite_llm)
+    shelf = Library.existing()  # the reference library; None when empty, missing or off
+    if shelf is not None:
+        log(f"[library] {shelf.size()} book(s) in the reference library, searched before the web")
+    researcher, research_note = _researcher(args, rewrite_llm, shelf)
     pipeline = TextPipeline(work, language, rewrite_llm, verify_llm,
                             load_prompts(language, args.prompts_dir), glossary, slides,
                             args.max_retries, log, args.max_part_words, args.workers,
-                            researcher, kind if kind == "slides" else "transcript")
+                            researcher, kind if kind == "slides" else "transcript", shelf)
     track("outline")
     outline = pipeline.run_outline(units)
     log(f"[outline] {len(outline.parts)} part(s), "
@@ -729,7 +757,7 @@ def run(args, series: dict | None = None) -> int:
                                        "unledgered": [(r["part"], i) for r in records
                                                       for i in r["issues"]
                                                       if i["type"] == "unledgered"]},
-                     factcheck, _asr_notes(work), ocr_notes)
+                     factcheck, _asr_notes(work), ocr_notes, match)
         override = {}
         if kind != "recording":
             override["transcribe"] = ("read from the slides (no recording, no transcript)"
@@ -895,14 +923,75 @@ def key_main(argv: list[str]) -> int:
         return 1
 
 
+def library_main(argv: list[str]) -> int:
+    """`lecture2audio library add|list|remove|search`: the reference library (library.py)."""
+    from . import library
+    parser = argparse.ArgumentParser(
+        prog="lecture2audio library",
+        description="Your own reference books (course textbooks, reference PDFs), searched "
+                    "before the web to fill the gaps of a lecture. A fact from a book is kept "
+                    "only if its quote is found word for word in the page, and it is cited as "
+                    "\"Title, p. N\". The index stays on this machine (L2A_LIBRARY moves it); "
+                    "the passages a run uses are sent to the model provider.")
+    sub = parser.add_subparsers(dest="action", required=True)
+    add = sub.add_parser("add", help="add PDF files (the same file twice is added once)")
+    add.add_argument("files", nargs="+")
+    add.add_argument("--title", help="the title to cite (one file only; default: the file name)")
+    sub.add_parser("list", help="list the books")
+    remove = sub.add_parser("remove", help="remove a book")
+    remove.add_argument("book", help="the book id shown by `library list`")
+    find = sub.add_parser("search", help="search the pages of every book")
+    find.add_argument("query")
+    find.add_argument("-k", type=int, default=5, help="number of pages (default 5)")
+    args = parser.parse_args(argv)
+    try:
+        shelf = Library.default()
+        if shelf is None:
+            raise LibraryError("the library is turned off (L2A_LIBRARY=off)")
+        if args.action == "add":
+            if args.title and len(args.files) > 1:
+                raise LibraryError("--title names one book: give one file with it")
+            for item in shelf.add(args.files, args.title):
+                extra = "".join(f", {item[k]} page(s) {what}" for k, what in
+                                (("ocr_pages", "read by OCR"), ("empty_pages", "without text"))
+                                if item.get(k))
+                print(f"{item['book']}: \"{item['title']}\", {item['pages']} page(s){extra} "
+                      f"({item['status']})")
+            print(f"Library: {shelf.file}")
+        elif args.action == "list":
+            books = shelf.list()
+            for b in books:
+                print(f"{b['book']:<30} {b['pages']:>5} p.  {b['title']}")
+            print(f"{len(books)} book(s) in {shelf.file}")
+        elif args.action == "remove":
+            if not shelf.remove(args.book):
+                raise LibraryError(f"no book with the id {args.book} (see `library list`)")
+            print(f"{args.book} removed.")
+        else:
+            hits = shelf.search(args.query, args.k)
+            for h in hits:
+                print(f"[{h['source']}] {library.citation(h['title'], h['page'])}\n    {h['text']}")
+            if not hits:
+                print("No page matches.")
+        return 0
+    except (LibraryError, OSError, sqlite3.Error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv=None) -> None:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] == "key":  # API keys in ~/.lecture2audio.env (keys.py)
         sys.exit(key_main(argv[1:]))
+    if argv and argv[0] == "library":  # the reference library (library.py)
+        sys.exit(library_main(argv[1:]))
     keys.load()  # saved keys fill the variables the shell left unset
     if argv and argv[0] == "app":  # the local web app: drop the files, watch the run, read
         from .app import main as app_main
         sys.exit(app_main(argv[1:]))
+    if argv and argv[0] == "mcp":  # the MCP server over stdio, for other agents (ADR-0008)
+        from .mcp_server import main as mcp_main
+        sys.exit(mcp_main(argv[1:]))
     if argv and argv[0] not in (*COMMANDS, "-h", "--help"):
         argv = ["build", *argv]  # zero friction: `lecture2audio ./lecture_folder/`
     args = build_parser().parse_args(argv)
