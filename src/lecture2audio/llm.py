@@ -62,6 +62,33 @@ EFFORT_MODELS = re.compile(r"claude-(fable|mythos|opus-5|sonnet-5|haiku-5|opus-4
 CUT_OFF = "The answer was cut off ({}). Use a smaller --max-part-words."
 
 
+# Requests in flight per model, shared by every client of that model in the process (the
+# writer, the checker, the research loops and the audits draw from the same pool). DeepSeek
+# allows 2,500 concurrent requests per account for deepseek-flash and 500 for deepseek-v4-pro,
+# with no per-minute limit (ADR-0006); the pools stay well under that. A 429 is retried by the
+# SDKs, which back off and honour retry-after. L2A_CONCURRENCY overrides every pool.
+CONCURRENCY = {"deepseek-flash": 64, "deepseek-v4-pro": 32}
+DEFAULT_CONCURRENCY, LOCAL_CONCURRENCY = 16, 4
+_pools: dict[tuple[str, str], threading.BoundedSemaphore] = {}
+_pools_lock = threading.Lock()
+
+
+def concurrency(model: str, local: bool = False) -> int:
+    override = os.environ.get("L2A_CONCURRENCY", "")
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    return LOCAL_CONCURRENCY if local else CONCURRENCY.get(model, DEFAULT_CONCURRENCY)
+
+
+def slot(base_url: str, model: str, local: bool = False) -> threading.BoundedSemaphore:
+    """The pool of request slots of one model on one host."""
+    with _pools_lock:
+        key = (base_url, model)
+        if key not in _pools:
+            _pools[key] = threading.BoundedSemaphore(concurrency(model, local))
+        return _pools[key]
+
+
 class LLM:
     """Base class. Subclasses call `_count` so that the report can show the cost of a run."""
     name = "llm"
@@ -216,7 +243,8 @@ class AnthropicLLM(LLM):
         if self.fallbacks:
             params["betas"], params["fallbacks"] = [FALLBACK_BETA], "default"
         try:
-            with trace.call("model", host=self.base_url, **params) as record, \
+            with slot(self.base_url, self.model), \
+                    trace.call("model", host=self.base_url, **params) as record, \
                     self._errors(), self.client.beta.messages.stream(**params) as stream:
                 for event in stream:  # the trace counts what arrives; nothing else is done
                     record.feed(event)
@@ -376,7 +404,8 @@ class OpenAICompatLLM(LLM):
             if self.extra:
                 request["extra_body"] = self.extra
             try:
-                with trace.call("model", host=self.base_url, **request) as record, \
+                with slot(self.base_url, self.model, self.provider == "local"), \
+                        trace.call("model", host=self.base_url, **request) as record, \
                         self._errors(), self.client.chat.completions.stream(**request) as stream:
                     for event in stream:  # the trace counts what arrives
                         record.feed(event)
@@ -499,7 +528,8 @@ class OpenAILLM(OpenAICompatLLM):
                        tools=[{"type": "web_search", "search_context_size": "high"}],
                        include=["web_search_call.action.sources"], max_tool_calls=depth,
                        max_output_tokens=max_tokens + self.reasoning_room)
-        with trace.call("model", host=self.base_url, **request) as record, self._errors():
+        with slot(self.base_url, self.model), \
+                trace.call("model", host=self.base_url, **request) as record, self._errors():
             with self.client.responses.create(**request) as stream:
                 for event in stream:
                     record.feed(event)

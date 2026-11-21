@@ -60,13 +60,26 @@ def html_to_text(raw: str) -> str:
     return re.sub(r"\n\s*\n+", "\n\n", text).strip()
 
 
+def _tls():
+    """Certificates from certifi when it is installed (it comes with httpx): a Python from
+    python.org on macOS has no system certificates, and every https page then fails."""
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
 def _pdf_text(data: bytes) -> str:
     try:
         import io
+        import logging
 
         from pypdf import PdfReader
     except ImportError as exc:
         raise FetchError("the page is a PDF and pypdf is not installed") from exc
+    logging.getLogger("pypdf").setLevel(logging.ERROR)  # repairs of broken PDFs are not news
     reader = PdfReader(io.BytesIO(data))
     return "\n".join((page.extract_text() or "") for page in reader.pages)
 
@@ -75,7 +88,8 @@ def fetch_page(url: str, timeout: float = 20) -> str:
     """The text of a public page (HTML, plain text, or PDF if pypdf is installed)."""
     if not public_url(url):
         raise FetchError(f"not a public http(s) address: {url}")
-    opener = urllib.request.build_opener(_CheckedRedirect)
+    opener = urllib.request.build_opener(_CheckedRedirect,
+                                         urllib.request.HTTPSHandler(context=_tls()))
     request = urllib.request.Request(url, headers={"user-agent": USER_AGENT,
                                                    "accept": "text/html,text/plain,application/pdf"})
     try:
@@ -140,7 +154,7 @@ def _json_request(url: str, payload: dict | None, headers: dict, timeout: float 
                                      method="POST" if data is not None else "GET")
     try:
         with trace.call("search", url=url, payload=payload) as record, \
-                urllib.request.urlopen(request, timeout=timeout) as response:
+                urllib.request.urlopen(request, timeout=timeout, context=_tls()) as response:
             record["answer"] = json.loads(response.read().decode("utf-8"))
             return record["answer"]
     except urllib.error.HTTPError as exc:

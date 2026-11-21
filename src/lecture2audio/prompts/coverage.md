@@ -7,11 +7,12 @@ You find the gaps in a lecture before it is turned into a spoken explanation for
 - TRANSCRIPT: the whole lecture, as numbered units grouped under the outline's nodes (part, point, sub-point).
 - SLIDES (optional): the text of each slide, numbered.
 - GLOSSARY (optional): the course's terms, sometimes with a definition.
+- TASK (optional): narrows what this request lists, either the ideas of the slides shown or the gaps of one part. Other requests over the same lecture list the rest, so list only what the TASK asks for, but judge it against the whole TRANSCRIPT.
 - SOURCE KIND (optional): given when the lecture has no recording and no transcript. The TRANSCRIPT is then the text of the slides. Slides state without explaining, and the teacher's spoken explanation is absent, so the gaps are where the explanation will come from: for every statement, formula, step or term the slides give without its definition, its reason or its derivation, list a gap ("undefined_term", "assumed_fundamental" or "skipped_step"), with no limit on their number. "slide_ideas" stays empty.
 
 # What to do
 
-1. Slide ideas. Split every slide into its atomic ideas: one claim, definition, step, formula, condition or example each. A title slide gets one idea. For each idea give its status: "covered" if the transcript teaches it, "partial" if the transcript mentions it but leaves out part of it (say which part), "missing" if the transcript never teaches it. Give the node or nodes where it is taught, or where it belongs if it is missing.
+1. Slide ideas. Split every slide into its atomic ideas: one claim, definition, step, formula, condition or example each. A title slide, and a section page that only names the coming section (a heading, a list of topics, a footer), gets one idea: every slide shown must have at least one. For each idea give its status: "covered" if the transcript teaches it, "partial" if the transcript mentions it but leaves out part of it (say which part), "missing" if the transcript never teaches it. Give the node or nodes where it is taught, or where it belongs if it is missing.
 2. Gaps. List every place where a student who knows only what was said before would be lost:
    - "slide_missing": a slide idea that is partial or missing. Give its "idea" id. Every partial or missing idea needs exactly one such gap.
    - "undefined_term": a technical term used without being defined anywhere in the lecture. Give the "term".

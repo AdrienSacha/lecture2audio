@@ -67,7 +67,7 @@ def write_glossary(path: Path, name: str, outline: Outline, terms: list[dict]) -
              "order in which the audio defines them.", ""]
     if not terms:
         lines += ["The termbase is empty: no technical term was found, or the termbase step "
-                  "failed (see termbase.json).", ""]
+                  "failed (see report.md).", ""]
     for term in terms:
         if term.get("from_series"):
             lines.append(f"**{term['term']}** (defined in the lecture {term['from_series']}). "
@@ -403,7 +403,14 @@ def _gap_lines(outline: Outline, gaps: dict) -> list[str]:
     coverage, research = gaps["coverage"], gaps["research"]
     lines = ["## Gaps in the lecture and how they were filled", ""]
     if coverage.get("error"):
-        lines += [f"The gap search failed: {coverage['error']}", ""]
+        lines += [f"The gap search failed: {coverage['error']} It runs again on the next run.",
+                  ""]
+    if coverage.get("unlisted_slides"):
+        lines += [f"Slides {coverage['unlisted_slides']} have no idea listed, even after they "
+                  "were asked for alone; whether the lecture teaches them was not checked.", ""]
+    for chunk in coverage.get("failed_chunks", []):
+        lines += [f"The gap search of {chunk['label']} failed: {chunk['error']} Its gaps are "
+                  "missing from this run; it is asked again, alone, on the next run.", ""]
     ideas = coverage.get("slide_ideas", [])
     if ideas:
         counts = {s: sum(i["status"] == s for i in ideas) for s in ("covered", "partial", "missing")}
@@ -457,6 +464,9 @@ def _gap_lines(outline: Outline, gaps: dict) -> list[str]:
 
 def _term_summary(gaps: dict) -> list[str]:
     terms = gaps.get("terms") or []
+    if gaps.get("terms_error"):
+        return [f"The termbase step failed: {gaps['terms_error']} It runs again on the next run.",
+                ""]
     if not terms:
         return []
     assumed = [t["term"] for t in terms if not t["in_lecture"]]

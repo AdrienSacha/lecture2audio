@@ -135,6 +135,11 @@ def item_fields(item) -> dict:
     if hasattr(item, "id") and hasattr(item, "title") and hasattr(item, "children"):
         return {"part": str(item.id), "part_title": item.title}
     if isinstance(item, dict):
+        if item.get("kind") == "slides" and item.get("slides"):  # a slide range of the gap search
+            span = item["slides"]
+            label = (f"slides {span[0]}-{span[-1]}" if isinstance(span, (list, tuple))
+                     else f"slides {span}")
+            return {"item": label}
         if item.get("id") and item.get("node") is not None and "query" in item:  # a gap
             return {"gap": str(item["id"]), "part": str(item["node"]).split(".")[0]}
         if item.get("part") is not None:
