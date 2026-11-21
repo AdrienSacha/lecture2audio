@@ -1,38 +1,29 @@
 # Control room: state of the work
 
+Design: `docs/adr/0005-trace-and-control-room.md`. Screenshots: `docs/screenshots/`.
+
 ## Done
-- `trace.py`: every request is a `start` line and an `end` line with the same `id`, plus `progress`
-  lines (about once a second: characters of reasoning and answer received, the last words) while a
-  model streams. Each line carries its context: stage (from `stages.Tracker`), part (or gap, or
-  slide), role and prompt, seat (writer or checker model), attempt, repair, try, audit,
-  conversation and turn of a research loop, and `parent` (the call that caused it). `gate` lines
-  record the code checks on an answer; a `run` line (with the pid) opens each session. The dry
-  model is recorded too (host "dry"). Keys are redacted; a file the trace cannot write is ignored.
-- Context is a ContextVar: `TextPipeline._map` and `slides.read_slides` copy it per item, so
-  parallel parts never mix. `_ask_json` names the prompt and the seat; the retry loops of the script,
-  the cards and the recitation set the attempt and the repair; the research loops link turns and
-  their searches and pages.
+- `trace.py`: start, progress (about once a second while streaming) and end lines per request,
+  with id, parent and context (stage, part, role, prompt, seat, attempt, repair, try, audit,
+  conversation, turn); `gate` lines for code checks; a `run` line with the pid per session. The
+  dry model is recorded too (host "dry"). Keys redacted; an unwritable file is ignored.
+- Context propagation: `TextPipeline._map`, `slides.read_slides`, and the audits run beside the
+  main path (`cli.beside`) copy the context per item; the research loops link turns and tools.
 - `events.jsonl` lines carry a time.
-- `room.py` + endpoints in `app.py`: `/api/room/runs`, `/api/room/stream` (SSE: hello with the stage
-  graph, stages, call summaries with byte offsets, the idea graph, whether a process is working on
-  the run, read with `ps`, never signalled), `/api/room/detail` (full lines at given offsets, only
-  line starts). Only run folders under the output folder; keys redacted again.
-- The run screen gets a `snapshot` event on (re)connection: the current state at once, no replay.
-- `assets/app.html`: the control room (Flow: stage graph, who talks to whom with calls in flight,
-  timeline; Ideas: the idea ledger as a graph by part with status colours; an inspector with the
-  full prompt, answer, reasoning, linked calls; an "in flight now" list with timers; counters; a
-  process pill). Buttons: header "Control room" (shows "Live: ..." for a run started on the
-  command line), "Watch the AI work" on the run screen, "What the AI did" on the done screen.
-- `tests/room_fixture.py`: a made-up run (research loop, parallel parts, repair, rejected answer,
-  model error), at once or live (`--live 6`).
-- Tests: `tests/test_trace.py`, `RoomTest` in `tests/test_app.py`, trace tests in `test_llm.py`.
+- `room.py` and `/api/room/runs`, `/api/room/stream`, `/api/room/detail` in `app.py`: run
+  folders only, Host/Origin checks, keys redacted again, summaries cached per file so a reload is
+  instant, process state from `ps` (read only), the stage of an untimed last line dated by the
+  file's modification time.
+- The run screen gets one `snapshot` event on (re)connection, not a replay.
+- The control room in `assets/app.html`: stage graph, who talks to whom with calls in flight,
+  timeline, an "in flight now" list with timers and streamed characters, a process pill, the idea
+  graph, an inspector with the full prompt, answer, reasoning and linked calls.
+- `tests/room_fixture.py` writes a made-up run, at once or live (`--live 6`).
 
 ## Left
-- Restart the scratch server and check the process pill (the server running during the last test
-  still had the old app.py loaded).
-- Test for the run screen snapshot with a job in progress.
-- ADR-0005 and docs/research-notes.md entry; CLAUDE.md conventions (in the report only).
-- Screenshots in docs/screenshots/.
+- First open of a very large trace (about 90 MB) takes about 6 s (JSON parsing); reloads are
+  instant.
+- The progress lines stay in the server's summary cache (about 30 MB on a ten-hour run).
 
 ## How to resume
 - Env: `uv venv /tmp/l2a-trace-venv && VIRTUAL_ENV=/tmp/l2a-trace-venv uv pip install -e .`
