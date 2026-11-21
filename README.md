@@ -88,9 +88,18 @@ Voice, Whisper and PDF reading are optional extras (`".[voice,whisper-mac,pdf]"`
 | `openrouter`, `kimi`, `compat` | `OPENROUTER_API_KEY`, `MOONSHOT_API_KEY`, `L2A_COMPAT_API_KEY` | `--rewrite-model` is required; `compat` also needs `--base-url` |
 | `local` | none | Any OpenAI-compatible server, with `--rewrite-model` |
 
+## Use from other agents
+
+lecture2audio can be driven by another agent in two standard forms (ADR-0008).
+
+- **Agent Skill**: `skills/lecture2audio/` follows the [Agent Skills specification](https://agentskills.io/specification). Copy or link it into the agent's skills folder (for Claude Code, `~/.claude/skills/lecture2audio`). Its script `scripts/run.py` runs the command line and prints a short summary of the run; `references/` explains the stages, the options and every output file.
+- **MCP server**: install the extra with `uv pip install -e '.[mcp]'`, then register `lecture2audio mcp --out /absolute/path/to/out` in the host. In Claude Code: `claude mcp add --scope user lecture2audio -- /path/to/.venv/bin/lecture2audio mcp --out /path/to/out`. In Cursor or Claude Desktop, add the block of `skills/lecture2audio/assets/mcp.json` to `mcp.json` or `claude_desktop_config.json`. The tools are `build` (returns a run name at once), `status`, `list_runs`, `read_result` and `stop_run`; the result files are also resources at `lecture2audio://runs/{run}/{file}`.
+
+API keys never pass through the agent: the runs read them from the environment, as the command line does.
+
 ## Status
 
-- The test suite has 284 tests and runs offline with no key and no model; it needs ffmpeg. One test is skipped. Run it with `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`.
+- The test suite has 315 tests and runs offline with no key and no model; it needs ffmpeg. One test is skipped. Run it with `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`.
 - Not tested: real calls to any provider (the tests use the dry model and a scripted harness), real voices, and Whisper transcription.
 - The prompts have not been tuned on real lectures. `tests/real_data.py` can fetch MIT OpenCourseWare material to try them on.
 - There are no evaluation numbers and no baseline yet. The planted-omission audits tell you whether a checker noticed one fault in a given run, not how often the pipeline loses an idea.
