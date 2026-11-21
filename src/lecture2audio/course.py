@@ -19,7 +19,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from . import enrich
+from . import enrich, trace
 from .course_schema import MAX_PARAGRAPHS, Card, Cards, Exercise, describe
 from .outline import Node, Outline, render_outline
 from .pipeline import (_NUMBER, SOFT_ISSUES, NumberIndex, TextPipeline, _and, _section, blocking,
@@ -579,10 +579,13 @@ class CoursePipeline:
                               for i in start.get("ideas", [])]}
         for _ in range(self.p.max_retries + 1 if tries is None else tries):
             attempts += 1
-            cards, exercises = self._write(outline, ctx, record, feedback)
-            if scope and best is not None:  # a bounded repair keeps every card that passed
-                cards, exercises = splice_cards(best, cards, exercises, scope, ctx["nodes"])
-            judged, ideas = self._judge(ctx, record, outline, cards, exercises)
+            with trace.context(attempt=(start or {}).get("attempts", 0) + attempts,
+                               repair=scope_words(scope) if scope else
+                               ("all cards" if attempts > 1 or start else None)):
+                cards, exercises = self._write(outline, ctx, record, feedback)
+                if scope and best is not None:  # a bounded repair keeps every card that passed
+                    cards, exercises = splice_cards(best, cards, exercises, scope, ctx["nodes"])
+                judged, ideas = self._judge(ctx, record, outline, cards, exercises)
             issues = card_issues(cards, ctx, language) + question_issues(cards, exercises) + judged
             count = len([i for i in issues if i["type"] not in SOFT])
             better = count <= best["blocking"] if (start and attempts == 1) else (
@@ -738,6 +741,7 @@ class CoursePipeline:
                     for c in cold]
         return parts, cold
 
+    @trace.tagged(audit="audit_judge")
     def audit_judge(self, outline: Outline, parts: list[dict], by_part: dict) -> dict:
         """Empty, in an accepted part, the one card that teaches an idea (it keeps its title
         and its claim to the idea), and ask the judge again. The judge's own verdict is scored,

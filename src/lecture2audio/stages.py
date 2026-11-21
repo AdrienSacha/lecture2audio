@@ -20,6 +20,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import trace
+
 
 @dataclass(frozen=True)
 class Stage:
@@ -176,6 +178,7 @@ class Tracker:
             raise ValueError(f"{name} is not a stage of stages.STAGES")
         self.finish()
         self.current, self._began = name, time.monotonic()
+        trace.set_stage(name)  # every call made from now on says which stage it serves
         self._emit({"stage": name, "state": "running"})
 
     def finish(self) -> None:
@@ -186,11 +189,13 @@ class Tracker:
             self._emit({"stage": self.current, "state": "done",
                         "seconds": round(self.seconds[self.current], 1)})
             self.current = None
+            trace.set_stage(None)
 
     def _emit(self, event: dict) -> None:
         line = json.dumps(event)
+        stamped = json.dumps({**event, "time": round(time.time(), 3)})  # for the timeline
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+            handle.write(stamped + "\n")
         if self._announce:
             print("@@stage " + line, flush=True)
 

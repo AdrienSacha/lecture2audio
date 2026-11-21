@@ -28,12 +28,13 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import keys, stages
+from . import keys, room, stages
 from .sources import discover_inputs, slugify
 
 ASSETS = Path(__file__).parent / "assets"
@@ -149,6 +150,7 @@ class Job:
         self.state: dict[str, str] = {}  # stage -> running | done
         self.progress: dict[str, float] = {}
         self.current: str | None = None
+        self.started: float | None = None  # time.time() when the run started
 
     def emit(self, event: dict) -> None:
         with self.changed:
@@ -157,7 +159,7 @@ class Job:
 
     def public(self) -> dict:
         return {"job": self.id, "status": self.status, "name": self.name, "mode": self.mode,
-                "expected": self.expected}
+                "expected": self.expected, "started": self.started}
 
 
 class App:
@@ -268,6 +270,7 @@ class App:
             # a run that stopped starts again from its saved stages, with a fresh event list
             job.events, job.state, job.progress = [], {}, {}
             job.current, job.cancelled, job.status = None, False, "running"
+            job.started = time.time()
         try:
             job.process = subprocess.Popen(
                 command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -556,7 +559,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._route({"/": self._page, "/api/config": self._config, "/api/inputs": self._inputs,
                      "/api/events": self._events, "/api/runs": self._runs,
-                     "/api/runs/": self._run, "/files/": self._file})
+                     "/api/runs/": self._run, "/files/": self._file,
+                     "/api/room/runs": self._room_runs, "/api/room/stream": self._room_stream,
+                     "/api/room/detail": self._room_detail})
 
     do_HEAD = do_GET
 
@@ -580,7 +585,7 @@ class Handler(BaseHTTPRequestHandler):
             (j for j in reversed(list(self.app.jobs.values())) if j.status != "new"), None)
         self._json({
             "stages": [{"name": s.name, "label": LABELS.get(s.name, s.name.capitalize()),
-                        "about": s.about} for s in stages.STAGES],
+                        "about": s.about, "needs": list(s.needs)} for s in stages.STAGES],
             "providers": [{"id": pid, "label": label, "key": needs_key, "models": needs_models,
                            # where the key in use comes from, never the key itself
                            "has_key": bool(os.environ.get(KEY_ENV.get(pid, ""))),
@@ -616,6 +621,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+        if not sent:
+            # a page that opens (or reloads) gets where the run is now in one event, not a
+            # replay of everything since the start; the end, if any, follows it
+            with job.changed:
+                events = list(job.events)
+                done = bool(events) and events[-1]["type"] == "end"
+                snapshot = {"type": "snapshot", **job.public(), "stages": dict(job.state),
+                            "progress": dict(job.progress), "current": job.current,
+                            "log": [e["line"] for e in events if e["type"] == "log"][-400:]}
+            sent = len(events) - (1 if done else 0)
+            self.wfile.write(f"id: {sent}\ndata: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
+                             .encode())
+            self.wfile.flush()
         while True:
             with job.changed:
                 if len(job.events) <= sent:
@@ -632,6 +650,107 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             if batch[-1]["type"] == "end":
                 return
+
+    # -- the control room: what the AI did in a run (room.py)
+    def _room_work(self, query: dict) -> Path:
+        work = room.run_folder(self.app.out, query.get("run") or "")
+        if work is None:
+            raise Refused(404, "No such run.")
+        return work
+
+    def _room_runs(self, _rest: str, _query: dict) -> None:
+        job = self.app.running()
+        found = room.runs(self.app.out)
+        listing = room.processes()
+        for run in found[:12]:  # the recent ones: is a process working on them now?
+            run["live"] = bool(job and job.name == run["name"]) or bool(
+                room.process(self.app.out / run["name"], listing)["alive"])
+        for run in found[12:]:
+            run["live"] = False
+        self._json({"runs": found, "running": job.name if job else None})
+
+    def _room_detail(self, _rest: str, query: dict) -> None:
+        """The full lines of calls.jsonl at the offsets given (`at=12,3456`)."""
+        work = self._room_work(query)
+        try:
+            offsets = [int(v) for v in (query.get("at") or "").split(",") if v.strip()]
+        except ValueError:
+            raise Refused(400, "Bad offsets.") from None
+        self._json({"records": room.details(work, offsets)})
+
+    def _room_stream(self, _rest: str, query: dict) -> None:
+        """Server-Sent Events: the stages, the calls (as summaries) and the idea graph of a
+        run, from the start of its files, then as they grow, until the page goes away."""
+        work = self._room_work(query)
+        calls, events = room.summaries_of(work), room.Tail(work / "events.jsonl")
+        count = 0  # summaries of calls.jsonl sent so far
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def send(data: dict) -> None:
+            self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+
+        job = self.app.running()
+        alive = ({"alive": True, "pid": job.process.pid if job.process else None}
+                 if job and job.name == work.name else room.process(work))
+        send({"t": "hello", "run": work.name, "title": room._title(work),
+              "graph": room.graph(), "parts": room.outline_parts(work),
+              "calls": (work / "calls.jsonl").is_file(), "process": alive})
+        self.wfile.flush()
+        signature, quiet, checked, alive_at = None, 0.0, 0.0, time.monotonic()
+        while True:
+            sent = False
+            batch = events.lines()
+            if events.reset:
+                send({"t": "reset"})
+                sent = True
+            if batch:
+                try:
+                    mtime = (work / "events.jsonl").stat().st_mtime
+                except OSError:
+                    mtime = None
+                send({"t": "stages", "items": room.stage_events(batch, mtime)})
+                sent = True
+            calls.read()  # at most 8 chunks per pass, so stages stay current
+            items, total = calls.since(count)
+            if total < count:  # the file was rewritten: start again
+                send({"t": "calls-reset"})
+                items, total = calls.since(0)
+            count = total
+            for k in range(0, len(items), 1500):
+                send({"t": "calls", "items": items[k:k + 1500]})
+                sent = True
+            now = time.monotonic()
+            if now - alive_at >= 5:  # is a process still working on this run?
+                alive_at = now
+                job = self.app.running()
+                state = ({"alive": True, "pid": job.process.pid if job.process else None}
+                         if job and job.name == work.name else room.process(work))
+                if state != alive:
+                    alive = state
+                    send({"t": "process", **state})
+                    sent = True
+            if now - checked >= 2:
+                checked = now
+                new = room.idea_signature(work)
+                if new != signature:
+                    signature = new
+                    send({"t": "ideas", **room.idea_map(work)})
+                    sent = True
+            if sent:
+                self.wfile.flush()
+                quiet = now
+                continue
+            if now - quiet >= 15:
+                self.wfile.write(b": waiting\n\n")  # finds a closed page
+                self.wfile.flush()
+                quiet = now
+            time.sleep(0.4)
 
     def _file(self, rest: str, query: dict) -> None:
         """A file of the output folder, with Range support so a player can seek."""

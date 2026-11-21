@@ -9,6 +9,7 @@ can be opened or edited by hand.
 """
 from __future__ import annotations
 
+import contextvars
 import copy
 import json
 import re
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from . import enrich
+from . import enrich, trace
 from . import library as books
 from .llm import LLM, LLMError, extract_json
 from .outline import (Node, Outline, checklist, dump, fallback_outline, moves, noise_by_part,
@@ -716,13 +717,21 @@ class TextPipeline:
     def _ask_json(self, llm: LLM, system: str, user: str, validate, what: str,
                   tries: int = 3) -> dict:
         note, best = "", None
-        for _ in range(tries):
-            raw = llm.complete(system, user + note)
-            try:
-                data = extract_json(raw)
-                errors = validate(data)
-            except ValueError as exc:
-                errors = [f"not valid JSON ({exc})"]
+        # The trace is told which prompt this is and which model seat sends it; it observes.
+        prompt = next((name for name, text in getattr(self.prompts, "__dict__", {}).items()
+                       if text == system), None)
+        seat = "checker" if llm is self.verify_llm and llm is not self.rewrite_llm else "writer"
+        for attempt in range(tries):
+            with trace.context(prompt=prompt, role=trace.ROLES.get(prompt), seat=seat,
+                               **{"try": attempt + 1 if attempt else None}):
+                raw = llm.complete(system, user + note)
+                try:
+                    data = extract_json(raw)
+                    errors = validate(data)
+                except ValueError as exc:
+                    errors = [f"not valid JSON ({exc})"]
+                trace.note("gate", parent=trace.last_id(), what=what, ok=not errors,
+                           errors=errors[:12])
             if not errors:
                 return data
             if best is None or len(errors) < len(best):  # feedback from the best attempt
@@ -737,15 +746,19 @@ class TextPipeline:
         """function(item) for every item, in parallel, results in order. `on_done(result)` is
         called as each item finishes (from its worker thread)."""
         def one(item):
-            result = function(item)
+            with trace.context(**trace.item_fields(item)):  # the part the calls serve
+                result = function(item)
             if on_done:
                 on_done(result)
             return result
 
+        # each item runs in its own copy of the caller's context (trace fields), taken here,
+        # in the calling thread, so that parallel parts never share or mix theirs
+        contexts = [contextvars.copy_context() for _ in items]
         if self.workers == 1 or len(items) < 2:
-            return [one(item) for item in items]
+            return [ctx.run(one, item) for ctx, item in zip(contexts, items)]
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            return list(pool.map(one, items))
+            return list(pool.map(lambda pair: pair[0].run(one, pair[1]), zip(contexts, items)))
 
     # -- stage 1: outline ----------------------------------------------------------
     def run_outline(self, units: list[str]) -> Outline:
@@ -1002,6 +1015,7 @@ class TextPipeline:
                 + _section("SLIDES", select_slides(self.slides, source) if self.slides else "")
                 + "## TRANSCRIPT OF THIS PART\n" + transcript)
 
+    @trace.tagged(audit="audit_ideas")
     def audit_ideas(self, outline: Outline) -> dict:
         """Plant one unmistakable fact in a copy of a part and list that part's ideas again: an
         extractor that does not list it may be dropping ideas, and the ledger only proves that
@@ -1039,6 +1053,7 @@ class TextPipeline:
         cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         return result
 
+    @trace.tagged(audit="audit_coverage")
     def audit_coverage(self, outline: Outline) -> dict:
         """Plant a hole in the lecture and see whether the gap search notices it, because a
         search that finds nothing might simply be blind."""
@@ -1136,7 +1151,8 @@ class TextPipeline:
                     self.library, [str(gap.get("query", "")), str(gap.get("term") or "")])))
                 + "## CONTEXT\n" + render_part_transcript(outline, part, [])[:8000])
         try:
-            text, documents = self.researcher(self.prompts.research, user)
+            with trace.context(prompt="research", role=trace.ROLES["research"], seat="writer"):
+                text, documents = self.researcher(self.prompts.research, user)
             data = extract_json(text)
             errors = enrich.validate_research(data)
             if errors:
@@ -1364,13 +1380,15 @@ class TextPipeline:
         best, feedback, attempts, scope, repairs = None, "", 0, None, []
         for _ in range(self.max_retries + 1):
             attempts += 1
-            result = self._rewrite(outline, ctx, feedback)
-            if scope:  # a bounded repair: only the sections at fault come from the new text
-                result = splice_repair(best["result"], result, scope)
-            issues = self._code_issues(ctx, result)
-            found, ideas = self._verify(outline, ctx, result)
-            issues += found
-            issues += self._check_terms(outline, ctx, result)
+            with trace.context(attempt=attempts, repair=scope_words(scope) if scope else
+                               ("whole part" if attempts > 1 else None)):
+                result = self._rewrite(outline, ctx, feedback)
+                if scope:  # a bounded repair: only the sections at fault come from the new text
+                    result = splice_repair(best["result"], result, scope)
+                issues = self._code_issues(ctx, result)
+                found, ideas = self._verify(outline, ctx, result)
+                issues += found
+                issues += self._check_terms(outline, ctx, result)
             count = len(blocking(issues))
             if best is not None:
                 repairs.append({"attempt": attempts, "scope": scope or "all",
@@ -1419,6 +1437,7 @@ class TextPipeline:
         return self._map(one, outline.parts, on_done)
 
     # -- checks on the whole lecture ---------------------------------------------------
+    @trace.tagged(audit="audit_verifier")
     def audit_verifier(self, outline: Outline, records: list[dict]) -> dict:
         """Plant an omission in an accepted part and see whether the verifier notices it."""
         cache = self.work_dir / "audit.json"

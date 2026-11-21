@@ -10,6 +10,7 @@ still fails. One call per slide, cached in slides/.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import re
 import shutil
@@ -18,6 +19,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from . import trace
 from .llm import LLM, LLMError
 from .sources import garbled_share, load_slides
 
@@ -101,8 +103,13 @@ def read_slides(path: str | Path, cache: Path, llm: LLM, log=print, workers: int
                      "are on the slide. Transcribe everything on it.")
         return layers[k], why  # not cached: the next run tries again
 
+    def traced(k: int):  # each slide's calls say which slide they read (trace)
+        with trace.context(item=f"slide {k + 1}", prompt="slide", role=trace.ROLES["slide"]):
+            return one(k)
+
+    contexts = [contextvars.copy_context() for _ in range(total)]
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        results = list(pool.map(one, range(total)))
+        results = list(pool.map(lambda k: contexts[k].run(traced, k), range(total)))
     fallback = [{"slide": k + 1, "why": why} for k, (_, why) in enumerate(results) if why]
     notes = {"mode": "vision", "model": llm.name, "slides": total, "fallback": fallback}
     (cache / "notes.json").write_text(json.dumps(notes, ensure_ascii=False, indent=2),

@@ -6,6 +6,7 @@ of course material, the audio, and the idea ledger `ideas.csv`."""
 from __future__ import annotations
 
 import argparse
+import contextvars
 import copy
 import hashlib
 import json
@@ -530,7 +531,15 @@ def run(args, series: dict | None = None) -> int:
     background = ThreadPoolExecutor(max_workers=3, thread_name_prefix="audit")
 
     def beside(function, *arguments):
-        return None if args.no_audit else background.submit(function, *arguments)
+        if args.no_audit:
+            return None
+        # the trace keeps the stage the audit belongs to while the main path moves on
+        stage, context = trace.current().get("stage"), contextvars.copy_context()
+
+        def audit():
+            with trace.context(stage=stage):
+                return function(*arguments)
+        return background.submit(context.run, audit)
 
     ideas_audit = beside(pipeline.audit_ideas, outline)
     track("gaps")
@@ -907,7 +916,10 @@ def main(argv=None) -> None:
         argv = ["build", *argv]  # zero friction: `lecture2audio ./lecture_folder/`
     args = build_parser().parse_args(argv)
     try:
-        sys.exit(run_series(args) if args.command == "series" else run(args))
+        try:
+            sys.exit(run_series(args) if args.command == "series" else run(args))
+        finally:
+            trace.close()  # a later run in the same process (tests) never writes here
     except KeyboardInterrupt:
         print("Interrupted. Run the same command again to continue where it stopped.",
               file=sys.stderr)
