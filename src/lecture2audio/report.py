@@ -408,6 +408,9 @@ def _gap_lines(outline: Outline, gaps: dict) -> list[str]:
     if coverage.get("unlisted_slides"):
         lines += [f"Slides {coverage['unlisted_slides']} have no idea listed, even after they "
                   "were asked for alone; whether the lecture teaches them was not checked.", ""]
+    for chunk in coverage.get("failed_chunks", []):
+        lines += [f"The gap search of {chunk['label']} failed: {chunk['error']} Its gaps are "
+                  "missing from this run; it is asked again, alone, on the next run.", ""]
     ideas = coverage.get("slide_ideas", [])
     if ideas:
         counts = {s: sum(i["status"] == s for i in ideas) for s in ("covered", "partial", "missing")}

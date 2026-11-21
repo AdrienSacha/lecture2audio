@@ -700,8 +700,10 @@ class CoverageAudit(unittest.TestCase):
         audit, seen = self.run_audit(blind=False)
         self.assertTrue(audit["caught"])
         self.assertEqual(audit["node"], "1.2")
-        self.assertNotIn("] um ok\n", seen[0] + "\n")  # the real run was not blanked
-        self.assertIn("[4] um ok", seen[1])
+        self.assertEqual(len(seen), 3)  # the search (two parts), then part 1 alone, blanked
+        self.assertFalse(any("] um ok\n" in u + "\n" for u in seen[:2]))
+        self.assertIn("[4] um ok", seen[2])
+        self.assertIn("Only the gaps of part 1 ", seen[2])
 
     def test_a_blind_search_is_reported(self):
         audit, _ = self.run_audit(blind=True)
