@@ -192,5 +192,67 @@ class Protocol(McpCase):
         self.assertEqual(json.loads(runs.contents[0].text)[0]["run"], "lecture-one")
 
 
+SKILL = Path(__file__).resolve().parent.parent / "skills" / "lecture2audio"
+
+
+class Skill(unittest.TestCase):
+    """The Agent Skill follows the agentskills.io specification and matches the code."""
+
+    def frontmatter(self) -> dict:
+        text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---\n"))
+        head = text.split("---\n")[1]
+        fields, current = {}, None
+        for line in head.splitlines():
+            if line and not line.startswith(" "):
+                current, _, value = line.partition(":")
+                fields[current] = value.strip()
+        return fields
+
+    def test_spec_fields_only(self):
+        fields = self.frontmatter()
+        allowed = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+        self.assertLessEqual(set(fields), allowed)
+        self.assertEqual(fields["name"], SKILL.name)
+        self.assertRegex(fields["name"], r"^[a-z0-9]+(-[a-z0-9]+)*$")
+        self.assertLessEqual(len(fields["description"]), 1024)
+        self.assertLessEqual(len(fields["compatibility"]), 500)
+
+    def test_references_exist_and_name_every_stage(self):
+        body = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+        for link in ("references/outputs.md", "references/stages.md", "references/options.md",
+                     "references/mcp.md"):
+            self.assertIn(link, body)
+            self.assertTrue((SKILL / link).is_file(), link)
+        table = (SKILL / "references" / "stages.md").read_text(encoding="utf-8")
+        for stage in srv.stages.STAGES:
+            self.assertIn(f"| {stage.name} |", table)
+        outputs = (SKILL / "references" / "outputs.md").read_text(encoding="utf-8")
+        for name in srv.READABLE:
+            self.assertIn(f"`{name}` | yes", outputs)
+        for status in srv_ledger_statuses():
+            self.assertIn(f"`{status}`", outputs)
+
+    def test_script_status(self):
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "run"
+            work.mkdir()
+            (work / "events.jsonl").write_text('{"stage": "outline", "state": "done", '
+                                               '"seconds": 1.0}\n', encoding="utf-8")
+            (work / "ideas.csv").write_text("idea_id,status\nT1.1,missing_cards\n",
+                                            encoding="utf-8")
+            done = subprocess.run([sys.executable, str(SKILL / "scripts" / "run.py"), "--status",
+                                   str(work)], capture_output=True, text=True, check=True)
+        self.assertIn("outline (done 1.0 s)", done.stdout)
+        self.assertIn("missing_cards 1", done.stdout)
+
+
+def srv_ledger_statuses():
+    from lecture2audio import ledger
+    return ledger.STATUSES
+
+
 if __name__ == "__main__":
     unittest.main()
