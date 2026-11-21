@@ -10,12 +10,19 @@ no file has two writers), as artifact-driven workflow compilers do before execut
 models never choose the next stage, because letting a model route through a reviewed graph
 cost 12 to 56 points of repeated-run success in the STAGE ablation.
 
+A stage is either whole-lecture (one result for the lecture: the outline, the gap search,
+the research) or per part (`per_part`: one result per part of the outline). A per-part stage of
+part k needs only part k of the per-part stages it names, and the whole of the others; the
+scheduler (`flow.py`) runs each (stage, part) node as soon as those are done, so a slow part
+never holds back the next stage of the other parts (ADR-0006).
+
 A new stage: add it here, after the stages it needs, with the files it caches.
 """
 from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +39,7 @@ class Stage:
     discard_own: bool = True  # --redo NAME deletes this stage's own files
     rebuilt: bool = False  # not a cache: written again from the stage results on every run
     about: str = ""
+    per_part: bool = False  # one result per part, run part by part as its inputs are ready
 
 
 STAGES: tuple[Stage, ...] = (
@@ -49,23 +57,24 @@ STAGES: tuple[Stage, ...] = (
     Stage("research", ("research",), ("gaps",),
           about="facts from the web for each gap, quotes checked word for word"),
     Stage("ideas", ("ideas", "ideas_audit.json"), ("outline",),
-          about="atomic ideas, one call per part, and the planted-fact audit"),
+          about="atomic ideas, one call per part, and the planted-fact audit", per_part=True),
     Stage("rewrite", ("rewrite", "audit.json"), ("outline", "gaps", "research", "ideas"),
-          about="script of each part, verified idea by idea, and the planted-omission audit"),
+          about="script of each part, verified idea by idea, and the planted-omission audit",
+          per_part=True),
     Stage("factcheck", ("factcheck",), ("rewrite", "ideas"), redo=False,
           about="MiniCheck on each lecture sentence against the units it cites"),
     Stage("spoken", ("spoken",), ("rewrite",),
-          about="the exact words for the voice"),
+          about="the exact words for the voice", per_part=True),
     Stage("audio", ("audio",), ("spoken",),
-          about="voiced chunks, the round trip and the joined recording"),
+          about="voiced chunks, the round trip and the joined recording", per_part=True),
     Stage("parts", ("parts",), ("audio",), redo=False,
           about="one recording per part for the vault"),
     Stage("course", ("course",), ("rewrite", "ideas"),
-          about="cards, exercises, the judge, the cold read and the revision"),
+          about="cards, exercises, the judge, the cold read and the revision", per_part=True),
     Stage("vault", ("vault",), ("course",), redo=False,
           about="the Obsidian notes"),
     Stage("recitation", ("recitation",), ("rewrite", "ideas", "course"),
-          about="the recitation notes of each part, as blocks checked by code"),
+          about="the recitation notes of each part, as blocks checked by code", per_part=True),
     Stage("project", ("project.json",), ("outline", "ideas", "gaps"),
           about="the project: one thing to build in checkable steps (--project)"),
     Stage("documents", ("recitation.tex", "recitation.pdf", "project.tex", "project.pdf",
@@ -96,6 +105,15 @@ def check(stages: tuple[Stage, ...] = STAGES) -> list[str]:
             writer[path] = stage.name
         seen.add(stage.name)
     return errors
+
+
+def part_needs(name: str, stages: tuple[Stage, ...] = STAGES) -> tuple[list[str], list[str]]:
+    """(the per-part stages whose same part a node of `name` needs, the stages it needs whole).
+    A whole-lecture stage needs every part of a per-part stage, so all its needs are whole."""
+    by_name = {s.name: s for s in stages}
+    stage = by_name[name]
+    same = [n for n in stage.needs if stage.per_part and by_name[n].per_part]
+    return same, [n for n in stage.needs if n not in same]
 
 
 def downstream(name: str, stages: tuple[Stage, ...] = STAGES) -> list[str]:
@@ -161,35 +179,62 @@ class Tracker:
     """What a run is doing, as data. Each change of stage is one JSON line in
     `events.jsonl`, and on standard output as `@@stage {...}` when L2A_EVENTS is set: the app
     follows a run from these lines and does not have to guess from the wording of the log.
-    Calling the tracker with a stage name closes the stage before it; a stage may be entered
-    more than once (the gap search and the termbase are both "gaps"), and its seconds add up.
-    """
+
+    Calling the tracker with a stage name closes every running stage and opens that one (the
+    stages run one after the other). While parts stream through the stage graph, several
+    stages run at once: `start` opens a stage without closing the others, and `stop` closes
+    it; the scheduler opens a stage when its first node starts and closes it when its last
+    node is done, so a stage is "running" while any part is in it and "done" when every part
+    has finished it. A stage may be entered more than once, and its seconds add up (they
+    overlap between stages that run at once). Thread-safe."""
 
     def __init__(self, work: Path):
         self.path = Path(work) / "events.jsonl"
         self.path.write_text("", encoding="utf-8")
-        self.current: str | None = None
+        self.current: str | None = None  # the stage opened last, while it runs
         self.seconds: dict[str, float] = {}
-        self._began = 0.0
+        self._running: dict[str, float] = {}  # stage -> when it was opened
+        self._lock = threading.RLock()
         self._announce = bool(os.environ.get("L2A_EVENTS"))
 
     def __call__(self, name: str) -> None:
+        with self._lock:
+            self.finish()
+            self.start(name)
+
+    def start(self, name: str) -> None:
+        """Open a stage, leaving the others running (nothing happens if it is open)."""
         if name not in BY_NAME:
             raise ValueError(f"{name} is not a stage of stages.STAGES")
-        self.finish()
-        self.current, self._began = name, time.monotonic()
-        trace.set_stage(name)  # every call made from now on says which stage it serves
-        self._emit({"stage": name, "state": "running"})
+        with self._lock:
+            if name in self._running:
+                return
+            self._running[name], self.current = time.monotonic(), name
+            trace.set_stage(name)  # calls made outside a flow node say which stage they serve
+            self._emit({"stage": name, "state": "running"})
+
+    def stop(self, name: str) -> None:
+        """Close a stage (nothing happens if it is not open)."""
+        with self._lock:
+            began = self._running.pop(name, None)
+            if began is None:
+                return
+            self.seconds[name] = self.seconds.get(name, 0.0) + time.monotonic() - began
+            self._emit({"stage": name, "state": "done", "seconds": round(self.seconds[name], 1)})
+            if self.current == name:
+                self.current = next(reversed(self._running), None)
+                trace.set_stage(self.current)
+
+    @property
+    def running(self) -> list[str]:
+        with self._lock:
+            return list(self._running)
 
     def finish(self) -> None:
-        """Close the stage that is running."""
-        if self.current:
-            spent = time.monotonic() - self._began
-            self.seconds[self.current] = self.seconds.get(self.current, 0.0) + spent
-            self._emit({"stage": self.current, "state": "done",
-                        "seconds": round(self.seconds[self.current], 1)})
-            self.current = None
-            trace.set_stage(None)
+        """Close every stage that is running."""
+        with self._lock:
+            for name in list(self._running):
+                self.stop(name)
 
     def _emit(self, event: dict) -> None:
         line = json.dumps(event)

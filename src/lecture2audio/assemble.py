@@ -81,8 +81,9 @@ def render_chunk(backend: TTS, text: str, final: Path) -> None:
 
 def repair_chunks(backend: TTS, voiced: list[list[dict]], transcribe: Callable[[Path], str],
                   threshold: float, retries: int, cache: Path,
-                  log: Callable[[str], None] = print) -> list[dict]:
-    """The round trip, with repair. Every chunk is transcribed back and compared with its
+                  log: Callable[[str], None] = print, first: int = 0) -> list[dict]:
+    """The round trip, with repair. `voiced` holds parts `first`, `first + 1`, ... (one part
+    at a time when each is checked as soon as it is voiced). Every chunk is transcribed back and compared with its
     text; a chunk below `threshold` is voiced again, up to `retries` times, and the attempt
     heard best is kept in place of the first. Autoregressive voices skip or invent words on
     some samples, and resampling the failures is the standard inference-time fix (Seed-TTS,
@@ -90,7 +91,7 @@ def repair_chunks(backend: TTS, voiced: list[list[dict]], transcribe: Callable[[
     from .roundtrip import similarity
     seen = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else {}
     results = []
-    for p_index, entries in enumerate(voiced):
+    for p_index, entries in enumerate(voiced, first):
         chunks = [e for e in entries if e["kind"] == "chunk"]
         for c_index, entry in enumerate(chunks):
             path, stat = entry["path"], entry["path"].stat()
@@ -131,35 +132,40 @@ def synth_blocks(backend: TTS, parts: list[list[dict]], audio_dir: Path, chunk_c
     kind is "chunk" (speech) or "pause" (silence after a quiz question). Each chunk is cached
     under a name derived from its text, so editing one sentence re-voices only that chunk.
     """
+    return [synth_part(backend, blocks, audio_dir, chunk_chars, quiz, quiz_pause, log,
+                       p_index, len(parts)) for p_index, blocks in enumerate(parts)]
+
+
+def synth_part(backend: TTS, blocks: list[dict], audio_dir: Path, chunk_chars: int,
+               quiz: bool = True, quiz_pause: float = 8.0,
+               log: Callable[[str], None] = print, index: int = 0,
+               count: int = 1) -> list[dict]:
+    """Voice the speech blocks of one part (part `index` of `count`), as soon as its spoken
+    form exists (flow.py). Returns its entries {chapter, kind, path, text, block}."""
     audio_dir.mkdir(parents=True, exist_ok=True)
     pause_file = audio_dir / f"pause_{quiz_pause:.1f}.wav"
-    if quiz:
+    if quiz and not pause_file.exists():
         write_silence(pause_file, quiz_pause)
-    result = []
-    keep = lambda b: quiz or b["role"] not in ("quiz_intro", "question", "answer")
-    total = sum(len(chunk_text(b["text"], chunk_chars)) for blocks in parts for b in blocks if keep(b))
-    done = 0
-    for p_index, blocks in enumerate(parts):
-        entries = []
-        chosen = [b for b in blocks if keep(b)]
-        count = 0
-        for b_index, block in enumerate(chosen):
-            for chunk in chunk_text(block["text"], chunk_chars):
-                done += 1
-                final = audio_dir / _cache_name(backend, chunk)
-                log(f"[voice] chunk {done}/{total}, part {p_index + 1}/{len(parts)}"
-                    + (" (already recorded)" if final.exists() else ""))
-                if not final.exists():
-                    render_chunk(backend, chunk, final)
-                entries.append({"chapter": block["chapter"], "kind": "chunk", "path": final,
-                                "text": chunk, "block": b_index})
-                count += 1
-            if block["role"] == "question" and quiz:
-                entries.append({"chapter": block["chapter"], "kind": "pause", "path": pause_file,
-                                "text": None, "block": b_index})
-        log(f"[voice] part {p_index + 1}/{len(parts)}: {count} chunk(s)")
-        result.append(entries)
-    return result
+    chosen = [b for b in blocks
+              if quiz or b["role"] not in ("quiz_intro", "question", "answer")]
+    total = sum(len(chunk_text(b["text"], chunk_chars)) for b in chosen)
+    entries, done = [], 0
+    for b_index, block in enumerate(chosen):
+        for chunk in chunk_text(block["text"], chunk_chars):
+            done += 1
+            final = audio_dir / _cache_name(backend, chunk)
+            # the part first: the app reads the progress of the stage from the first count
+            log(f"[voice] part {index + 1}/{count}, chunk {done}/{total}"
+                + (" (already recorded)" if final.exists() else ""))
+            if not final.exists():
+                render_chunk(backend, chunk, final)
+            entries.append({"chapter": block["chapter"], "kind": "chunk", "path": final,
+                            "text": chunk, "block": b_index})
+        if block["role"] == "question" and quiz:
+            entries.append({"chapter": block["chapter"], "kind": "pause", "path": pause_file,
+                            "text": None, "block": b_index})
+    log(f"[voice] part {index + 1}/{count}: {done} chunk(s)")
+    return entries
 
 
 def join_parts(parts: list[list[dict]], audio_dir: Path, chunk_gap: float = 0.25,

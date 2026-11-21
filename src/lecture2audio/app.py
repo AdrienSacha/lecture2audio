@@ -305,13 +305,19 @@ class App:
         if name not in stages.BY_NAME:
             return
         if event.get("state") == "running":
-            self._stage(job, name, None)
+            # several stages run at once while parts stream through the graph (flow.py):
+            # opening one never closes another; each closes on its own "done" event
+            job.current = name
+            job.state[name] = "running"
+            job.emit({"type": "stage", "name": name, "state": "running",
+                      "progress": round(job.progress.get(name, 0.0), 3)})
         else:
             job.state[name] = "done"
             job.emit({"type": "stage", "name": name, "state": "done", "progress": 1,
                       "seconds": event.get("seconds")})
             if job.current == name:
-                job.current = None
+                job.current = next((s for s, now in reversed(job.state.items())
+                                    if now == "running"), None)
 
     def _follow(self, job: Job) -> None:
         lines: list[str] = []
@@ -330,8 +336,11 @@ class App:
                 if not getattr(job, "structured", False):
                     if stage:  # an older build: the stage is guessed from the log tag
                         self._stage(job, stage, fraction)
-                elif stage == job.current and fraction is not None:
-                    self._stage(job, stage, fraction)  # "part 3/12" inside the stage
+                elif job.state.get(stage) == "running" and fraction is not None:
+                    # "part 3/12" inside a running stage (one of several, when parts stream)
+                    job.progress[stage] = max(fraction, job.progress.get(stage, 0.0))
+                    job.emit({"type": "stage", "name": stage, "state": "running",
+                              "progress": round(job.progress[stage], 3)})
         finally:
             code = process.wait()
             job.status = ("cancelled" if job.cancelled else "done" if code == 0 else "failed")
@@ -343,7 +352,9 @@ class App:
                 if job.status == "done":
                     final[stage.name] = "done" if seen or stage.name in on_disk else "skipped"
                 else:  # the stage that was running is where the run stopped
+                    # every stage that was running is where the run stopped
                     final[stage.name] = ("stopped" if stage.name == job.current
+                                         or job.state.get(stage.name) == "running"
                                          else "done" if seen else "skipped")
             error = next((l for l in reversed(lines) if l.startswith("error:")), None) or (
                 lines[-1] if lines and job.status == "failed" else None)

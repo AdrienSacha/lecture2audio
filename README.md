@@ -99,7 +99,7 @@ API keys never pass through the agent: the runs read them from the environment, 
 
 ## Status
 
-- The test suite has 315 tests and runs offline with no key and no model; it needs ffmpeg. One test is skipped. Run it with `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`.
+- The test suite has 338 tests and runs offline with no key and no model; it needs ffmpeg. One test is skipped. Run it with `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests`.
 - Not tested: real calls to any provider (the tests use the dry model and a scripted harness), real voices, and Whisper transcription.
 - The prompts have not been tuned on real lectures. `tests/real_data.py` can fetch MIT OpenCourseWare material to try them on.
 - There are no evaluation numbers and no baseline yet. The planted-omission audits tell you whether a checker noticed one fault in a given run, not how often the pipeline loses an idea.
