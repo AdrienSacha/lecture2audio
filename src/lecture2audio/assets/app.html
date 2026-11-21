@@ -292,10 +292,11 @@ dialog::backdrop { background: rgba(0, 0, 0, .32); -webkit-backdrop-filter: blur
 .r-brand i { width: 8px; height: 8px; border-radius: 50%; background: var(--r-faint); box-shadow: 0 0 0 3px rgba(125, 144, 165, .12); }
 .r-brand i.live { background: var(--r-green); box-shadow: 0 0 0 3px rgba(90, 240, 181, .16), 0 0 14px var(--r-green); animation: r-blink 2s ease-in-out infinite; }
 @keyframes r-blink { 50% { opacity: .45; } }
-.r-select { height: 32px; max-width: 320px; min-width: 0; padding: 0 30px 0 12px; border-radius: 8px; border: 1px solid var(--r-line-2); background: var(--r-panel) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5 5 6.5 8 3.5' fill='none' stroke='%237d90a5' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 11px center; appearance: none; -webkit-appearance: none; cursor: pointer; text-overflow: ellipsis; }
+.r-select { height: 32px; max-width: 260px; min-width: 0; padding: 0 30px 0 12px; border-radius: 8px; border: 1px solid var(--r-line-2); background: var(--r-panel) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5 5 6.5 8 3.5' fill='none' stroke='%237d90a5' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 11px center; appearance: none; -webkit-appearance: none; cursor: pointer; text-overflow: ellipsis; }
 .r-select:hover { border-color: rgba(79, 216, 255, .4); }
 .r-now { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; color: var(--r-dim); overflow: hidden; white-space: nowrap; }
-.r-now b { color: var(--r-text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+.r-now b { flex: 0 1 auto; min-width: 8em; color: var(--r-text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+.r-now span { flex: none; font-variant-numeric: tabular-nums; }
 .r-counters { display: flex; gap: 2px; }
 .r-counter { display: grid; padding: 4px 12px; border-left: 1px solid var(--r-line); min-width: 74px; }
 .r-counter span { font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: var(--r-faint); }
@@ -1148,6 +1149,9 @@ function actorLabel(c) {
   return [c.seat === "checker" ? "Checking model" : "Writing model", c.model || c.host || ""];
 }
 function shown(c) { return c.session === R.session; }
+// "now" for the drawings: the clock while a process works on the run, else the last thing it
+// wrote, so a run that stopped hours ago is not drawn as if it were still going
+function nowT() { return R.proc?.alive === false && R.lastSeen ? R.lastSeen : Date.now(); }
 function where(c) {
   const bits = [];
   if (c.part) bits.push("part " + c.part); else if (c.item) bits.push(c.item); else bits.push("lecture");
@@ -1170,8 +1174,9 @@ async function roomOpen(name) {
   const pick = $("r-run");
   pick.replaceChildren(...list.runs.map((r) => el("option", { value: r.name },
     `${r.live ? "● " : ""}${r.title}${r.title !== r.name ? "  (" + r.name + ")" : ""}`)));
-  if (!list.runs.length) pick.append(el("option", { value: "" }, "No run yet"));
-  const chosen = name && list.runs.some((r) => r.name === name) ? name
+  if (name && !list.runs.some((r) => r.name === name)) pick.prepend(el("option", { value: name }, name));
+  if (!pick.options.length) pick.append(el("option", { value: "" }, "No run yet"));
+  const chosen = name ? name
     : list.running || state.name || (list.runs[0] && list.runs[0].name) || "";
   pick.value = chosen;
   roomConnect(chosen);
@@ -1204,10 +1209,13 @@ function roomEvent(d) {
   if (d.t === "hello") {  // also after a reconnection: everything is sent again
     const keep = R.sel, proc = R.proc;
     roomReset(); R.run = d.run; R.sel = keep; R.title = d.title; R.liveFrom = Date.now() - 1500;
-    R.graph = d.graph; R.hasCalls = d.calls; R.proc = proc;
+    R.graph = d.graph; R.hasCalls = d.calls; R.proc = d.process || proc;
     for (const p of d.parts) R.parts.set(p.id, p.title);
     $("r-feed").replaceChildren();
     buildRail();
+  } else if (d.t === "calls-reset") {
+    R.calls = new Map(); R.order = []; R.gates = []; R.session = 0; R.lanesDirty = true;
+    R.totals = { calls: 0, in: 0, out: 0, search: 0, page: 0, err: 0 };
   } else if (d.t === "reset") {
     R.stages = {}; R.bands = [];
   } else if (d.t === "stages") {
@@ -1231,6 +1239,7 @@ function roomEvent(d) {
 }
 function stageEvent(e) {
   const t = (e.time || Date.now() / 1000) * 1000, s = R.stages[e.stage] ||= { state: "pending", seconds: 0 };
+  if (e.time) R.lastSeen = Math.max(R.lastSeen || 0, t);
   s.state = e.state;
   if (e.state === "running") { s.since = t; R.bands.push({ stage: e.stage, start: t, end: null }); R.current = e.stage; }
   else {
@@ -1242,6 +1251,7 @@ function stageEvent(e) {
 }
 function ingest(s) {
   const t = Date.parse(s.time) || Date.now();
+  R.lastSeen = Math.max(R.lastSeen || 0, t);
   if (s.kind === "run") {  // a new session of the run (a rerun appends to calls.jsonl)
     R.session++; R.lanesDirty = true;
     for (const c of R.calls.values()) if (c.end == null) c.end = c.start;  // cut off
@@ -1257,6 +1267,7 @@ function ingest(s) {
     if (!s.ok) feed({ t, cls: "bad", who: "code gate", whereText: c ? where(c) : "", text: `Rejected ${s.what || "the answer"}: ${(s.errors || []).join("; ")}`, call: s.parent });
     return;
   }
+  if (!s.id) s.id = "@" + s.at;  // a line of the first trace format: one line per call, no id
   let c = R.calls.get(s.id);
   const fresh = !c;
   if (!c) {
@@ -1564,8 +1575,8 @@ function drawBoard(now) {
 const tl = { label: 176, rowH: 15, gap: 5, top: 36, hits: [] };
 function tlRange() {
   let t0 = Infinity, t1 = -Infinity;
-  for (const c of R.order) if (shown(c)) { t0 = Math.min(t0, c.start); t1 = Math.max(t1, c.end ?? Date.now()); }
-  for (const b of R.bands) { t0 = Math.min(t0, b.start); t1 = Math.max(t1, b.end ?? (R.current ? Date.now() : b.start)); }
+  for (const c of R.order) if (shown(c)) { t0 = Math.min(t0, c.start); t1 = Math.max(t1, c.end ?? nowT()); }
+  for (const b of R.bands) { t0 = Math.min(t0, b.start); t1 = Math.max(t1, b.end ?? (R.current ? nowT() : b.start)); }
   if (!isFinite(t0)) { t0 = Date.now() - 60000; t1 = Date.now(); }
   if (t1 - t0 < 5000) t1 = t0 + 5000;
   return [t0, t1 + (t1 - t0) * .02];
@@ -1586,7 +1597,7 @@ function drawTimeline() {
   // stage bands
   ctx.font = '9.5px ui-monospace, "SF Mono", Menlo, monospace'; ctx.textBaseline = "middle";
   R.bands.forEach((b, i) => {
-    const a = Math.max(x0, X(b.start)), z = Math.min(w, X(b.end ?? Date.now()));
+    const a = Math.max(x0, X(b.start)), z = Math.min(w, X(b.end ?? nowT()));
     if (z <= a) return;
     ctx.fillStyle = R.focus === b.stage ? "rgba(255,181,71,.07)" : i % 2 ? "rgba(132,196,255,.035)" : "rgba(132,196,255,.06)";
     ctx.fillRect(a, 0, z - a, height);
@@ -1603,7 +1614,7 @@ function drawTimeline() {
     ctx.fillText(clockFmt.format(t), x, tl.top - 14);
   }
   tl.hits = [];
-  const sel = R.sel, now = Date.now();
+  const sel = R.sel, now = nowT();
   for (const lane of lanes) {
     const y = lane.y;
     ctx.fillStyle = "rgba(132,196,255,.04)"; ctx.fillRect(x0, y, w - x0, lane.height * tl.rowH);
@@ -1840,7 +1851,7 @@ function paintCounters() {
   set("r-n-out", compact(T.out)); set("r-n-search", fmt.format(T.search)); set("r-n-page", fmt.format(T.page));
   set("r-n-err", fmt.format(T.err));
   $("r-n-live").classList.toggle("hot", live > 0);
-  const running = !!R.current || live > 0;
+  const running = R.proc ? !!R.proc.alive : (!!R.current || live > 0);
   $("r-live").classList.toggle("live", running);
   const stage = R.graph.find((s) => s.name === R.current);
   let idle = R.title || R.run || "No run selected";
@@ -1851,7 +1862,8 @@ function paintCounters() {
   $("r-now").textContent = stage ? `${stage.name}: ${stage.about}` : idle;
   const st = stage && R.stages[stage.name];
   const began = R.bands.length ? R.bands[0].start : null;
-  $("r-clock").textContent = [st && st.since ? `stage ${secs((Date.now() - st.since) / 1000)}` : "",
+  const stopped = R.proc?.alive === false;
+  $("r-clock").textContent = [st && st.since ? (stopped ? `stopped at ${clockFmt.format(R.lastSeen || st.since)}` : `stage ${secs((Date.now() - st.since) / 1000)}`) : "",
     began && R.proc?.alive ? `run ${secs((Date.now() - began) / 1000)}` : ""].filter(Boolean).join(" · ");
   const proc = $("r-proc"), p = R.proc;
   proc.hidden = !p || !R.run;

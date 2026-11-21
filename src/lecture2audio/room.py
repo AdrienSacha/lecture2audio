@@ -18,7 +18,9 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -89,13 +91,26 @@ def _last_pid(work: Path) -> int | None:
         return None
 
 
+_ps_lock = threading.Lock()
+_ps_cache: tuple[float, str | None] = (0.0, None)
+PS_SECONDS = 4.0  # one `ps` serves every page and stream for this long
+
+
 def processes() -> str | None:
-    """`ps` of every process: pid and command line (None when ps cannot run)."""
-    try:
-        return subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True,
-                              timeout=3).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
+    """`ps` of every process: pid and command line (None when ps cannot run). `ps` is slow on
+    macOS (up to a second), so one listing is shared for PS_SECONDS by every request."""
+    global _ps_cache
+    with _ps_lock:
+        taken, listing = _ps_cache
+        if time.monotonic() - taken < PS_SECONDS and taken:
+            return listing
+        try:
+            listing = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
+                                     text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            listing = None
+        _ps_cache = (time.monotonic(), listing)
+        return listing
 
 
 def process(work: Path, listing: str | None = None) -> dict:
@@ -115,8 +130,11 @@ def process(work: Path, listing: str | None = None) -> dict:
     if pid in commands:
         return {"alive": True, "pid": pid}
     for pid, command in commands.items():
-        if " app" in command.split("lecture2audio", 1)[-1][:5]:
-            continue  # the app server itself
+        # a run of the program itself (python -m lecture2audio ..., or its script), not the
+        # app server and not another program that merely names the folder (tail, an editor)
+        run = re.search(r"(?:-m\s+lecture2audio|/lecture2audio)(?:\s+(\S+)|$)", command)
+        if not run or run.group(1) == "app":
+            continue
         if (f"--name {work.name}" in command or f"--name={work.name}" in command
                 or str(work) in command):
             return {"alive": True, "pid": pid}
@@ -200,6 +218,50 @@ def summaries(lines: list[tuple[int, bytes]]) -> list[dict]:
             latest[item["id"]] = index
     return [item for index, item in enumerate(out)
             if item.get("phase") != "progress" or latest.get(item.get("id")) == index]
+
+
+class Summaries:
+    """The summaries of one calls.jsonl, kept by the server between page loads, so that a
+    reload sends what is known at once and only the new lines are read and parsed. A file that
+    became shorter (rewritten) starts again. One per file; thread safe."""
+
+    def __init__(self, path: Path):
+        self.tail, self.items, self.lock = Tail(path), [], threading.Lock()
+
+    def read(self, limit: int = 8) -> bool:
+        """Read up to `limit` chunks of new lines; True when something was added."""
+        added = False
+        with self.lock:
+            for _ in range(limit):
+                lines = self.tail.lines()
+                if self.tail.reset:
+                    self.items = []
+                if not lines:
+                    break
+                self.items += summaries(lines)
+                added = True
+        return added
+
+    def since(self, count: int) -> tuple[list[dict], int]:
+        """The items after the first `count` (a progress line followed by a newer one of the
+        same call left out), and the new count."""
+        with self.lock:
+            items, total = self.items[count:], len(self.items)
+        latest = {item.get("id"): k for k, item in enumerate(items) if item.get("id")}
+        return [item for k, item in enumerate(items) if item.get("phase") != "progress"
+                or latest.get(item.get("id")) == k], total
+
+
+_summaries: dict[Path, Summaries] = {}
+_summaries_lock = threading.Lock()
+
+
+def summaries_of(work: Path) -> Summaries:
+    path = (work / "calls.jsonl").resolve()
+    with _summaries_lock:
+        if path not in _summaries:
+            _summaries[path] = Summaries(path)
+        return _summaries[path]
 
 
 def stage_events(lines: list[tuple[int, bytes]], mtime: float | None = None) -> list[dict]:

@@ -682,7 +682,8 @@ class Handler(BaseHTTPRequestHandler):
         """Server-Sent Events: the stages, the calls (as summaries) and the idea graph of a
         run, from the start of its files, then as they grow, until the page goes away."""
         work = self._room_work(query)
-        calls, events = room.Tail(work / "calls.jsonl"), room.Tail(work / "events.jsonl")
+        calls, events = room.summaries_of(work), room.Tail(work / "events.jsonl")
+        count = 0  # summaries of calls.jsonl sent so far
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -694,11 +695,14 @@ class Handler(BaseHTTPRequestHandler):
         def send(data: dict) -> None:
             self.wfile.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
 
+        job = self.app.running()
+        alive = ({"alive": True, "pid": job.process.pid if job.process else None}
+                 if job and job.name == work.name else room.process(work))
         send({"t": "hello", "run": work.name, "title": room._title(work),
               "graph": room.graph(), "parts": room.outline_parts(work),
-              "calls": (work / "calls.jsonl").is_file()})
+              "calls": (work / "calls.jsonl").is_file(), "process": alive})
         self.wfile.flush()
-        signature, quiet, checked, alive_at, alive = None, 0.0, 0.0, 0.0, None
+        signature, quiet, checked, alive_at = None, 0.0, 0.0, time.monotonic()
         while True:
             sent = False
             batch = events.lines()
@@ -712,13 +716,14 @@ class Handler(BaseHTTPRequestHandler):
                     mtime = None
                 send({"t": "stages", "items": room.stage_events(batch, mtime)})
                 sent = True
-            for _ in range(8):  # at most 8 chunks per pass, so stages stay current
-                lines = calls.lines()
-                if not lines:
-                    break
-                items = room.summaries(lines)
-                for k in range(0, len(items), 1500):
-                    send({"t": "calls", "items": items[k:k + 1500]})
+            calls.read()  # at most 8 chunks per pass, so stages stay current
+            items, total = calls.since(count)
+            if total < count:  # the file was rewritten: start again
+                send({"t": "calls-reset"})
+                items, total = calls.since(0)
+            count = total
+            for k in range(0, len(items), 1500):
+                send({"t": "calls", "items": items[k:k + 1500]})
                 sent = True
             now = time.monotonic()
             if now - alive_at >= 5:  # is a process still working on this run?

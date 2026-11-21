@@ -305,6 +305,57 @@ class RoomTest(AppCase):
         self.assertEqual([s["state"] for s in seen], ["running", "done"])
         self.assertEqual(next(m for m in messages if m["t"] == "ideas")["ideas"], [])
 
+    def test_a_process_is_found_by_its_run_never_by_a_mere_mention(self):
+        from lecture2audio import room
+        work = Path("/u/code/lecture2audio/out/demo")
+        found = room.process(work, "12 /usr/bin/python3 -m lecture2audio build in --name demo")
+        self.assertEqual(found, {"alive": True, "pid": 12})
+        for other in ("13 tail -f /u/code/lecture2audio/out/demo/calls.jsonl",
+                      "14 /v/bin/python -m lecture2audio app --out /u/code/lecture2audio/out/demo",
+                      "15 /v/bin/lecture2audio build x --name other"):
+            self.assertFalse(room.process(work, other)["alive"], other)
+
+    def test_a_page_that_opens_late_gets_the_state_not_a_replay(self):
+        job = self.app.job(None, create=True)
+        job.status, job.name, job.started = "running", "demo", 1000.0
+        job.state, job.current = {"outline": "done", "rewrite": "running"}, "rewrite"
+        for k in range(600):
+            job.emit({"type": "log", "line": f"line {k}"})
+        connection = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=10)
+        connection.request("GET", f"/api/events?job={job.id}")
+        response = connection.getresponse()
+        first = None
+        while first is None:
+            line = response.fp.readline()
+            if line.startswith(b"data: "):
+                first = json.loads(line[6:])
+        job.emit({"type": "end", "status": "done"})
+        rest = [json.loads(l[6:]) for l in response.read().splitlines() if l.startswith(b"data: ")]
+        connection.close()
+        self.assertEqual(first["type"], "snapshot")
+        self.assertEqual((first["current"], first["stages"]["rewrite"], first["started"]),
+                         ("rewrite", "running", 1000.0))
+        self.assertEqual(first["log"][-1], "line 599")
+        self.assertEqual(len(first["log"]), 400)
+        self.assertEqual([e["type"] for e in rest], ["end"])  # no replay of the 600 lines
+
+    def test_summaries_are_kept_for_the_next_page_and_old_lines_get_an_offset(self):
+        from lecture2audio import room
+        work = self.make_run("cache")
+        old = json.dumps({"time": "2026-11-20T10:00:00.000+00:00", "kind": "model",
+                          "request": {"model": "m", "messages": []}, "seconds": 2,
+                          "answer": {"usage": {"prompt_tokens": 3, "completion_tokens": 1}}})
+        (work / "calls.jsonl").write_text(old + "\n")
+        cache = room.summaries_of(work)
+        self.assertTrue(cache.read())
+        items, count = cache.since(0)
+        self.assertEqual((count, items[0]["at"], items[0]["tokens_in"]), (1, 0, 3))
+        self.assertIs(room.summaries_of(work), cache)
+        with open(work / "calls.jsonl", "a") as out:
+            out.write(old + "\n")
+        cache.read()
+        self.assertEqual([i["at"] for i in cache.since(1)[0]], [len(old) + 1])
+
     def test_tail_reads_whole_lines_and_sees_a_rewrite(self):
         from lecture2audio import room
         path = self.make_run("tail") / "events.jsonl"

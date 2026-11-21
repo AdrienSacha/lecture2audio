@@ -385,8 +385,8 @@ def summary(record: dict) -> dict:
             out["host"] = request.get("host")
             out["model"] = out.get("model") or request.get("model")
             out["asks"] = _last_user(request)[-300:]
-            out["sent"] = len(json.dumps(request.get("messages") or request.get("input") or "",
-                                         ensure_ascii=False)) + len(_system_text(request))
+            out["sent"] = _size(request.get("messages") or request.get("input")) + len(
+                _system_text(request))
             out["tools_offered"] = [((t.get("function") or {}).get("name") or t.get("name")
                                      or t.get("type")) for t in request.get("tools") or []
                                     if isinstance(t, dict)]
@@ -415,6 +415,17 @@ def summary(record: dict) -> dict:
         out["model"] = request.get("model")
         out["host"] = request.get("host")
     return {k: v for k, v in out.items() if v not in (None, "", [])}
+
+
+def _size(value) -> int:
+    """Characters of text in a request (cheaper than serializing it again)."""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(_size(v) for v in value.values())
+    if isinstance(value, list):
+        return sum(_size(v) for v in value)
+    return 0
 
 
 def _query_of(url: str) -> str:
